@@ -363,7 +363,9 @@ def build(*, http=None, pool=None, settings=None) -> Plugin:
 
 > **已实现**（2026-08-26）。实现日志见 [`docs/logs/M2.md`](../logs/M2.md)，历史规格归档见 [`docs/archive/M2-persistence.md`](../archive/M2-persistence.md)。
 
-## M3 — 采集层与出站网关
+## M3 — 采集层与出站网关（已实现）
+
+> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M3.md`](../logs/M3.md)，历史规格归档见 [`docs/archive/M3-collectors.md`](../archive/M3-collectors.md)，实现计划见 [`docs/plans/M3-implementation-plan.md`](../plans/M3-implementation-plan.md)。剩余项：`POST /v1/monitors/{target_id}/run` 立即执行与调度器并行降级随 M6；DNS 二次校验 / Vault 密钥管理随 M7。
 
 ### 基础信息
 

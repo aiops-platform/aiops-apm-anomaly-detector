@@ -32,6 +32,8 @@ class LogSignal(BaseModel):
     stack_trace: str | None = None
     timestamp: datetime
     trace_id: str | None = None
+    # M3 采集器预计算的堆栈签名（L1 signature_aggregate 聚合用；契约允许新增可选字段）
+    signature: str | None = None
 
 
 class ChangeSignal(BaseModel):

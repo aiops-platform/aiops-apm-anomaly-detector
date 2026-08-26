@@ -125,3 +125,12 @@ def _as_json(value: Any) -> str:
     import json
 
     return json.dumps(value, ensure_ascii=False)
+
+
+def _decode_json(value: Any) -> Any:
+    """把 MySQL JSON 列值还原为 Python 对象（已是 dict/list 则原样返回）。"""
+    import json
+
+    if isinstance(value, (dict, list)):
+        return value
+    return json.loads(value)

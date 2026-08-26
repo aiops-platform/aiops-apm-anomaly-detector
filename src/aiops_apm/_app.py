@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .collectors import SharedHttpClient
 from .exceptions import AppException, ErrorCode
 from .router.api import api_router
 from .settings import Settings
@@ -20,7 +21,7 @@ from .storage import build_storage
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """应用生命周期钩子：M2 接线 storage。
+    """应用生命周期钩子：M2 接线 storage；M3 接线共享出站 HTTP 客户端。
 
     **fail-fast**（用户确认）：mysql backend 连不上 DB 时 ``build_storage`` 抛异常，
     lifespan 启动失败 → uvicorn 进程退出。memory backend（demo/单测）无此约束。
@@ -30,9 +31,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     settings: Settings = app.state.settings
     app.state.storage = await build_storage(settings)
+    app.state.http_client = SharedHttpClient(settings)
     try:
         yield
     finally:
+        await app.state.http_client.aclose()
         await app.state.storage.close()
 
 

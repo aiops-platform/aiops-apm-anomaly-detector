@@ -1,9 +1,12 @@
-"""API 路由：M0 提供 /health、/ready 两个探针。"""
+"""API 路由：M0 探针 + M3 /v1/monitors 监控端点管理。"""
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from .monitors import router as monitors_router
+
 api_router = APIRouter()
+api_router.include_router(monitors_router)
 
 
 @api_router.get("/health")

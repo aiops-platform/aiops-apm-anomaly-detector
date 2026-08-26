@@ -17,6 +17,7 @@ dependencies = [
     "aiomysql>=0.2.0",
     "prometheus_client>=0.20",
     "pyyaml>=6.0",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -29,11 +30,11 @@ dev = [
     "pre-commit>=3.6",
 ]
 
-# 插件系统三个 entry_points group（M0 占位，M4 填内置插件）
+# 插件系统三个 entry_points group（M0 占位，M3 填 collectors，M4 填 detectors/suppressors）
 [project.entry-points."aiops_apm.collectors"]
-# http_metrics = "aiops_apm.collectors.http_metrics:build"
-# http_logs    = "aiops_apm.collectors.http_logs:build"
-# mock         = "aiops_apm.collectors.mock:build"
+http_metrics = "aiops_apm.collectors.http_metrics:build"
+http_logs    = "aiops_apm.collectors.http_logs:build"
+mock         = "aiops_apm.collectors.mock:build"
 
 [project.entry-points."aiops_apm.detectors"]
 # static_threshold    = "aiops_apm.detectors.static_threshold:build"
