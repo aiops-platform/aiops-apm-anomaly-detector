@@ -7,9 +7,12 @@ from __future__ import annotations
 
 from ..settings import Settings
 from .connection import ConnectionPool
+from .detection_state import DetectionStateStore, InMemoryDetectionStateStore, MySQLDetectionStateStore
 from .domain_config import DomainConfigStore, InMemoryDomainConfigStore, MySQLDomainConfigStore
+from .dynamic_config import DynamicConfigStore, InMemoryDynamicConfigStore, MySQLDynamicConfigStore
 from .monitor_targets import InMemoryMonitorTargetStore, MonitorTargetStore, MySQLMonitorTargetStore
 from .records import InMemoryRecordStore, MySQLRecordStore, RecordStore
+from .sequence import InMemorySequenceStore, MySQLSequenceStore, SequenceStore
 from .snapshots import InMemorySnapshotStore, MySQLSnapshotStore, SnapshotStore
 from .watermarks import InMemoryWatermarkStore, MySQLWatermarkStore, WatermarkStore
 
@@ -22,11 +25,14 @@ __all__ = [
     "MonitorTargetStore",
     "SnapshotStore",
     "WatermarkStore",
+    "SequenceStore",
+    "DetectionStateStore",
+    "DynamicConfigStore",
 ]
 
 
 class Storage:
-    """聚合 records + domain_configs + monitor_targets + snapshots + watermarks + 连接池。"""
+    """聚合 records + domain_configs + monitor_targets + snapshots + watermarks + M5 三件套 + 连接池。"""
 
     def __init__(
         self,
@@ -36,6 +42,9 @@ class Storage:
         monitor_targets: MonitorTargetStore,
         snapshots: SnapshotStore,
         watermarks: WatermarkStore,
+        sequence: SequenceStore,
+        detection_state: DetectionStateStore,
+        dynamic_config: DynamicConfigStore,
         pool: ConnectionPool | None = None,
     ) -> None:
         self.records = records
@@ -43,6 +52,9 @@ class Storage:
         self.monitor_targets = monitor_targets
         self.snapshots = snapshots
         self.watermarks = watermarks
+        self.sequence = sequence
+        self.detection_state = detection_state
+        self.dynamic_config = dynamic_config
         self.pool = pool
 
     async def health_check(self) -> bool:
@@ -64,6 +76,9 @@ async def build_storage(settings: Settings) -> Storage:
             monitor_targets=InMemoryMonitorTargetStore(),
             snapshots=InMemorySnapshotStore(),
             watermarks=InMemoryWatermarkStore(),
+            sequence=InMemorySequenceStore(),
+            detection_state=InMemoryDetectionStateStore(),
+            dynamic_config=InMemoryDynamicConfigStore(),
         )
     if backend == "mysql":
         pool = ConnectionPool(settings, db=settings.db_name)
@@ -74,6 +89,9 @@ async def build_storage(settings: Settings) -> Storage:
             monitor_targets=MySQLMonitorTargetStore(pool),
             snapshots=MySQLSnapshotStore(pool),
             watermarks=MySQLWatermarkStore(pool),
+            sequence=MySQLSequenceStore(pool),
+            detection_state=MySQLDetectionStateStore(pool),
+            dynamic_config=MySQLDynamicConfigStore(pool),
             pool=pool,
         )
     raise ValueError(f"unknown storage_backend: {backend!r}")

@@ -1066,6 +1066,8 @@ def filter_signals(
 
 ## M5 — 漏斗 L0–L3 + emit（确定性核心）
 
+> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M5.md`](../logs/M5.md)，历史规格归档见 [`docs/archive/M5-funnel.md`](../archive/M5-funnel.md)，实现计划见 [`docs/plans/M5-implementation-plan.md`](../plans/M5-implementation-plan.md)。剩余项：用例 2（内存泄漏组合升 critical）端到端与 scheduler/API 随 M6；LLM L2 摘要、fpr 回写随 M6/v2。
+
 ### 基础信息
 
 - **目标**：一个 `(tenant_id, domain)` 内的完整漏斗可独立运行（暂不接 scheduler）

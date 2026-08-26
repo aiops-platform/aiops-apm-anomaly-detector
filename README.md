@@ -2,7 +2,7 @@
 
 APM（应用性能监控）告警模块：从第三方 API 采集指标/日志，经确定性的 L0–L3 漏斗，产出 `problem_record` 落库，供下游诊断/修复使用。
 
-> 当前状态：**M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）已完成**（`make lint test dev` 全绿，182 个用例通过）。设计与实现计划见 [`docs/`](docs/)，实现规则见 [`CLAUDE.md`](CLAUDE.md)，实现日志见 [`docs/logs/`](docs/logs/)，归档见 [`docs/archive/`](docs/archive/)。
+> 当前状态：**M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）已完成**（`make lint test dev` 全绿，225 个用例通过）。设计与实现计划见 [`docs/`](docs/)，实现规则见 [`CLAUDE.md`](CLAUDE.md)，实现日志见 [`docs/logs/`](docs/logs/)，归档见 [`docs/archive/`](docs/archive/)。
 
 ## 实现进度
 
@@ -13,7 +13,7 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
 | M2 | 持久化与迁移（migrations + storage + config.loader） | ✅ 已完成 | [`docs/logs/M2.md`](docs/logs/M2.md) |
 | M3 | 采集层与出站网关（collectors + 安全网关 + 监控端点 API） | ✅ 已完成 | [`docs/logs/M3.md`](docs/logs/M3.md) |
 | M4 | 检测层（registry + 内置 detector/suppressor） | ✅ 已完成 | [`docs/logs/M4.md`](docs/logs/M4.md) |
-| M5 | 漏斗 L0–L3 + emit（确定性核心） | 未实现 | — |
+| M5 | 漏斗 L0–L3 + emit（确定性核心） | ✅ 已完成 | [`docs/logs/M5.md`](docs/logs/M5.md) |
 | M6 | 调度、多租户、API、恢复闭环 | 未实现 | — |
 | M7 | 可观测性、安全加固、交付 | 未实现 | — |
 
@@ -45,6 +45,10 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
   - `src/aiops_apm/pipeline/filter_signals.py`：`filter_signals` 结构化 matcher（`*`/None/`""`→全量；str→metric 名/log level；dict→`signal_type` 分派 metric/labels/service 与 level/service）
   - `src/aiops_apm/router/plugins.py`：`GET /v1/plugins` 列表 + `POST /v1/plugins/reload` 重载（`asyncio.to_thread` 防阻塞）
   - lifespan 接线 registry → `app.state.registry`；`/ready` 的 `plugins` 由 M4 起为 True
+- **M5 漏斗 L0–L3 + emit**（确定性核心，`run_domain` 一个 `(tenant_id, domain)` 内独立运行）：
+  - `src/aiops_apm/pipeline/`：`context.py`（`DetectionContext` + `DomainResult` + `build_context`：载入 domain_config + 四类动态配置）、`l0_suppress.py`（维护窗口/黑名单批量抑制）、`l1_detect.py`（按 detector 规则分发，单 detector 异常隔离）、`l2_correlate.py`（按 service 同源关联 + 变更关联 + `template_summary` 模板兜底）、`l3_verify.py`（持续性 + 误报率闸门降级 + 严重度校准）、`emit.py`（组装 ProblemRecord + 原子去重落库）、`runner.py`（`run_domain` 串行编排 + timeline + miss sweep）
+  - `src/aiops_apm/storage/`：`sequence.py`（`SequenceStore` PR-YYYYMMDD-NNNN 原子取号）、`detection_state.py`（`DetectionStateStore` consecutive/miss 计数）、`dynamic_config.py`（`DynamicConfigStore` 四类动态配置读取，按租户过滤）
+  - §13 用例 1/3/4/5/6/7/8/9/10/11 端到端通过（`test_pipeline.py` 11 个 UC-5.x）；用例 2（组合升 critical）留 M6
 
 ## 启动与快速上手
 
