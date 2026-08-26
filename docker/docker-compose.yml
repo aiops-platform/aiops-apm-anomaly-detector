@@ -1,0 +1,55 @@
+# UC-7.4 一键演示环境（本机无 docker → 写出待补跑）。
+#   docker compose up --build -d mysql mock-source apm-alert
+#   docker compose run --rm apm-alert python seed.py
+#   docker compose up -d prometheus
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: aiops_apm_runtime
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot123"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mock-source:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mock-source
+    ports:
+      - "9100:9100"
+
+  apm-alert:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      APM_STORAGE_BACKEND: mysql
+      APM_DB_HOST: mysql
+      APM_DB_PORT: "3306"
+      APM_DB_USER: root
+      APM_DB_PASSWORD: root123
+      APM_DB_NAME: aiops_apm_runtime
+      APM_ENABLE_SCHEDULER: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command: >
+      sh -c "python -m aiops_apm.migrations.runner &&
+             python seed.py &&
+             uvicorn aiops_apm.main:app --host 0.0.0.0 --port 8000"
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - apm-alert

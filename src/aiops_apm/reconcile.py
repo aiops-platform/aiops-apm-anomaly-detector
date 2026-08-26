@@ -18,14 +18,22 @@ from aiops_apm.storage import Storage
 _OPEN_STATES = ("pending", "in_progress")
 
 
+def record_anomalies(rec: dict) -> list:
+    """从记录 JSON 重建该单的 anomaly 对象列表（与 L3 用同一真源，保证可比对）。
+
+    M7（UC-7.6 fpr 回写）由 ``problems`` 复用，重建 group_key 用。
+    """
+    anomalies: list = []
+    for d in rec.get("metric_anomalies") or []:
+        anomalies.append(MetricAnomaly.model_validate(d))
+    for d in rec.get("log_anomalies") or []:
+        anomalies.append(LogAnomaly.model_validate(d))
+    return anomalies
+
+
 def record_anomaly_keys(rec: dict) -> list[str]:
     """从记录 JSON 重建该单的 anomaly_keys（与 L3 用同一真源，保证可比对）。"""
-    keys: list[str] = []
-    for d in rec.get("metric_anomalies") or []:
-        keys.append(fingerprint.anomaly_key(MetricAnomaly.model_validate(d)))
-    for d in rec.get("log_anomalies") or []:
-        keys.append(fingerprint.anomaly_key(LogAnomaly.model_validate(d)))
-    return keys
+    return [fingerprint.anomaly_key(a) for a in record_anomalies(rec)]
 
 
 class Reconciler:

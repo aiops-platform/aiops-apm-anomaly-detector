@@ -17,13 +17,36 @@ from aiops_apm.pipeline.l2_correlate import l2_correlate
 from aiops_apm.pipeline.l3_verify import l3_verify
 
 
+def _signal_summary(signal: Any) -> str:
+    """信号 JSON 安全摘要（UC-7.2 审计 timeline 用，截断防超长）。"""
+    kind = getattr(signal, "kind", "unknown")
+    if kind == "log":
+        return f"log:{getattr(signal, 'service', '?')}:{getattr(signal, 'signature', '') or getattr(signal, 'level', '')}"[:200]
+    return f"metric:{getattr(signal, 'service', '?')}:{getattr(signal, 'metric', '?')}"[:200]
+
+
 async def run_domain(ctx: DetectionContext) -> DomainResult:
     """串行执行一轮漏斗，返回单轮结果与 timeline。"""
     ctx.round_started_at = ctx.now
     timeline = [{"step": "collect_done", "ts": ctx.now, "count": len(ctx.signals)}]
 
     await l0_suppress(ctx)
-    timeline.append({"step": "suppressed", "count": len(ctx.suppressed)})
+    timeline.append(
+        {
+            "step": "suppressed",
+            "ts": ctx.now,
+            "count": len(ctx.suppressed),
+            "details": [
+                {
+                    "signal": _signal_summary(item["signal"]),
+                    "service": getattr(item["signal"], "service", "unknown"),
+                    "suppressor": item["suppressor"],
+                    "reason": str(item.get("reason", ""))[:200],
+                }
+                for item in ctx.suppressed
+            ],
+        }
+    )
 
     await l1_detect(ctx)
     timeline.append({"step": "detected", "count": len(ctx.anomalies)})

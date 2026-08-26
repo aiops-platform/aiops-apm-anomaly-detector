@@ -1,4 +1,4 @@
-"""UC-6.6：``/v1/config`` 配置热加载与域规则读写。"""
+"""UC-6.6：``/v1/config`` 配置热加载与域规则读写。M7（UC-7.3）写入侧校验 + 配置审计日志。"""
 
 from __future__ import annotations
 
@@ -6,8 +6,10 @@ import asyncio
 
 from fastapi import APIRouter, Request
 
+from ..audit import SecurityAudit
 from ..auth import get_principal, require_admin
 from ..config.loader import DomainConfigLoader
+from ..config.validator import validate_domain_config
 from ..exceptions import AppException, ErrorCode
 from ..models.config import DomainConfig
 from .deps import get_tenant_id
@@ -27,12 +29,17 @@ async def reload_config(request: Request) -> dict:
     reg = getattr(state, "registry", None)
     if reg is None:
         raise AppException(ErrorCode.INTERNAL, "plugin registry not loaded")
-    await asyncio.to_thread(
-        reg.reload,
-        http=state.http_client,
-        pool=getattr(state.storage, "pool", None),
-        settings=state.settings,
-    )
+    try:
+        await asyncio.to_thread(
+            reg.reload,
+            http=state.http_client,
+            pool=getattr(state.storage, "pool", None),
+            settings=state.settings,
+        )
+    except Exception as exc:  # noqa: BLE001 -- 审计失败事件后仍向上抛
+        SecurityAudit.log_config_event("*", "reload", "failed", detail=f"{type(exc).__name__}: {exc}")
+        raise
+    SecurityAudit.log_config_event("*", "reload", "success")
     return {"plugins": reg.list()}
 
 
@@ -49,9 +56,18 @@ async def get_domain_config(request: Request, domain: str) -> dict:
 
 @router.put("/{domain}")
 async def put_domain_config(request: Request, domain: str, body: dict) -> dict:
-    """更新该租户某域的检测规则（admin）。"""
+    """更新该租户某域的检测规则（admin）。
+
+    M7（UC-7.3）：``DomainConfig.model_validate`` 基础校验后接 ``validate_domain_config``
+    表驱动结构校验（detector/suppressor 参数），非法抛 ``ConfigValidationError`` → HTTP 400。
+    """
     require_admin(get_principal(request))
     tenant = get_tenant_id(request)
+    state = request.app.state
     cfg = DomainConfig.model_validate(body)
+    reg = getattr(state, "registry", None)
+    if reg is not None:
+        validate_domain_config(cfg, reg)
     version = await _storage(request).domain_configs.upsert(tenant, domain, cfg)
+    SecurityAudit.log_config_event(domain, "put", "success", detail=f"version={version}")
     return {"domain": domain, "version": version}

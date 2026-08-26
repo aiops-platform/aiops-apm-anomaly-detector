@@ -1,0 +1,9 @@
+# UC-7.4 / UC-7.1：Prometheus 抓取 apm-alert 的 /metrics。
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: apm-alert
+    static_configs:
+      - targets: ["apm-alert:8000"]
+    metrics_path: /metrics

@@ -10,6 +10,7 @@ import inspect
 import logging
 from types import MappingProxyType
 
+from aiops_apm.audit import SecurityAudit
 from aiops_apm.exceptions import AppException, ErrorCode
 from aiops_apm.plugins.base import Plugin
 
@@ -38,10 +39,13 @@ class PluginRegistry:
                     plugin = factory(http=http, pool=pool, settings=settings)
                     if inspect.iscoroutine(plugin):  # 契约要求同步 build() -> Plugin；防第三方 async 工厂静默坏
                         logger.warning("plugin build returned coroutine group=%s name=%s (build() 应为同步工厂)", group, ep.name)
+                        SecurityAudit.log_plugin_event(ep.name, "load", "failed", detail="async build() not allowed")
                         continue
                     snapshot[kind][ep.name] = plugin
+                    SecurityAudit.log_plugin_event(ep.name, "load", "success", detail=f"group={group}")
                 except Exception as exc:  # noqa: BLE001 -- 单个插件失败不拖垮整体
                     logger.warning("plugin load failed group=%s name=%s err=%s", group, ep.name, exc)
+                    SecurityAudit.log_plugin_event(ep.name, "load", "failed", detail=f"{type(exc).__name__}: {exc}")
         self._active = MappingProxyType(snapshot)
         return self
 

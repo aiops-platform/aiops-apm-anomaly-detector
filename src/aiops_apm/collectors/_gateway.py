@@ -2,11 +2,14 @@
 
 职责（P0#6 SSRF / secret 在此落地）：
 - ``validate_url``：scheme 白名单 + 私网/云元数据地址拦截（SSRF）。
+  域名先查 IP 字面量，再走 DNS 二次校验（``_resolve_ips``）——解析出的任一 IP
+  命中 ``BLOCKED_NETWORKS`` 拒绝；**解析失败也拒绝**（fail-closed，防 DNS rebinding
+  首查放行）。
 - ``validate_headers``：拒绝明文凭据；``authorization`` / ``x-api-key`` 必须用 ``${env:X}`` / ``${vault:path#key}`` 引用。
 - ``resolve_secret``：把 secret 引用解析为实际值（env 缺失返回空串；vault 为占位）。
 
-无状态（classmethod），不依赖 DB / 外部服务。域名校验只拦 IP 字面量；
-DNS 解析后的二次校验留 M7 安全加固。
+无状态（classmethod），不依赖 DB / 外部服务。拒绝分支走 ``SecurityAudit.log_gateway_event``
+（UC-7.6 安全审计；uri 只记 host:port）。
 """
 
 from __future__ import annotations
@@ -14,9 +17,31 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import socket
 from urllib.parse import urlparse
 
+from ..audit import SecurityAudit
 from ..exceptions import AppException, ErrorCode
+
+
+def _resolve_ips(host: str) -> list[str]:
+    """解析 hostname 的 A/AAAA 记录（去重），返回 IP 列表；不可解析抛 ``socket.gaierror``。"""
+    infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    ips: list[str] = []
+    for info in infos:
+        addr = str(info[4][0])
+        if addr not in ips:
+            ips.append(addr)
+    return ips
+
+
+def _is_ip(value: str) -> bool:
+    """判断字符串是否为合法 IP 地址（含 IPv6）。"""
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
 
 
 class OutboundGateway:
@@ -40,32 +65,57 @@ class OutboundGateway:
     SECRET_HEADERS = ("authorization", "x-api-key")
 
     @classmethod
-    def validate_url(cls, url: str) -> str:
-        """校验 URL 安全性；通过则原样返回，否则抛 ``AppException(VALIDATION, ...)``。"""
+    def validate_url(cls, url: str, *, trace_id: str | None = None) -> str:
+        """校验 URL 安全性；通过则原样返回，否则抛 ``AppException(VALIDATION, ...)``。
+
+        - IP 字面量：直接对 ``BLOCKED_NETWORKS`` 判定。
+        - hostname：``_resolve_ips`` 解析后任一 IP 命中私网 → 拒绝；
+          解析失败（``socket.gaierror``）→ 拒绝（fail-closed，防 DNS rebinding）。
+        """
         parsed = urlparse(url)
         if parsed.scheme not in cls.ALLOWED_SCHEMES:
+            SecurityAudit.log_gateway_event(url, True, f"scheme not allowed: {parsed.scheme}")
             raise AppException(ErrorCode.VALIDATION, f"scheme not allowed: {parsed.scheme}")
         hostname = parsed.hostname
-        if hostname:
+        if not hostname:
+            SecurityAudit.log_gateway_event(url, True, "missing host")
+            raise AppException(ErrorCode.VALIDATION, "missing host")
+        try:
+            ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            ip = None
+        if ip is not None:
+            cls._check_blocked(url, [ip])
+        else:
             try:
-                ip = ipaddress.ip_address(hostname)
-                for net in cls.BLOCKED_NETWORKS:
-                    if ip in net:
-                        raise AppException(ErrorCode.VALIDATION, f"blocked network: {ip}")
-            except ValueError:
-                pass  # 域名，后续 DNS 解析后再次校验（M7）
+                ips = _resolve_ips(hostname)
+            except socket.gaierror as exc:
+                SecurityAudit.log_gateway_event(url, True, f"dns resolution failed: {hostname}")
+                raise AppException(ErrorCode.VALIDATION, f"dns resolution failed for {hostname}") from exc
+            cls._check_blocked(url, [ipaddress.ip_address(i) for i in ips if _is_ip(i)])
         return url
 
     @classmethod
-    def validate_headers(cls, headers: dict) -> dict:
+    def _check_blocked(cls, url: str, ips: list) -> None:
+        """任一 IP 命中私网/云元数据 → 拒绝（含审计）。"""
+        for ip in ips:
+            for net in cls.BLOCKED_NETWORKS:
+                if ip in net:
+                    SecurityAudit.log_gateway_event(url, True, f"blocked network: {ip}")
+                    raise AppException(ErrorCode.VALIDATION, f"blocked network: {ip}")
+
+    @classmethod
+    def validate_headers(cls, headers: dict, *, trace_id: str | None = None) -> dict:
         """校验 headers 的 secret 引用；通过则原样返回，否则抛 ``AppException(VALIDATION, ...)``。"""
         for k, v in headers.items():
             if not isinstance(v, str):
                 continue
             if cls.PLAINTEXT_CRED_PATTERN.search(v):
+                SecurityAudit.log_gateway_event(f"header:{k}", True, "plaintext credential")
                 raise AppException(ErrorCode.VALIDATION, f"plaintext credential in header: {k}")
             # authorization/x-api-key 的值必须包含 secret 引用（支持 "Bearer ${env:X}" 形式）
             if k.lower() in cls.SECRET_HEADERS and not cls.SECRET_REF_PATTERN.search(v):
+                SecurityAudit.log_gateway_event(f"header:{k}", True, "missing secret reference")
                 raise AppException(ErrorCode.VALIDATION, f"header must use secret reference: {k}")
         return headers
 

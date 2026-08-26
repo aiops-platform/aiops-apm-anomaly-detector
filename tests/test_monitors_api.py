@@ -10,6 +10,12 @@ import pytest
 PROM_URL = "https://prometheus.example.com:9090/api/v1/query"
 
 
+@pytest.fixture(autouse=True)
+def _public_dns(monkeypatch):
+    """hostname URL 在 create/update 时过 ``validate_url`` 的 DNS 二次校验（M7）——统一放行为公网 IP。"""
+    monkeypatch.setattr("aiops_apm.collectors._gateway._resolve_ips", lambda host: ["93.184.216.34"])
+
+
 def _metric_body(**overrides):
     body = {
         "service": "order-management",

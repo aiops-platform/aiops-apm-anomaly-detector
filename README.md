@@ -2,7 +2,7 @@
 
 APM（应用性能监控）告警模块：从第三方 API 采集指标/日志，经确定性的 L0–L3 漏斗，产出 `problem_record` 落库，供下游诊断/修复使用。
 
-> 当前状态：**M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）+ M6 调度/多租户/API/恢复闭环已完成**（`make lint test dev` 全绿，287 个用例通过）。设计与实现计划见 [`docs/`](docs/)，实现规则见 [`CLAUDE.md`](CLAUDE.md)，实现日志见 [`docs/logs/`](docs/logs/)，归档见 [`docs/archive/`](docs/archive/)。
+> 当前状态：**M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）+ M6 调度/多租户/API/恢复闭环 + M7 可观测性/安全加固/交付已完成**（`make lint test dev` 全绿，351 个用例通过）。设计与实现计划见 [`docs/`](docs/)，实现规则见 [`CLAUDE.md`](CLAUDE.md)，实现日志见 [`docs/logs/`](docs/logs/)，归档见 [`docs/archive/`](docs/archive/)。
 
 ## 实现进度
 
@@ -15,11 +15,11 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
 | M4 | 检测层（registry + 内置 detector/suppressor） | ✅ 已完成 | [`docs/logs/M4.md`](docs/logs/M4.md) |
 | M5 | 漏斗 L0–L3 + emit（确定性核心） | ✅ 已完成 | [`docs/logs/M5.md`](docs/logs/M5.md) |
 | M6 | 调度、多租户、API、恢复闭环 | ✅ 已完成 | [`docs/logs/M6.md`](docs/logs/M6.md) |
-| M7 | 可观测性、安全加固、交付 | 未实现 | — |
+| M7 | 可观测性、安全加固、交付 | ✅ 已完成 | [`docs/logs/M7.md`](docs/logs/M7.md) |
 
 > 每完成一个里程碑：在 `docs/logs/<M阶段>.md` 记录实现日志，把已实现章节归档到 `docs/archive/`，并更新本表。
 
-## 已实现（M0–M6）
+## 已实现（M0–M7）
 
 - **M0 工程基座**：
   - 工程骨架：`pyproject.toml`（依赖 + 三个 entry_points 占位）、`Makefile`、`.env.example`、ruff/mypy/pytest/pre-commit
@@ -58,6 +58,15 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
   - `src/aiops_apm/summary.py` — `SummaryProvider` 钩子（模板默认，`enable_llm_summary` 开关，不接真实 LLM）
   - `src/aiops_apm/router/` — `alerts.py`（`POST /v1/alerts/run` 全量/域过滤）、`problems.py`（`/v1/problems` 查询 + resolve）、`config.py`（reload + 域配置读写）、`maintenance.py`（维护窗口 CRUD）、`blacklist.py`（黑名单 CRUD）；`monitors.py` 加 `POST /{id}/run` 手动单跑
   - §13 用例 2 端到端：related + high metric + high log → critical（`test_uc62_combo_critical.py`）；reconcile 自动关单、跨租户 403、多副本 lease 全部测试覆盖（原 225 不回归，新增 62 → 287）
+- **M7 可观测性、安全加固、交付**（Prometheus 指标 + 轮次审计 + 安全审计日志 + 配置校验 + fpr 回写 + Docker/压测，原 287 不回归，新增 64 → 351）：
+  - `src/aiops_apm/metrics.py` — Prometheus 7 类指标（round_total/success、records_created、degraded_sources、suppressed_total、false_positive_rate Gauge、round_duration Histogram）；`/metrics` 端点暴露；`poller.run_round` 每轮打点（`test_metrics.py`）
+  - `src/aiops_apm/storage/rounds.py` + `migrations/V3__detection_round_domain.sql` — `RoundStore`（InMemory/MySQL）读写 `detection_round`，`poller` 每轮 create running → success/partial/failed
+  - `src/aiops_apm/router/audit.py` — `GET /v1/audit/rounds`（domain/status/limit 过滤）+ `GET /v1/audit/suppressed`（从轮次 timeline details 摊平）
+  - `src/aiops_apm/audit.py` — `SecurityAudit` 五类结构化审计日志（auth/gateway/plugin/config/round），`APM_AUDIT_ENABLED` 开关，不记明文凭据（key 只留 sha256 前缀、URI 只留 host:port）
+  - `src/aiops_apm/collectors/_gateway.py` — SSRF **DNS 二次校验**（`_resolve_ips`，解析 IP 命中私网拒绝，`gaierror` fail-closed 拒绝，防 DNS rebinding）
+  - `src/aiops_apm/config/validator.py` — `validate_domain_config` detector/suppressor 参数表驱动校验；`PUT /v1/config/{domain}` 非法 → 400 `CONFIG_ERROR`
+  - `src/aiops_apm/storage/dynamic_config.py` `write_fpr` + `POST /v1/problems/{id}/resolve` 支持 `{"false_positive": true}` 误报回写 → `fpr_table` + FPR Gauge 重算
+  - `docker/` — Dockerfile（多阶段 uvicorn）+ docker-compose（mysql + mock-source + apm-alert + prometheus）+ seed.py + custom_detector(p95_latency 第三方插件示例) + demo.py + locustfile.py + prometheus.yml；`Makefile` `docker-up`/`docker-down`/`loadtest`（本机无 docker/locust → 写出待补跑）
 
 ## 启动与快速上手
 
@@ -210,6 +219,45 @@ curl -i -X POST http://127.0.0.1:<port>/v1/blacklist -H "Content-Type: applicati
 # 鉴权示例（配置了 APM_API_KEYS 后）：scoped key 自带租户 / master key 任意租户
 curl -i http://127.0.0.1:<port>/v1/monitors -H "Authorization: Bearer k1" -H "X-Tenant-Id: tenant-a"
 curl -i http://127.0.0.1:<port>/v1/monitors -H "Authorization: Bearer k2"   # "*" 任意租户
+```
+
+#### M7 指标 / 审计 / 配置校验 / 误报回写
+
+Prometheus 指标（`/metrics`）暴露 7 类指标，每轮检测自动打点（无需额外配置）；检测轮次写入 `detection_round`，可审计查询；config PUT 做 detector/suppressor 参数校验（非法 → 400 `CONFIG_ERROR`）；问题单 resolve 可回写误报：
+
+```bash
+# Prometheus 指标文本（round_total/success、records_created、degraded_sources、
+#   suppressed_total、false_positive_rate、round_duration_seconds）
+curl -i http://127.0.0.1:<port>/metrics
+
+# 轮次审计：按 domain/status 过滤，started_at 倒序
+curl -i "http://127.0.0.1:<port>/v1/audit/rounds?domain=application&status=success&limit=10"
+
+# 被抑制信号摊平（从轮次 timeline details，可选 ?service= 过滤）
+curl -i "http://127.0.0.1:<port>/v1/audit/suppressed?service=order-management"
+
+# 配置写入侧校验：static_threshold 缺 threshold → 400 CONFIG_ERROR
+curl -i -X PUT http://127.0.0.1:<port>/v1/config/application -H "Content-Type: application/json" \
+  -d '{"detectors":[{"plugin":"static_threshold","params":{}}]}'
+
+# 误报回写：手动关单并记为误报（写 fpr_table + 更新 FPR Gauge）
+curl -i -X POST http://127.0.0.1:<port>/v1/problems/PR-20260826-0001/resolve \
+  -H "Content-Type: application/json" -d '{"false_positive":true}'
+
+# SSRF DNS 二次校验：hostname 解析到私网 → 400；解析失败（gaierror）→ fail-closed 400
+curl -i -X POST http://127.0.0.1:<port>/v1/monitors -H "Content-Type: application/json" \
+  -d '{"service":"x","signal_type":"metric","source_type":"prometheus",
+       "source_config":{"url":"http://internal.example.com/metrics","field_mapping":{}}}'
+```
+
+安全审计日志输出到 `aiops_apm.audit` logger（Docker 由 stdout 收集），`APM_AUDIT_ENABLED=false` 可关。
+
+Docker / 压测（本机无 docker/locust 时写出待补跑；环境可用后执行）：
+
+```bash
+make docker-up      # docker compose up：mysql + mock-source + apm-alert + prometheus
+make docker-down    # docker compose down
+make loadtest       # locust headless 压测（/v1/problems、POST /v1/alerts/run、/metrics、/v1/audit/rounds）
 ```
 
 ### 5. 质量检查（提交前）

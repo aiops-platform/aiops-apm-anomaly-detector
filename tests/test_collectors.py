@@ -20,6 +20,13 @@ from aiops_apm.collectors._gateway import OutboundGateway
 from aiops_apm.exceptions import AppException, ErrorCode
 from aiops_apm.storage import InMemorySnapshotStore, InMemoryWatermarkStore
 
+
+@pytest.fixture(autouse=True)
+def _public_dns(monkeypatch):
+    """hostname URL 在 collect 时过 ``validate_url`` 的 DNS 二次校验（M7）——统一放行为公网 IP。"""
+    monkeypatch.setattr("aiops_apm.collectors._gateway._resolve_ips", lambda host: ["93.184.216.34"])
+
+
 # ---- 目标构造 ----
 
 

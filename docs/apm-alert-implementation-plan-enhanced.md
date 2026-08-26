@@ -365,7 +365,7 @@ def build(*, http=None, pool=None, settings=None) -> Plugin:
 
 ## M3 — 采集层与出站网关（已实现）
 
-> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M3.md`](../logs/M3.md)，历史规格归档见 [`docs/archive/M3-collectors.md`](../archive/M3-collectors.md)，实现计划见 [`docs/plans/M3-implementation-plan.md`](../plans/M3-implementation-plan.md)。剩余项：`POST /v1/monitors/{target_id}/run` 立即执行与调度器并行降级随 M6；DNS 二次校验 / Vault 密钥管理随 M7。
+> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M3.md`](../logs/M3.md)，历史规格归档见 [`docs/archive/M3-collectors.md`](../archive/M3-collectors.md)，实现计划见 [`docs/plans/M3-implementation-plan.md`](../plans/M3-implementation-plan.md)。剩余项：`POST /v1/monitors/{target_id}/run` 立即执行与调度器并行降级随 M6 落地；DNS 二次校验已随 M7 落地（fail-closed）；Vault 密钥管理待后续。
 
 ### 基础信息
 
@@ -701,7 +701,7 @@ class MockCollector(Collector):
 
 ## M4 — 插件化（registry + 内置 detector/suppressor）（已实现）
 
-> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M4.md`](../logs/M4.md)，历史规格归档见 [`docs/archive/M4-plugins.md`](../archive/M4-plugins.md)，实现计划见 [`docs/plans/M4-implementation-plan.md`](../plans/M4-implementation-plan.md)。剩余项：漏斗主体（`l0_suppress`/`l1_detect`/L2/L3/emit）随 M5；维护窗口/黑名单表读取与 admin 写表 API 随 M6；reload admin 权限随 M7。
+> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M4.md`](../logs/M4.md)，历史规格归档见 [`docs/archive/M4-plugins.md`](../archive/M4-plugins.md)，实现计划见 [`docs/plans/M4-implementation-plan.md`](../plans/M4-implementation-plan.md)。剩余项：漏斗主体（`l0_suppress`/`l1_detect`/L2/L3/emit）随 M5 落地；维护窗口/黑名单表读取与 admin 写表 API、reload admin 权限随 M6 落地。
 
 ### 基础信息
 
@@ -1066,7 +1066,7 @@ def filter_signals(
 
 ## M5 — 漏斗 L0–L3 + emit（确定性核心）
 
-> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M5.md`](../logs/M5.md)，历史规格归档见 [`docs/archive/M5-funnel.md`](../archive/M5-funnel.md)，实现计划见 [`docs/plans/M5-implementation-plan.md`](../plans/M5-implementation-plan.md)。剩余项：用例 2（内存泄漏组合升 critical）端到端与 scheduler/API 随 M6；LLM L2 摘要、fpr 回写随 M6/v2。
+> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M5.md`](../logs/M5.md)，历史规格归档见 [`docs/archive/M5-funnel.md`](../archive/M5-funnel.md)，实现计划见 [`docs/plans/M5-implementation-plan.md`](../plans/M5-implementation-plan.md)。剩余项：用例 2（内存泄漏组合升 critical）端到端与 scheduler/API 随 M6 落地；fpr 回写已随 M7 落地；LLM L2 摘要待后续。
 
 ### 基础信息
 
@@ -1512,7 +1512,7 @@ async def run_domain(ctx: DetectionContext) -> "DomainResult":
 
 ## M6 — 调度、多租户、API、恢复闭环
 
-> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M6.md`](../logs/M6.md)，历史规格归档见 [`docs/archive/M6-scheduler-apis.md`](../archive/M6-scheduler-apis.md)，实现计划见 [`docs/plans/M6-implementation-plan.md`](../plans/M6-implementation-plan.md)。剩余项：真实 LLM L2 摘要、detector params 写入侧校验、fpr 回写、MySQL 真库实测随 M7/后续。
+> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M6.md`](../logs/M6.md)，历史规格归档见 [`docs/archive/M6-scheduler-apis.md`](../archive/M6-scheduler-apis.md)，实现计划见 [`docs/plans/M6-implementation-plan.md`](../plans/M6-implementation-plan.md)。剩余项：detector params 写入侧校验、fpr 回写已随 M7 落地；真实 LLM L2 摘要、MySQL 真库实测待后续。
 
 ### 基础信息
 
@@ -2019,7 +2019,9 @@ async def run_all(request: Request, principal: Principal = Depends(get_principal
 
 ---
 
-## M7 — 可观测性、安全加固、交付
+## M7 — 可观测性、安全加固、交付（已实现）
+
+> **已实现**（2026-08-27）。实现日志见 [`docs/logs/M7.md`](../logs/M7.md)，历史规格归档见 [`docs/archive/M7-observability-security.md`](../archive/M7-observability-security.md)，实现计划见 [`docs/plans/M7-implementation-plan.md`](../plans/M7-implementation-plan.md)。剩余项：真实 LLM L2 摘要、vault 密钥管理、真库/真容器实测（MySQL、docker compose、locust）待环境可用补跑。
 
 ### 基础信息
 

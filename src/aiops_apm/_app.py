@@ -10,9 +10,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import generate_latest
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .audit import set_audit_enabled
 from .auth.middleware import AuthMiddleware
 from .collectors import SharedHttpClient
 from .exceptions import AppException, ErrorCode
@@ -35,6 +37,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     多副本下 scheduler 靠 lease 门控，仅一个副本实际调度（UC-6.9）。
     """
     settings: Settings = app.state.settings
+    set_audit_enabled(settings.audit_enabled)
     app.state.storage = await build_storage(settings)
     app.state.http_client = SharedHttpClient(settings)
     app.state.registry = PluginRegistry().load(
@@ -73,6 +76,7 @@ def _status_for_code(code: ErrorCode) -> int:
         ErrorCode.NOT_FOUND: 404,
         ErrorCode.PLUGIN_NOT_FOUND: 404,
         ErrorCode.VALIDATION: 400,
+        ErrorCode.CONFIG_ERROR: 400,
         ErrorCode.PERMISSION: 403,
     }
     return mapping.get(code, 500)
@@ -91,6 +95,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.add_middleware(AuthMiddleware, api_keys=app.state.settings.api_keys)
 
     app.include_router(api_router)
+
+    @app.get("/metrics", include_in_schema=False)
+    async def _metrics() -> Response:
+        """Prometheus 指标（UC-7.1）：`generate_latest()` 暴露默认注册表全部指标。"""
+        return Response(generate_latest(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
     @app.exception_handler(AppException)
     async def _app_exception_handler(request: Request, exc: AppException) -> JSONResponse:

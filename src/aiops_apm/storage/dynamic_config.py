@@ -68,6 +68,10 @@ class DynamicConfigStore(ABC):
     async def delete_blacklist(self, tenant_id: str, entry_id: int) -> None:
         """删除黑名单行。"""
 
+    @abstractmethod
+    async def write_fpr(self, tenant_id: str, group_key: str, *, false_positive: bool) -> None:
+        """误报回写（UC-7.6）：该 group_key 记录一次判定，total+1，fpr 重算落库。"""
+
 
 class InMemoryDynamicConfigStore(DynamicConfigStore):
     def __init__(self) -> None:
@@ -201,6 +205,18 @@ class InMemoryDynamicConfigStore(DynamicConfigStore):
             raise ValueError("tenant_id is required")
         rows = self._blacklist.get(tenant_id, [])
         self._blacklist[tenant_id] = [r for r in rows if r["id"] != entry_id]
+
+    async def write_fpr(self, tenant_id: str, group_key: str, *, false_positive: bool) -> None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        table = self._fpr.setdefault(tenant_id, {})
+        row = table.get(group_key)
+        old_total = int(row.get("total", 0)) if row else 0
+        old_fpr = float(row.get("fpr", 0.0)) if row else 0.0
+        new_total = old_total + 1
+        fp_inc = 1 if false_positive else 0
+        new_fpr = (old_fpr * old_total + fp_inc) / new_total
+        table[group_key] = {"fpr": round(new_fpr, 4), "total": new_total}
 
 
 class MySQLDynamicConfigStore(DynamicConfigStore):
@@ -373,4 +389,19 @@ class MySQLDynamicConfigStore(DynamicConfigStore):
             raise ValueError("tenant_id is required")
         await self._pool.execute(
             "DELETE FROM suppress_blacklist WHERE tenant_id=%s AND id=%s", (tenant_id, entry_id)
+        )
+
+    async def write_fpr(self, tenant_id: str, group_key: str, *, false_positive: bool) -> None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        fp_inc = 1 if false_positive else 0
+        # 单语句原子回写：total+1、false_positive 按判定 +1、fpr 重算（fpr = 累计误报 / 累计判定）
+        await self._pool.execute(
+            "INSERT INTO fpr_table (tenant_id, group_key, false_positive_cnt, total_cnt, fpr) "
+            "VALUES (%s, %s, %s, 1, %s) "
+            "ON DUPLICATE KEY UPDATE "
+            "total_cnt = total_cnt + 1, "
+            "false_positive_cnt = false_positive_cnt + %s, "
+            "fpr = (false_positive_cnt + %s) / (total_cnt + 1)",
+            (tenant_id, group_key, fp_inc, 1.0 if false_positive else 0.0, fp_inc, fp_inc),
         )

@@ -13,6 +13,7 @@ from .dynamic_config import DynamicConfigStore, InMemoryDynamicConfigStore, MySQ
 from .lease import InMemoryLeaseStore, LeaseStore, MySQLLeaseStore
 from .monitor_targets import InMemoryMonitorTargetStore, MonitorTargetStore, MySQLMonitorTargetStore
 from .records import InMemoryRecordStore, MySQLRecordStore, RecordStore
+from .rounds import InMemoryRoundStore, MySQLRoundStore, RoundStore
 from .sequence import InMemorySequenceStore, MySQLSequenceStore, SequenceStore
 from .snapshots import InMemorySnapshotStore, MySQLSnapshotStore, SnapshotStore
 from .watermarks import InMemoryWatermarkStore, MySQLWatermarkStore, WatermarkStore
@@ -30,11 +31,12 @@ __all__ = [
     "DetectionStateStore",
     "DynamicConfigStore",
     "LeaseStore",
+    "RoundStore",
 ]
 
 
 class Storage:
-    """聚合 records + domain_configs + monitor_targets + snapshots + watermarks + M5 三件套 + leases + 连接池。"""
+    """聚合 records + domain_configs + monitor_targets + snapshots + watermarks + M5 三件套 + leases + rounds + 连接池。"""
 
     def __init__(
         self,
@@ -48,6 +50,7 @@ class Storage:
         detection_state: DetectionStateStore,
         dynamic_config: DynamicConfigStore,
         leases: LeaseStore,
+        rounds: RoundStore,
         pool: ConnectionPool | None = None,
     ) -> None:
         self.records = records
@@ -59,6 +62,7 @@ class Storage:
         self.detection_state = detection_state
         self.dynamic_config = dynamic_config
         self.leases = leases
+        self.rounds = rounds
         self.pool = pool
 
     async def health_check(self) -> bool:
@@ -84,6 +88,7 @@ async def build_storage(settings: Settings) -> Storage:
             detection_state=InMemoryDetectionStateStore(),
             dynamic_config=InMemoryDynamicConfigStore(),
             leases=InMemoryLeaseStore(),
+            rounds=InMemoryRoundStore(),
         )
     if backend == "mysql":
         pool = ConnectionPool(settings, db=settings.db_name)
@@ -98,6 +103,7 @@ async def build_storage(settings: Settings) -> Storage:
             detection_state=MySQLDetectionStateStore(pool),
             dynamic_config=MySQLDynamicConfigStore(pool),
             leases=MySQLLeaseStore(pool),
+            rounds=MySQLRoundStore(pool),
             pool=pool,
         )
     raise ValueError(f"unknown storage_backend: {backend!r}")

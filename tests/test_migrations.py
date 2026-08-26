@@ -69,9 +69,10 @@ def test_split_statements_ignores_comments_and_quoted_semicolons() -> None:
 def test_load_scripts_parses_version() -> None:
     runner = _runner(FakeConn())
     scripts = runner._load_scripts()
-    assert [s.version for s in scripts] == [1, 2]
+    assert [s.version for s in scripts] == [1, 2, 3]
     assert "problem_record" in scripts[0].sql
     assert "collect_watermark" in scripts[1].sql
+    assert "detection_round" in scripts[2].sql
 
 
 def test_v1_script_contains_twelve_tables_and_dedup_mechanism() -> None:
@@ -105,11 +106,12 @@ async def test_migrate_applies_new_scripts_in_order() -> None:
     conn = FakeConn(current_version=0)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 2
+    assert applied == 3
     assert conn.schema_versions_created
     assert any(s.startswith("CREATE DATABASE IF NOT EXISTS aiops_apm_runtime") for s in conn.statements)
     assert any(s.strip().startswith("CREATE TABLE IF NOT EXISTS problem_record") for s in conn.statements)
     assert any(s.strip().startswith("CREATE TABLE IF NOT EXISTS collect_watermark") for s in conn.statements)
+    assert any("ALTER TABLE detection_round ADD COLUMN domain" in s for s in conn.statements)
     # 版本号已记录
     assert any("INSERT INTO schema_versions" in s for s in conn.statements)
 
@@ -118,10 +120,11 @@ async def test_migrate_idempotent_skips_applied_versions() -> None:
     conn = FakeConn(current_version=1)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 1  # V1 已应用，仅补 V2
+    assert applied == 2  # V1 已应用，仅补 V2、V3
     # 已应用版本不重复执行其建表语句
     assert not any("CREATE TABLE IF NOT EXISTS problem_record" in s for s in conn.statements)
     assert any("CREATE TABLE IF NOT EXISTS collect_watermark" in s for s in conn.statements)
+    assert any("ALTER TABLE detection_round ADD COLUMN domain" in s for s in conn.statements)
 
 
 def test_v2_script_contains_collect_watermark() -> None:
@@ -131,3 +134,10 @@ def test_v2_script_contains_collect_watermark() -> None:
     # 主键 (tenant_id, target_id) —— 每个端点一行水位线
     assert "PRIMARY KEY (tenant_id, target_id)" in sql
     assert "last_ts" in sql
+
+
+def test_v3_script_adds_detection_round_domain() -> None:
+    runner = _runner(FakeConn())
+    sql = runner._load_scripts()[2].sql
+    assert "ALTER TABLE detection_round ADD COLUMN domain" in sql
+    assert "DEFAULT 'application'" in sql

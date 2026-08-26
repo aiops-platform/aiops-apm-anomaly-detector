@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # 为空 = 放行（不挂 AuthMiddleware，既有 API 测试零改动）。
     api_keys: dict[str, str] = {}
 
+    # ---- 可观测性 / 安全（M7 起生效）----
+    # 安全审计日志开关（APM_AUDIT_ENABLED，默认开；日志即审计，不落库）。
+    audit_enabled: bool = True
+    # 轮次审计 list_rounds 默认取轮次数上限（APM_ROUND_RETENTION_ROUNDS）。
+    round_retention_rounds: int = 1000
+
     # ---- 出站（M3 起生效）----
     outbound_timeout_sec: float = 10.0
     outbound_max_body_bytes: int = 5_000_000

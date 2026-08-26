@@ -12,6 +12,7 @@ import uuid
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
+from ..audit import SecurityAudit
 from ..exceptions import ErrorCode
 from . import Principal
 
@@ -30,8 +31,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         auth = request.headers.get("Authorization", "")
         key = auth[len("Bearer ") :].strip() if auth.startswith("Bearer ") else ""
+        requested = request.headers.get("X-Tenant-Id", "default")
         scope_raw = self._api_keys.get(key) if key else None
         if scope_raw is None:
+            # 审计（UC-7.6）：不记 key 明文，SecurityAudit 只留 sha256 前缀
+            SecurityAudit.log_auth_event(requested, "request", "deny", detail="missing_or_invalid_key")
             return JSONResponse(
                 status_code=401,
                 content={
@@ -41,8 +45,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 },
             )
         tenants = self._scope(scope_raw)
-        requested = request.headers.get("X-Tenant-Id", "default")
         if "*" not in tenants and requested not in tenants:
+            SecurityAudit.log_auth_event(requested, "request", "deny", detail="tenant_out_of_scope")
             return JSONResponse(
                 status_code=403,
                 content={
@@ -51,6 +55,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     "trace_id": uuid.uuid4().hex,
                 },
             )
+        SecurityAudit.log_auth_event(requested, "request", "allow")
         request.state.principal = Principal(
             api_key=key,
             tenants=tenants,

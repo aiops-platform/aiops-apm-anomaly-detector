@@ -1,9 +1,10 @@
-"""API 路由：M0 探针 + M3 /v1/monitors + M4 /v1/plugins + M6 alerts/problems/config/maintenance/blacklist。"""
+"""API 路由：M0 探针 + M3 /v1/monitors + M4 /v1/plugins + M6 alerts/problems/config/maintenance/blacklist + M7 audit。"""
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from .alerts import router as alerts_router
+from .audit import router as audit_router
 from .blacklist import router as blacklist_router
 from .config import router as config_router
 from .maintenance import router as maintenance_router
@@ -19,6 +20,7 @@ api_router.include_router(problems_router)
 api_router.include_router(config_router)
 api_router.include_router(maintenance_router)
 api_router.include_router(blacklist_router)
+api_router.include_router(audit_router)
 
 
 @api_router.get("/health")

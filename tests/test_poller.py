@@ -1,4 +1,4 @@
-"""M6 poller：``run_round`` 并行采集 → 降级标记 → 入漏斗。"""
+"""M6 poller：``run_round`` 并行采集 → 降级标记 → 入漏斗。M7 扩展：轮次审计 + metrics。"""
 
 from datetime import datetime, timezone
 
@@ -64,5 +64,45 @@ async def test_run_round_marks_failed_target_as_degraded() -> None:
         assert result.degraded_sources == ["MT-0009"]
         assert result.anomaly_count == 0  # 无有效信号
         assert result.timeline[0]["step"] == "collect_done"
+    finally:
+        await storage.close()
+
+
+async def test_run_round_writes_detection_round_success() -> None:
+    storage = await make_storage()
+    try:
+        registry = PluginRegistry().load()
+        sig = MetricSignal(service="svc-a", metric="cpu_usage", value=0.98, timestamp=TS)
+        await run_round(
+            registry=registry, storage=storage, tenant_id="default", domain="application",
+            targets=[_target(target_id="MT-0001", _mock_signals=[sig])], now=TS,
+        )
+        rounds = await storage.rounds.list_rounds("default")
+        assert len(rounds) == 1
+        r = rounds[0]
+        assert r["status"] == "success"
+        assert r["domain"] == "application"
+        assert r["started_at"] == TS
+        assert r["timeline"][0]["step"] == "collect_done"
+        # 轮次审计 timeline 里 suppressed 步骤带 details（JSON 安全）
+        assert all(s.get("step") != "suppressed" or "details" in s for s in r["timeline"])
+    finally:
+        await storage.close()
+
+
+async def test_run_round_writes_detection_round_partial_on_degraded() -> None:
+    storage = await make_storage()
+    try:
+        registry = PluginRegistry().load()
+        bad = _target(target_id="MT-0009", source_type="unknown")
+        ok = _target(target_id="MT-0001", _mock_signals=[])
+        result = await run_round(
+            registry=registry, storage=storage, tenant_id="default", domain="application",
+            targets=[bad, ok], now=TS,
+        )
+        assert result.degraded_sources == ["MT-0009"]
+        rounds = await storage.rounds.list_rounds("default")
+        assert rounds[0]["status"] == "partial"
+        assert rounds[0]["degraded_sources"] == ["MT-0009"]
     finally:
         await storage.close()

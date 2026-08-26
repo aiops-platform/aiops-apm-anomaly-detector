@@ -1,0 +1,17 @@
+# UC-7.4 可插拔规则示例：第三方 p95_latency 检测器包（独立 entry_points）。
+# 安装后 PluginRegistry 会发现 `aiops_apm.detectors` 下的 p95_latency → build()。
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "p95-latency-detector"
+version = "0.1.0"
+description = "demo: latency p95 超过阈值告警的第三方检测器"
+requires-python = ">=3.10"
+
+[project.entry-points."aiops_apm.detectors"]
+p95_latency = "p95_latency:build"
+
+[tool.setuptools]
+packages = ["p95_latency"]

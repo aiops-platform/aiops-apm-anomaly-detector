@@ -1,0 +1,6 @@
+# 模拟第三方源（UC-7.4）：stdlib HTTP，:9100 暴露 /metrics /logs。
+FROM python:3.11-slim
+WORKDIR /app
+COPY docker/mock_source.py /app/mock_source.py
+EXPOSE 9100
+CMD ["python", "/app/mock_source.py"]

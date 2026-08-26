@@ -6,7 +6,7 @@ MYPY     := $(VENV)/bin/mypy
 PYTEST   := $(VENV)/bin/pytest
 UVICORN  := $(VENV)/bin/uvicorn
 
-.PHONY: install lint test dev migrate
+.PHONY: install lint test dev migrate docker-up docker-down loadtest
 
 install:
 	python3 -m venv $(VENV)
@@ -26,3 +26,13 @@ dev:
 migrate:
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	$(PY) -m aiops_apm.migrations.runner
+
+# ---- M7 交付：Docker 一键演示 + 压测（本机无 docker/locust → 待补跑）----
+docker-up:
+	docker compose -f docker/docker-compose.yml up --build -d mysql mock-source apm-alert prometheus
+
+docker-down:
+	docker compose -f docker/docker-compose.yml down
+
+loadtest:
+	locust -f docker/locustfile.py --host http://127.0.0.1:8000 --headless -u 20 -r 2 -t 60s

@@ -7,7 +7,9 @@ from aiops_apm.exceptions import AppException, ErrorCode
 
 # ---- validate_url ----
 
-def test_validate_url_allows_public_http_https():
+def test_validate_url_allows_public_http_https(monkeypatch):
+    # hostname 走 DNS 二次校验：monkeypatch 解析为公网 IP → 放行
+    monkeypatch.setattr("aiops_apm.collectors._gateway._resolve_ips", lambda host: ["93.184.216.34"])
     url = "https://prometheus.example.com:9090/api/v1/query"
     assert OutboundGateway.validate_url(url) == url
 
