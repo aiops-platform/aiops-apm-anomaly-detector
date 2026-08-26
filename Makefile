@@ -23,6 +23,6 @@ dev:
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	$(UVICORN) aiops_apm._app:create_app --factory --reload --host 0.0.0.0 --port "$${APM_PORT:-8000}"
 
-# M2 阶段实现
 migrate:
-	@echo "M2 阶段提供：建齐单一 schema aiops_apm_runtime 的所有表"
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	$(PY) -m aiops_apm.migrations.runner

@@ -16,6 +16,7 @@ dependencies = [
     "pydantic-settings>=2.2",
     "aiomysql>=0.2.0",
     "prometheus_client>=0.20",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

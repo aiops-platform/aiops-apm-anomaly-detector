@@ -6,7 +6,7 @@
 
 `aiops-apm-anomaly-detector` 是一个 APM（应用性能监控）告警模块。它从第三方 API 采集指标/日志，经过确定性的 L0–L3 漏斗，最终产出 `problem_record` 落库，供下游诊断/修复使用。
 
-**当前里程碑：** M0 工程基座已完成（`make lint test dev` 全绿）。已实现：工程骨架（`pyproject.toml`、`Makefile`、`.env.example`、ruff/mypy/pytest/pre-commit）、`Settings`、`AppException`/`ErrorCode`、`create_app`/`lifespan`、统一异常响应（`{code, reason, trace_id}`）、`/health`、`/ready` 探针。下一阶段：M1 契约层。
+**当前里程碑：** M0 工程基座 + M1 契约层 + M2 持久化与迁移已完成（`make lint test dev` 全绿，45 用例）。已实现：工程骨架、`Settings`、`AppException`/`ErrorCode`、统一异常响应、探针（M0）；`models/`（signal/anomaly/record/config）+ `models/fingerprint.py`（去重真源）+ `plugins/base.py`（插件 ABC，契约冻结）（M1）；`migrations/`（`MigrationRunner` + `V1__init_tables.sql` 12 张表，`make migrate`）+ `storage/`（`ConnectionPool`/`RecordStore`/`DomainConfigStore`/`build_storage`，problem_record 原子去重）+ `config/`（`DomainConfigLoader` + `domains.yaml` seed）（M2）。下一阶段：M3 采集层与出站网关。
 
 设计文档（`docs/apm-alert-module-design.md`、`docs/apm-alert-implementation-plan-enhanced.md`）是实现的事实来源与蓝图；已实现章节归档在 `docs/archive/`，实现日志在 `docs/logs/`，各 M 阶段实现计划在 `docs/plans/`。
 

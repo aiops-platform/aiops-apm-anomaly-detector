@@ -16,12 +16,17 @@ async def health() -> dict:
 async def ready(request: Request) -> JSONResponse:
     """就绪探针：检查 DB 连接与插件加载状态。
 
-    M0 为空壳，尚未构建存储/插件，因此恒返回 503 NOT_READY（满足 UC-0.1）。
-    后续里程碑在 lifespan 中构建 app.state.storage / app.state.registry 后自动生效。
+    M2 起在 lifespan 构建 app.state.storage（fail-fast，连不上 DB 直接启动失败）；
+    db 反映运行时真实连接状态（memory 恒可用，mysql 走连接池探活，DB 挂了为 False）。
+    插件 registry 属 M4，未构建仍返回 503 NOT_READY。
     """
     state = request.app.state
+    storage = getattr(state, "storage", None)
+    db = False
+    if storage is not None:
+        db = await storage.health_check()
     checks = {
-        "db": bool(getattr(state, "storage", None)),
+        "db": db,
         "plugins": bool(getattr(state, "registry", None)),
     }
     if not all(checks.values()):

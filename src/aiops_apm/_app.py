@@ -1,7 +1,7 @@
 """FastAPI 应用工厂 + lifespan + 统一异常处理。
 
 M0 为工程基座：进程能起、配置能加载、探针可用、异常标准化。
-lifespan 中的连接池 / 插件注册 / 调度器在后续里程碑填充。
+lifespan 中的插件注册 / 调度器在后续里程碑填充。
 """
 
 import uuid
@@ -15,18 +15,25 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .exceptions import AppException, ErrorCode
 from .router.api import api_router
 from .settings import Settings
+from .storage import build_storage
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """应用生命周期钩子。
+    """应用生命周期钩子：M2 接线 storage。
 
-    TODO(M2): 初始化 MySQL 连接池 / InMemory 存储
+    **fail-fast**（用户确认）：mysql backend 连不上 DB 时 ``build_storage`` 抛异常，
+    lifespan 启动失败 → uvicorn 进程退出。memory backend（demo/单测）无此约束。
+
     TODO(M4): 加载插件 registry
     TODO(M6): 启动 scheduler 后台任务
     """
-    yield
-    # shutdown 阶段：关闭连接池、停止 scheduler（后续里程碑填充）
+    settings: Settings = app.state.settings
+    app.state.storage = await build_storage(settings)
+    try:
+        yield
+    finally:
+        await app.state.storage.close()
 
 
 def _status_for_code(code: ErrorCode) -> int:
