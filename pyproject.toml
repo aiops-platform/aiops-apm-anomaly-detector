@@ -37,13 +37,13 @@ http_logs    = "aiops_apm.collectors.http_logs:build"
 mock         = "aiops_apm.collectors.mock:build"
 
 [project.entry-points."aiops_apm.detectors"]
-# static_threshold    = "aiops_apm.detectors.static_threshold:build"
-# simple_compare      = "aiops_apm.detectors.simple_compare:build"
-# signature_aggregate = "aiops_apm.detectors.signature_aggregate:build"
+static_threshold    = "aiops_apm.detectors.static_threshold:build"
+simple_compare      = "aiops_apm.detectors.simple_compare:build"
+signature_aggregate = "aiops_apm.detectors.signature_aggregate:build"
 
 [project.entry-points."aiops_apm.suppressors"]
-# maintenance_window = "aiops_apm.suppressors.maintenance_window:build"
-# blacklist          = "aiops_apm.suppressors.blacklist:build"
+maintenance_window = "aiops_apm.suppressors.maintenance_window:build"
+blacklist          = "aiops_apm.suppressors.blacklist:build"
 
 [tool.setuptools.packages.find]
 where = ["src"]

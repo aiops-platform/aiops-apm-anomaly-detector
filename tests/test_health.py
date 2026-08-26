@@ -9,10 +9,10 @@ def test_health_ok(client: TestClient) -> None:
     assert res.json() == {"status": "ok"}
 
 
-def test_ready_not_ready_without_plugins(client: TestClient) -> None:
-    """M2 memory backend：db 就绪，但插件未构建，仍应返回 503 + NOT_READY。"""
+def test_ready_ok_with_plugins(client: TestClient) -> None:
+    """M4 memory backend：db:True + plugins:True（registry 已接线）→ 200 ready。"""
     res = client.get("/ready")
-    assert res.status_code == 503
+    assert res.status_code == 200
     body = res.json()
-    assert body["code"] == "NOT_READY"
-    assert "'db': True" in body["reason"]
+    assert body["status"] == "ready"
+    assert body["checks"] == {"db": True, "plugins": True}

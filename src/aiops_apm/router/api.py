@@ -1,12 +1,14 @@
-"""API 路由：M0 探针 + M3 /v1/monitors 监控端点管理。"""
+"""API 路由：M0 探针 + M3 /v1/monitors 监控端点管理 + M4 /v1/plugins 插件管理。"""
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from .monitors import router as monitors_router
+from .plugins import router as plugins_router
 
 api_router = APIRouter()
 api_router.include_router(monitors_router)
+api_router.include_router(plugins_router)
 
 
 @api_router.get("/health")
@@ -21,7 +23,7 @@ async def ready(request: Request) -> JSONResponse:
 
     M2 起在 lifespan 构建 app.state.storage（fail-fast，连不上 DB 直接启动失败）；
     db 反映运行时真实连接状态（memory 恒可用，mysql 走连接池探活，DB 挂了为 False）。
-    插件 registry 属 M4，未构建仍返回 503 NOT_READY。
+    M4 起在 lifespan 构建 app.state.registry（插件 registry），plugins 反映其加载状态。
     """
     state = request.app.state
     storage = getattr(state, "storage", None)

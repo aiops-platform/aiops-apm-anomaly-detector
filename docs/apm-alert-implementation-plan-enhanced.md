@@ -699,7 +699,9 @@ class MockCollector(Collector):
 
 ---
 
-## M4 — 插件化（registry + 内置 detector/suppressor）
+## M4 — 插件化（registry + 内置 detector/suppressor）（已实现）
+
+> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M4.md`](../logs/M4.md)，历史规格归档见 [`docs/archive/M4-plugins.md`](../archive/M4-plugins.md)，实现计划见 [`docs/plans/M4-implementation-plan.md`](../plans/M4-implementation-plan.md)。剩余项：漏斗主体（`l0_suppress`/`l1_detect`/L2/L3/emit）随 M5；维护窗口/黑名单表读取与 admin 写表 API 随 M6；reload admin 权限随 M7。
 
 ### 基础信息
 

@@ -14,6 +14,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .collectors import SharedHttpClient
 from .exceptions import AppException, ErrorCode
+from .plugins.registry import PluginRegistry
 from .router.api import api_router
 from .settings import Settings
 from .storage import build_storage
@@ -21,17 +22,22 @@ from .storage import build_storage
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """应用生命周期钩子：M2 接线 storage；M3 接线共享出站 HTTP 客户端。
+    """应用生命周期钩子：M2 接线 storage；M3 接线共享出站 HTTP 客户端；M4 加载插件 registry。
 
     **fail-fast**（用户确认）：mysql backend 连不上 DB 时 ``build_storage`` 抛异常，
     lifespan 启动失败 → uvicorn 进程退出。memory backend（demo/单测）无此约束。
+    插件 registry 从 entry_points 发现并原子快照加载（单插件失败只告警不拖垮）。
 
-    TODO(M4): 加载插件 registry
     TODO(M6): 启动 scheduler 后台任务
     """
     settings: Settings = app.state.settings
     app.state.storage = await build_storage(settings)
     app.state.http_client = SharedHttpClient(settings)
+    app.state.registry = PluginRegistry().load(
+        http=app.state.http_client,
+        pool=getattr(app.state.storage, "pool", None),
+        settings=settings,
+    )
     try:
         yield
     finally:
@@ -43,6 +49,7 @@ def _status_for_code(code: ErrorCode) -> int:
     """ErrorCode -> HTTP 状态码。"""
     mapping = {
         ErrorCode.NOT_FOUND: 404,
+        ErrorCode.PLUGIN_NOT_FOUND: 404,
         ErrorCode.VALIDATION: 400,
         ErrorCode.PERMISSION: 403,
     }
