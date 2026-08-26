@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiops-apm-anomaly-detector"
+version = "0.1.0"
+description = "APM 告警模块：采集指标/日志，经确定性 L0-L3 漏斗，产出 problem_record 落库"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "aiomysql>=0.2.0",
+    "prometheus_client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.4",
+    "mypy>=1.9",
+    "pre-commit>=3.6",
+]
+
+# 插件系统三个 entry_points group（M0 占位，M4 填内置插件）
+[project.entry-points."aiops_apm.collectors"]
+# http_metrics = "aiops_apm.collectors.http_metrics:build"
+# http_logs    = "aiops_apm.collectors.http_logs:build"
+# mock         = "aiops_apm.collectors.mock:build"
+
+[project.entry-points."aiops_apm.detectors"]
+# static_threshold    = "aiops_apm.detectors.static_threshold:build"
+# simple_compare      = "aiops_apm.detectors.simple_compare:build"
+# signature_aggregate = "aiops_apm.detectors.signature_aggregate:build"
+
+[project.entry-points."aiops_apm.suppressors"]
+# maintenance_window = "aiops_apm.suppressors.maintenance_window:build"
+# blacklist          = "aiops_apm.suppressors.blacklist:build"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+testpaths = ["tests"]

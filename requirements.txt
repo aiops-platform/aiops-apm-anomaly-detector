@@ -1,0 +1,7 @@
+# 运行依赖（与 pyproject.toml [project].dependencies 保持一致，此处做版本锚定）
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+pydantic-settings>=2.2
+aiomysql>=0.2.0
+prometheus_client>=0.20

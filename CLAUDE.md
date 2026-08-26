@@ -6,7 +6,9 @@
 
 `aiops-apm-anomaly-detector` 是一个 APM（应用性能监控）告警模块。它从第三方 API 采集指标/日志，经过确定性的 L0–L3 漏斗，最终产出 `problem_record` 落库，供下游诊断/修复使用。
 
-**重要当前状态：** 本仓库目前只有设计文档，尚无任何 Python 源码——仅有 `docs/`、`README.md`、`LICENSE`（Apache 2.0）和 `.gitignore`。下面两份设计文档是实现的事实来源与蓝图。
+**当前里程碑：** M0 工程基座已完成（`make lint test dev` 全绿）。已实现：工程骨架（`pyproject.toml`、`Makefile`、`.env.example`、ruff/mypy/pytest/pre-commit）、`Settings`、`AppException`/`ErrorCode`、`create_app`/`lifespan`、统一异常响应（`{code, reason, trace_id}`）、`/health`、`/ready` 探针。下一阶段：M1 契约层。
+
+设计文档（`docs/apm-alert-module-design.md`、`docs/apm-alert-implementation-plan-enhanced.md`）是实现的事实来源与蓝图；已实现章节归档在 `docs/archive/`，实现日志在 `docs/logs/`，各 M 阶段实现计划在 `docs/plans/`。
 
 ## 事实来源文档
 
@@ -20,9 +22,10 @@
 
 每个里程碑（M0–M7）落地实现时，必须遵循以下流程，保证文档随代码同步演进：
 
-1. **实现日志**：每完成一个 M 阶段，在 `docs/logs/` 下新建 `<M阶段>.md`（如 `docs/logs/M0.md`、`docs/logs/M1.md`），记录该阶段的改动点、新增/修改文件清单、完成状态与遗留问题。
-2. **归档已实现内容**：从设计文档（`docs/apm-alert-module-design.md`、`docs/apm-alert-implementation-plan-enhanced.md`）中，把该阶段「已实现」的章节迁移到 `docs/archive/<M阶段>-<主题>.md`（按 M 阶段归档，如 `docs/archive/M5-funnel.md`）。原设计文档只保留尚未实现的部分。
-3. **更新 README**：把已实现的内容同步更新到 `README.md`，使其持续反映实现进度（当前实现的模块、用法、目录结构、完成状态）。
+1. **实现计划**：每个 M 阶段动手前，先产出实现计划文档（范围、文件清单、验收标准）存入 `docs/plans/<M阶段>-implementation-plan.md`；并在本文件「当前里程碑」处标注该阶段「进行中」，完成后改为「已完成」。
+2. **实现日志**：每完成一个 M 阶段，在 `docs/logs/` 下新建 `<M阶段>.md`（如 `docs/logs/M0.md`、`docs/logs/M1.md`），记录该阶段的改动点、新增/修改文件清单、完成状态与遗留问题。
+3. **归档已实现内容**：从设计文档（`docs/apm-alert-module-design.md`、`docs/apm-alert-implementation-plan-enhanced.md`）中，把该阶段「已实现」的章节迁移到 `docs/archive/<M阶段>-<主题>.md`（按 M 阶段归档，如 `docs/archive/M5-funnel.md`）。原设计文档只保留尚未实现的部分。
+4. **更新 README**：把已实现的内容同步更新到 `README.md`，使其持续反映实现进度（当前实现的模块、用法、目录结构、完成状态）。
 
 ## 四条不可回退的设计原则
 
@@ -55,7 +58,7 @@
 
 ## 命令
 
-以下命令来自实现计划中各里程碑的完成标准（`Makefile`/`pyproject.toml` 尚不存在，需在 M0 创建）：
+以下命令来自实现计划中各里程碑的完成标准（`Makefile`/`pyproject.toml` 已在 M0 创建）：
 
 - `make lint` — ruff + mypy
 - `make test` — pytest（先写测试；计划是 TDD 驱动，§13 用例为测试来源）
@@ -63,6 +66,8 @@
 - `make migrate` — 建齐单 schema（`aiops_apm_runtime`）所有表
 - `docker compose up` — 完整环境（mysql、mock-source、apm-alert、prometheus）
 - 用 `uvicorn ...` 启动服务；`GET /health`、`GET /ready` 为探针，`GET /metrics` 暴露 Prometheus 指标
+
+启动/手动调用/配置说明见 [`README.md`](../README.md) 的「启动与快速上手」章节（M0–M7 共用，每完成一个里程碑补充该阶段的启动附加步骤）。
 
 配置使用 `pydantic-settings`，环境变量前缀为 `APM_`（如 `APM_DB_HOST`、`APM_PORT`、`APM_ENABLE_SCHEDULER`）。
 
