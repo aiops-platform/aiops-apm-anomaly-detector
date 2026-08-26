@@ -10,6 +10,7 @@ from .connection import ConnectionPool
 from .detection_state import DetectionStateStore, InMemoryDetectionStateStore, MySQLDetectionStateStore
 from .domain_config import DomainConfigStore, InMemoryDomainConfigStore, MySQLDomainConfigStore
 from .dynamic_config import DynamicConfigStore, InMemoryDynamicConfigStore, MySQLDynamicConfigStore
+from .lease import InMemoryLeaseStore, LeaseStore, MySQLLeaseStore
 from .monitor_targets import InMemoryMonitorTargetStore, MonitorTargetStore, MySQLMonitorTargetStore
 from .records import InMemoryRecordStore, MySQLRecordStore, RecordStore
 from .sequence import InMemorySequenceStore, MySQLSequenceStore, SequenceStore
@@ -28,11 +29,12 @@ __all__ = [
     "SequenceStore",
     "DetectionStateStore",
     "DynamicConfigStore",
+    "LeaseStore",
 ]
 
 
 class Storage:
-    """聚合 records + domain_configs + monitor_targets + snapshots + watermarks + M5 三件套 + 连接池。"""
+    """聚合 records + domain_configs + monitor_targets + snapshots + watermarks + M5 三件套 + leases + 连接池。"""
 
     def __init__(
         self,
@@ -45,6 +47,7 @@ class Storage:
         sequence: SequenceStore,
         detection_state: DetectionStateStore,
         dynamic_config: DynamicConfigStore,
+        leases: LeaseStore,
         pool: ConnectionPool | None = None,
     ) -> None:
         self.records = records
@@ -55,6 +58,7 @@ class Storage:
         self.sequence = sequence
         self.detection_state = detection_state
         self.dynamic_config = dynamic_config
+        self.leases = leases
         self.pool = pool
 
     async def health_check(self) -> bool:
@@ -79,6 +83,7 @@ async def build_storage(settings: Settings) -> Storage:
             sequence=InMemorySequenceStore(),
             detection_state=InMemoryDetectionStateStore(),
             dynamic_config=InMemoryDynamicConfigStore(),
+            leases=InMemoryLeaseStore(),
         )
     if backend == "mysql":
         pool = ConnectionPool(settings, db=settings.db_name)
@@ -92,6 +97,7 @@ async def build_storage(settings: Settings) -> Storage:
             sequence=MySQLSequenceStore(pool),
             detection_state=MySQLDetectionStateStore(pool),
             dynamic_config=MySQLDynamicConfigStore(pool),
+            leases=MySQLLeaseStore(pool),
             pool=pool,
         )
     raise ValueError(f"unknown storage_backend: {backend!r}")

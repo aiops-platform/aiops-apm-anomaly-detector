@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from aiops_apm.models.record import ProblemRecord
-from aiops_apm.pipeline.l2_correlate import template_summary
+from aiops_apm.summary import TemplateSummaryProvider
 
 
 async def emit(
@@ -29,6 +29,9 @@ async def emit(
     evidence: list[dict] = []
     if ctx.degraded_sources:
         evidence.append({"type": "degraded", "target_ids": list(ctx.degraded_sources)})
+    # M6 摘要钩子：ctx.summary_provider 缺省用确定性模板（零 LLM 调用）
+    provider = ctx.summary_provider if ctx.summary_provider is not None else TemplateSummaryProvider()
+    summary = provider.summarize(service=service, metric_anoms=metric_anoms, log_anoms=log_anoms)
     rec = ProblemRecord(
         record_id=await ctx.sequence_store.next_id(ctx.domain),
         tenant_id=ctx.tenant_id,
@@ -40,7 +43,7 @@ async def emit(
         first_seen_at=ctx.now,
         last_seen_at=ctx.now,
         occurrence_count=1,
-        symptom={"summary": template_summary(metric_anoms, log_anoms)},
+        symptom={"summary": summary},
         metric_anomalies=metric_anoms,
         log_anomalies=log_anoms,
         correlation=correlation,

@@ -25,6 +25,19 @@ class Settings(BaseSettings):
     max_concurrent_rounds: int = 10
     total_timeout_sec: float = 30.0
 
+    # ---- 多副本 lease（M6 起生效）----
+    scheduler_lease_ttl_sec: float = 30.0
+    scheduler_jitter_ratio: float = 0.1
+
+    # ---- 恢复闭环（M6 起生效，reconcile 自动关闭）----
+    resolve_after_rounds: int = 3
+    resolve_check_interval_sec: float = 30.0
+
+    # ---- 鉴权（M6 起生效，配置了才强制）----
+    # JSON env APM_API_KEYS：{"<api-key>": "tenant1,tenant2"}，值 "*" 表全租户。
+    # 为空 = 放行（不挂 AuthMiddleware，既有 API 测试零改动）。
+    api_keys: dict[str, str] = {}
+
     # ---- 出站（M3 起生效）----
     outbound_timeout_sec: float = 10.0
     outbound_max_body_bytes: int = 5_000_000

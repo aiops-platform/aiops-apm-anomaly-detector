@@ -1,8 +1,12 @@
-"""路由公共依赖：租户解析。"""
+"""路由公共依赖：租户解析 + 主体透传。"""
 
 from __future__ import annotations
 
 from fastapi import Request
+
+from ..auth import Principal, get_principal
+
+__all__ = ["get_tenant_id", "get_principal", "Principal"]
 
 
 def get_tenant_id(request: Request) -> str:

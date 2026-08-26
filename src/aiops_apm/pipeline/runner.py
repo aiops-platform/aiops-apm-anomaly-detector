@@ -38,7 +38,8 @@ async def run_domain(ctx: DetectionContext) -> DomainResult:
     records: list[Any] = []
     for service, anoms in by_service.items():
         corr, change_related, recent_change = correlations[service]
-        verification = await l3_verify(ctx, service, anoms)
+        # M6 §13 用例 2：related（指标+日志同源）时组合升 critical 判定依据
+        verification = await l3_verify(ctx, service, anoms, related=corr.related)
         records.extend(await emit(ctx, service, anoms, corr, change_related, recent_change, verification))
 
     await ctx.state_store.sweep(ctx.tenant_id, ctx.domain, ctx.seen_keys)  # miss 计数（UC-5.6）

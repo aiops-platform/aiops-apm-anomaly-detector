@@ -69,6 +69,10 @@ class MonitorTargetStore(ABC):
     async def load_all_targets(self, tenant_id: str) -> builtins.list[dict]:
         """加载该租户 enabled 的端点（M6 调度器用）。"""
 
+    @abstractmethod
+    async def list_tenants(self) -> builtins.list[str]:
+        """去重返回有启用端点的租户列表（M6 调度器扫描用）。"""
+
 
 class InMemoryMonitorTargetStore(MonitorTargetStore):
     def __init__(self) -> None:
@@ -150,6 +154,10 @@ class InMemoryMonitorTargetStore(MonitorTargetStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         return [_public(r) for r in self._rows if r["tenant_id"] == tenant_id and r["enabled"]]
+
+    async def list_tenants(self) -> builtins.list[str]:
+        tenants = sorted({r["tenant_id"] for r in self._rows if r["enabled"]})
+        return tenants
 
 
 class MySQLMonitorTargetStore(MonitorTargetStore):
@@ -250,3 +258,9 @@ class MySQLMonitorTargetStore(MonitorTargetStore):
             (tenant_id,),
         )
         return [_public(r) for r in rows]
+
+    async def list_tenants(self) -> builtins.list[str]:
+        rows = await self._pool.fetchall(
+            "SELECT DISTINCT tenant_id FROM monitor_target WHERE enabled=1"
+        )
+        return sorted(r[0] for r in rows)

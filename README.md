@@ -2,7 +2,7 @@
 
 APM（应用性能监控）告警模块：从第三方 API 采集指标/日志，经确定性的 L0–L3 漏斗，产出 `problem_record` 落库，供下游诊断/修复使用。
 
-> 当前状态：**M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）已完成**（`make lint test dev` 全绿，225 个用例通过）。设计与实现计划见 [`docs/`](docs/)，实现规则见 [`CLAUDE.md`](CLAUDE.md)，实现日志见 [`docs/logs/`](docs/logs/)，归档见 [`docs/archive/`](docs/archive/)。
+> 当前状态：**M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）+ M6 调度/多租户/API/恢复闭环已完成**（`make lint test dev` 全绿，287 个用例通过）。设计与实现计划见 [`docs/`](docs/)，实现规则见 [`CLAUDE.md`](CLAUDE.md)，实现日志见 [`docs/logs/`](docs/logs/)，归档见 [`docs/archive/`](docs/archive/)。
 
 ## 实现进度
 
@@ -14,12 +14,12 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
 | M3 | 采集层与出站网关（collectors + 安全网关 + 监控端点 API） | ✅ 已完成 | [`docs/logs/M3.md`](docs/logs/M3.md) |
 | M4 | 检测层（registry + 内置 detector/suppressor） | ✅ 已完成 | [`docs/logs/M4.md`](docs/logs/M4.md) |
 | M5 | 漏斗 L0–L3 + emit（确定性核心） | ✅ 已完成 | [`docs/logs/M5.md`](docs/logs/M5.md) |
-| M6 | 调度、多租户、API、恢复闭环 | 未实现 | — |
+| M6 | 调度、多租户、API、恢复闭环 | ✅ 已完成 | [`docs/logs/M6.md`](docs/logs/M6.md) |
 | M7 | 可观测性、安全加固、交付 | 未实现 | — |
 
 > 每完成一个里程碑：在 `docs/logs/<M阶段>.md` 记录实现日志，把已实现章节归档到 `docs/archive/`，并更新本表。
 
-## 已实现（M0–M4）
+## 已实现（M0–M6）
 
 - **M0 工程基座**：
   - 工程骨架：`pyproject.toml`（依赖 + 三个 entry_points 占位）、`Makefile`、`.env.example`、ruff/mypy/pytest/pre-commit
@@ -48,7 +48,16 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
 - **M5 漏斗 L0–L3 + emit**（确定性核心，`run_domain` 一个 `(tenant_id, domain)` 内独立运行）：
   - `src/aiops_apm/pipeline/`：`context.py`（`DetectionContext` + `DomainResult` + `build_context`：载入 domain_config + 四类动态配置）、`l0_suppress.py`（维护窗口/黑名单批量抑制）、`l1_detect.py`（按 detector 规则分发，单 detector 异常隔离）、`l2_correlate.py`（按 service 同源关联 + 变更关联 + `template_summary` 模板兜底）、`l3_verify.py`（持续性 + 误报率闸门降级 + 严重度校准）、`emit.py`（组装 ProblemRecord + 原子去重落库）、`runner.py`（`run_domain` 串行编排 + timeline + miss sweep）
   - `src/aiops_apm/storage/`：`sequence.py`（`SequenceStore` PR-YYYYMMDD-NNNN 原子取号）、`detection_state.py`（`DetectionStateStore` consecutive/miss 计数）、`dynamic_config.py`（`DynamicConfigStore` 四类动态配置读取，按租户过滤）
-  - §13 用例 1/3/4/5/6/7/8/9/10/11 端到端通过（`test_pipeline.py` 11 个 UC-5.x）；用例 2（组合升 critical）留 M6
+  - §13 用例 1/3/4/5/6/7/8/9/10/11 端到端通过（`test_pipeline.py` 11 个 UC-5.x）；用例 2（组合升 critical）随 M6 落地
+- **M6 调度、多租户、API、恢复闭环**（把漏斗接成自服务闭环）：
+  - `src/aiops_apm/scheduler.py` — `Scheduler`：按 `monitor_target.schedule` 自动触发（多副本 lease 门控单调度器，tick 注入时钟可直测，`_next_run` 防启动风暴 + jitter）
+  - `src/aiops_apm/poller.py` — `run_round`：按 `(tenant, domain)` 组并行 collect（单 target 异常 → `degraded_sources` 不崩溃）→ `run_domain`
+  - `src/aiops_apm/reconcile.py` — `Reconciler`：周期性扫描 pending 单，全部 anomaly_key miss 达标 → `resolve(reason="auto")` 自动关单
+  - `src/aiops_apm/auth/` — `AuthMiddleware` + `Principal`：**配置了才强制**（`APM_API_KEYS` 非空才挂），无 key→401、跨租户→403、master key admin；未配置 = 放行
+  - `src/aiops_apm/storage/lease.py` — `LeaseStore` ABC + InMemory + MySQL（原子接管 SQL）
+  - `src/aiops_apm/summary.py` — `SummaryProvider` 钩子（模板默认，`enable_llm_summary` 开关，不接真实 LLM）
+  - `src/aiops_apm/router/` — `alerts.py`（`POST /v1/alerts/run` 全量/域过滤）、`problems.py`（`/v1/problems` 查询 + resolve）、`config.py`（reload + 域配置读写）、`maintenance.py`（维护窗口 CRUD）、`blacklist.py`（黑名单 CRUD）；`monitors.py` 加 `POST /{id}/run` 手动单跑
+  - §13 用例 2 端到端：related + high metric + high log → critical（`test_uc62_combo_critical.py`）；reconcile 自动关单、跨租户 403、多副本 lease 全部测试覆盖（原 225 不回归，新增 62 → 287）
 
 ## 启动与快速上手
 
@@ -169,7 +178,39 @@ curl -i -X POST http://127.0.0.1:<port>/v1/plugins/reload
 # → 200，返回更新后的插件列表
 ```
 
-> 后续里程碑（M6 起）会在这里补充调度器手动触发 `POST /v1/monitors/{id}/run`、`GET /v1/problems` 等接口调用示例。
+#### M6 手动触发与问题查询
+
+调度器开关 `APM_ENABLE_SCHEDULER`（默认 False，M6 起自动按 `monitor_target.schedule` 触发一轮检测）；配置 `APM_API_KEYS`（JSON `{"key":"tenant1,tenant2"}`，`"*"` 全租户）后启用鉴权——无 key→401、跨租户→403、master key 为 admin；未配置 = 放行：
+
+```bash
+# 手动单跑一个端点（一次采集 + 漏斗，返回 DomainResult：records/suppressed/anomaly/timeline）
+curl -i -X POST http://127.0.0.1:<port>/v1/monitors/MT-0001/run
+
+# 手动全跑（全部启用 target，?domain= 可选过滤；需 admin）
+curl -i -X POST http://127.0.0.1:<port>/v1/alerts/run
+curl -i -X POST "http://127.0.0.1:<port>/v1/alerts/run?domain=application"
+
+# 问题单查询 / 详情 / 手动关闭
+curl -i "http://127.0.0.1:<port>/v1/problems?state=pending&severity=high"
+curl -i http://127.0.0.1:<port>/v1/problems/PR-20260826-0001
+curl -i -X POST http://127.0.0.1:<port>/v1/problems/PR-20260826-0001/resolve   # reason=manual
+
+# 配置热加载（reload 声明在 /config/{domain} 之前避免路径冲突；写配置需 admin）
+curl -i -X POST http://127.0.0.1:<port>/v1/config/reload
+curl -i http://127.0.0.1:<port>/v1/config/application
+curl -i -X PUT http://127.0.0.1:<port>/v1/config/application -H "Content-Type: application/json" \
+  -d '{"detectors":[],"verify":{"persistence_rounds":2}}'
+
+# 维护窗口 / 黑名单 CRUD（自动关单：周期性扫描 pending 单，全部 anomaly_key miss 达标即 resolve(reason=auto)）
+curl -i -X POST http://127.0.0.1:<port>/v1/maintenance-windows -H "Content-Type: application/json" \
+  -d '{"service":"svc-a","start_at":"2026-08-26T11:00:00Z","end_at":"2026-08-26T12:00:00Z","reason":"release"}'
+curl -i -X POST http://127.0.0.1:<port>/v1/blacklist -H "Content-Type: application/json" \
+  -d '{"domain":"application","service":"svc-a","signal":"cpu_usage","reason":"known noisy"}'
+
+# 鉴权示例（配置了 APM_API_KEYS 后）：scoped key 自带租户 / master key 任意租户
+curl -i http://127.0.0.1:<port>/v1/monitors -H "Authorization: Bearer k1" -H "X-Tenant-Id: tenant-a"
+curl -i http://127.0.0.1:<port>/v1/monitors -H "Authorization: Bearer k2"   # "*" 任意租户
+```
 
 ### 5. 质量检查（提交前）
 

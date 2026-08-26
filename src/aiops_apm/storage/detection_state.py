@@ -40,6 +40,10 @@ class DetectionStateStore(ABC):
     async def sweep(self, tenant_id: str, domain: str, seen_keys: set) -> None:
         """本域 store 里本轮到到（∉ seen_keys）的 key → miss_rounds+1、consecutive_rounds=0（UC-5.6）。"""
 
+    @abstractmethod
+    async def list_by_domain(self, tenant_id: str, domain: str) -> dict:
+        """返回该域全部 ``{state_key: {consecutive_rounds, miss_rounds, first_seen, last_seen}}``（M6 reconcile 用）。"""
+
 
 class InMemoryDetectionStateStore(DetectionStateStore):
     def __init__(self) -> None:
@@ -78,6 +82,15 @@ class InMemoryDetectionStateStore(DetectionStateStore):
             if t == tenant_id and d == domain and k not in seen_keys:
                 row["miss_rounds"] += 1
                 row["consecutive_rounds"] = 0
+
+    async def list_by_domain(self, tenant_id: str, domain: str) -> dict:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        return {
+            k: dict(row)
+            for (t, d, k), row in self._rows.items()
+            if t == tenant_id and d == domain
+        }
 
 
 def _iso(value: datetime) -> str:
@@ -145,3 +158,18 @@ class MySQLDetectionStateStore(DetectionStateStore):
                 "WHERE tenant_id=%s AND domain=%s AND state_key=%s",
                 (tenant_id, domain, key),
             )
+
+    async def list_by_domain(self, tenant_id: str, domain: str) -> dict:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        rows = await self._pool.fetchall(
+            "SELECT state_key, state_value FROM detection_state WHERE tenant_id=%s AND domain=%s",
+            (tenant_id, domain),
+        )
+        out: dict = {}
+        for key, value in rows:
+            v = _decode_json(value)
+            v["first_seen"] = datetime.fromisoformat(v["first_seen"])
+            v["last_seen"] = datetime.fromisoformat(v["last_seen"])
+            out[key] = v
+        return out

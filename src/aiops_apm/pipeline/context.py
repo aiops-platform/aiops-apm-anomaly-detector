@@ -18,6 +18,8 @@ from aiops_apm.storage import Storage
 from aiops_apm.storage.detection_state import DetectionStateStore
 from aiops_apm.storage.records import RecordStore
 from aiops_apm.storage.sequence import SequenceStore
+from aiops_apm.storage.snapshots import SnapshotStore
+from aiops_apm.storage.watermarks import WatermarkStore
 
 
 def new_trace_id() -> str:
@@ -37,6 +39,10 @@ class DetectionContext:
     state_store: DetectionStateStore
     sequence_store: SequenceStore
     now: datetime
+    # M6 采集/摘要注入（可选，采集器 duck-type 只用 tenant_id/watermark_store/snapshot_store）
+    watermark_store: WatermarkStore | None = None
+    snapshot_store: SnapshotStore | None = None
+    summary_provider: object | None = None  # SummaryProvider；None → emit 走模板
     # 本轮数据
     targets: list = field(default_factory=list)
     signals: list = field(default_factory=list)
@@ -77,6 +83,7 @@ async def build_context(
     changes: list | None = None,
     degraded_sources: list | None = None,
     domain_config: DomainConfig | None = None,
+    summary_provider: object | None = None,
 ) -> DetectionContext:
     """载入 domain_config（DomainConfigLoader）+ 四类动态配置（storage.dynamic_config）+ 注入 state/sequence store。"""
     if domain_config is None:
@@ -109,6 +116,9 @@ async def build_context(
         state_store=storage.detection_state,
         sequence_store=storage.sequence,
         now=now,
+        watermark_store=storage.watermarks,
+        snapshot_store=storage.snapshots,
+        summary_provider=summary_provider,
         signals=list(signals or []),
         changes=list(changes or []),
         degraded_sources=list(degraded_sources or []),

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any
@@ -75,13 +76,22 @@ class RecordStore(ABC):
         *,
         state: str | None = None,
         service: str | None = None,
+        severity: str | None = None,
         limit: int = 50,
-    ) -> list[dict]:
-        """按租户查询，可选按 state/service 过滤，按 detected_at 倒序。"""
+    ) -> builtins.list[dict]:
+        """按租户查询，可选按 state/service/severity 过滤，按 detected_at 倒序。"""
+
+    @abstractmethod
+    async def get(self, tenant_id: str, record_id: str) -> dict | None:
+        """按 record_id 取单条记录；不存在返回 None。"""
 
     @abstractmethod
     async def resolve(self, tenant_id: str, record_id: str, reason: str = "auto") -> None:
         """关闭记录：state=resolved，open_group_key 自动变 NULL（允许复发开新单）。"""
+
+    @abstractmethod
+    async def list_tenants(self) -> builtins.list[str]:
+        """所有出现过 problem_record 的租户（去重排序），reconcile 扫描用。"""
 
 
 class InMemoryRecordStore(RecordStore):
@@ -127,8 +137,9 @@ class InMemoryRecordStore(RecordStore):
         *,
         state: str | None = None,
         service: str | None = None,
+        severity: str | None = None,
         limit: int = 50,
-    ) -> list[dict]:
+    ) -> builtins.list[dict]:
         if not tenant_id:
             raise ValueError("tenant_id is required")
         rows = [r for r in self._rows.values() if r["tenant_id"] == tenant_id]
@@ -136,8 +147,18 @@ class InMemoryRecordStore(RecordStore):
             rows = [r for r in rows if r["state"] == state]
         if service is not None:
             rows = [r for r in rows if r["service"] == service]
+        if severity is not None:
+            rows = [r for r in rows if r["severity"] == severity]
         rows.sort(key=lambda r: r["detected_at"], reverse=True)
         return [dict(r) for r in rows[:limit]]
+
+    async def get(self, tenant_id: str, record_id: str) -> dict | None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        row = self._rows.get(record_id)
+        if row is None or row["tenant_id"] != tenant_id:
+            return None
+        return dict(row)
 
     async def resolve(self, tenant_id: str, record_id: str, reason: str = "auto") -> None:
         if not tenant_id:
@@ -148,6 +169,9 @@ class InMemoryRecordStore(RecordStore):
         row["state"] = "resolved"
         row["resolved_at"] = datetime.now(timezone.utc)
         row["resolve_reason"] = reason
+
+    async def list_tenants(self) -> builtins.list[str]:
+        return sorted({r["tenant_id"] for r in self._rows.values()})
 
 
 def _decode_json(value: Any) -> Any:
@@ -217,8 +241,9 @@ class MySQLRecordStore(RecordStore):
         *,
         state: str | None = None,
         service: str | None = None,
+        severity: str | None = None,
         limit: int = 50,
-    ) -> list[dict]:
+    ) -> builtins.list[dict]:
         if not tenant_id:
             raise ValueError("tenant_id is required")
         cols = ", ".join(_RECORD_COLUMNS)
@@ -230,10 +255,23 @@ class MySQLRecordStore(RecordStore):
         if service is not None:
             sql += " AND service=%s"
             args.append(service)
+        if severity is not None:
+            sql += " AND severity=%s"
+            args.append(severity)
         sql += " ORDER BY detected_at DESC LIMIT %s"
         args.append(int(limit))
         rows = await self._pool.fetchall(sql, tuple(args))
         return [self._row_to_dict(r) for r in rows]
+
+    async def get(self, tenant_id: str, record_id: str) -> dict | None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        cols = ", ".join(_RECORD_COLUMNS)
+        row = await self._pool.fetchone(
+            f"SELECT {cols} FROM problem_record WHERE tenant_id=%s AND record_id=%s",
+            (tenant_id, record_id),
+        )
+        return None if row is None else self._row_to_dict(row)
 
     async def resolve(self, tenant_id: str, record_id: str, reason: str = "auto") -> None:
         if not tenant_id:
@@ -243,3 +281,7 @@ class MySQLRecordStore(RecordStore):
             "WHERE tenant_id=%s AND record_id=%s AND state <> 'resolved'",
             (reason, tenant_id, record_id),
         )
+
+    async def list_tenants(self) -> builtins.list[str]:
+        rows = await self._pool.fetchall("SELECT DISTINCT tenant_id FROM problem_record ORDER BY tenant_id")
+        return [r[0] for r in rows]

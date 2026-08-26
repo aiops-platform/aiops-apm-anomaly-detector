@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from .connection import ConnectionPool
 
@@ -32,6 +33,40 @@ class DynamicConfigStore(ABC):
     @abstractmethod
     async def load_changes(self, tenant_id: str) -> list[dict]:
         """``change_record`` 行 ``{change_id, service, type, summary, changed_at}``。"""
+
+    # ---- M6 写接口（维护窗口 / 黑名单 admin CRUD，UC-6.10/6.11）----
+
+    @abstractmethod
+    async def create_maintenance_window(self, tenant_id: str, window: dict) -> dict:
+        """新建维护窗口行，返回含 id 的行。"""
+
+    @abstractmethod
+    async def list_maintenance_windows(self, tenant_id: str, *, service: str | None = None) -> list[dict]:
+        """列出维护窗口，可按 service 过滤。"""
+
+    @abstractmethod
+    async def update_maintenance_window(self, tenant_id: str, window_id: int, patch: dict) -> dict | None:
+        """更新维护窗口字段，返回更新后的行；不存在返回 None。"""
+
+    @abstractmethod
+    async def delete_maintenance_window(self, tenant_id: str, window_id: int) -> None:
+        """删除维护窗口行。"""
+
+    @abstractmethod
+    async def create_blacklist(self, tenant_id: str, entry: dict) -> dict:
+        """新建黑名单行，返回含 id 的行。"""
+
+    @abstractmethod
+    async def list_blacklist(self, tenant_id: str) -> list[dict]:
+        """列出黑名单（含 disabled 行，admin 全量视图）。"""
+
+    @abstractmethod
+    async def update_blacklist(self, tenant_id: str, entry_id: int, patch: dict) -> dict | None:
+        """更新黑名单字段，返回更新后的行；不存在返回 None。"""
+
+    @abstractmethod
+    async def delete_blacklist(self, tenant_id: str, entry_id: int) -> None:
+        """删除黑名单行。"""
 
 
 class InMemoryDynamicConfigStore(DynamicConfigStore):
@@ -73,6 +108,100 @@ class InMemoryDynamicConfigStore(DynamicConfigStore):
             raise ValueError("tenant_id is required")
         return [dict(r) for r in self._changes.get(tenant_id, [])]
 
+    # ---- M6 写接口 ----
+
+    def _add_row(self, store: dict[str, list[dict]], tenant_id: str, row: dict) -> None:
+        rows = store.setdefault(tenant_id, [])
+        rows.append(row)
+
+    def _find_row(self, store: dict[str, list[dict]], tenant_id: str, row_id: int) -> dict | None:
+        for r in store.get(tenant_id, []):
+            if r["id"] == row_id:
+                return r
+        return None
+
+    async def create_maintenance_window(self, tenant_id: str, window: dict) -> dict:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        rows = self._maintenance_windows.setdefault(tenant_id, [])
+        row_id = max((r["id"] for r in rows), default=0) + 1
+        row = {
+            "id": row_id,
+            "tenant_id": tenant_id,
+            "service": window["service"],
+            "start_at": window["start_at"],
+            "end_at": window["end_at"],
+            "reason": window.get("reason"),
+        }
+        rows.append(row)
+        return dict(row)
+
+    async def list_maintenance_windows(self, tenant_id: str, *, service: str | None = None) -> list[dict]:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        rows = self._maintenance_windows.get(tenant_id, [])
+        if service is not None:
+            rows = [r for r in rows if r["service"] == service]
+        return [dict(r) for r in rows]
+
+    async def update_maintenance_window(self, tenant_id: str, window_id: int, patch: dict) -> dict | None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        row = self._find_row(self._maintenance_windows, tenant_id, window_id)
+        if row is None:
+            return None
+        for key in ("service", "start_at", "end_at", "reason"):
+            if key in patch:
+                row[key] = patch[key]
+        return dict(row)
+
+    async def delete_maintenance_window(self, tenant_id: str, window_id: int) -> None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        rows = self._maintenance_windows.get(tenant_id, [])
+        self._maintenance_windows[tenant_id] = [r for r in rows if r["id"] != window_id]
+
+    async def create_blacklist(self, tenant_id: str, entry: dict) -> dict:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        rows = self._blacklist.setdefault(tenant_id, [])
+        row_id = max((r["id"] for r in rows), default=0) + 1
+        row = {
+            "id": row_id,
+            "tenant_id": tenant_id,
+            "domain": entry.get("domain", "application"),
+            "service": entry["service"],
+            "signal": entry["signal"],
+            "reason": entry.get("reason"),
+            "enabled": bool(entry.get("enabled", True)),
+        }
+        rows.append(row)
+        return dict(row)
+
+    async def list_blacklist(self, tenant_id: str) -> list[dict]:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        return [dict(r) for r in self._blacklist.get(tenant_id, [])]
+
+    async def update_blacklist(self, tenant_id: str, entry_id: int, patch: dict) -> dict | None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        row = self._find_row(self._blacklist, tenant_id, entry_id)
+        if row is None:
+            return None
+        for key in ("domain", "service", "signal", "reason"):
+            if key in patch:
+                row[key] = patch[key]
+        if "enabled" in patch:
+            row["enabled"] = bool(patch["enabled"])
+        return dict(row)
+
+    async def delete_blacklist(self, tenant_id: str, entry_id: int) -> None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        rows = self._blacklist.get(tenant_id, [])
+        self._blacklist[tenant_id] = [r for r in rows if r["id"] != entry_id]
+
 
 class MySQLDynamicConfigStore(DynamicConfigStore):
     def __init__(self, pool: ConnectionPool) -> None:
@@ -112,3 +241,136 @@ class MySQLDynamicConfigStore(DynamicConfigStore):
             (tenant_id,),
         )
         return [{"change_id": r[0], "service": r[1], "type": r[2], "summary": r[3], "changed_at": r[4]} for r in rows]
+
+    # ---- M6 写接口 ----
+
+    async def create_maintenance_window(self, tenant_id: str, window: dict) -> dict:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        window_id = await self._pool.execute_lastid(
+            "INSERT INTO maintenance_window (tenant_id, service, start_at, end_at, reason) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (tenant_id, window["service"], window["start_at"], window["end_at"], window.get("reason")),
+        )
+        return {
+            "id": window_id,
+            "tenant_id": tenant_id,
+            "service": window["service"],
+            "start_at": window["start_at"],
+            "end_at": window["end_at"],
+            "reason": window.get("reason"),
+        }
+
+    async def list_maintenance_windows(self, tenant_id: str, *, service: str | None = None) -> list[dict]:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        sql = "SELECT id, service, start_at, end_at, reason FROM maintenance_window WHERE tenant_id=%s"
+        args: list[Any] = [tenant_id]
+        if service is not None:
+            sql += " AND service=%s"
+            args.append(service)
+        rows = await self._pool.fetchall(sql, tuple(args))
+        return [
+            {"id": r[0], "service": r[1], "start_at": r[2], "end_at": r[3], "reason": r[4]} for r in rows
+        ]
+
+    async def update_maintenance_window(self, tenant_id: str, window_id: int, patch: dict) -> dict | None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        sets, args = [], [tenant_id, window_id]
+        for key in ("service", "start_at", "end_at", "reason"):
+            if key in patch:
+                sets.append(f"{key}=%s")
+                args.append(patch[key])
+        if sets:
+            sets_sql = ", ".join(sets)
+            await self._pool.execute(
+                f"UPDATE maintenance_window SET {sets_sql} WHERE tenant_id=%s AND id=%s", tuple(args)
+            )
+        row = await self._pool.fetchone(
+            "SELECT id, service, start_at, end_at, reason FROM maintenance_window "
+            "WHERE tenant_id=%s AND id=%s",
+            (tenant_id, window_id),
+        )
+        if row is None:
+            return None
+        return {"id": row[0], "service": row[1], "start_at": row[2], "end_at": row[3], "reason": row[4]}
+
+    async def delete_maintenance_window(self, tenant_id: str, window_id: int) -> None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        await self._pool.execute(
+            "DELETE FROM maintenance_window WHERE tenant_id=%s AND id=%s", (tenant_id, window_id)
+        )
+
+    async def create_blacklist(self, tenant_id: str, entry: dict) -> dict:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        entry_id = await self._pool.execute_lastid(
+            "INSERT INTO suppress_blacklist (tenant_id, domain, service, `signal`, reason, enabled) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (
+                tenant_id,
+                entry.get("domain", "application"),
+                entry["service"],
+                entry["signal"],
+                entry.get("reason"),
+                1 if entry.get("enabled", True) else 0,
+            ),
+        )
+        return {
+            "id": entry_id,
+            "tenant_id": tenant_id,
+            "domain": entry.get("domain", "application"),
+            "service": entry["service"],
+            "signal": entry["signal"],
+            "reason": entry.get("reason"),
+            "enabled": bool(entry.get("enabled", True)),
+        }
+
+    async def list_blacklist(self, tenant_id: str) -> list[dict]:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        rows = await self._pool.fetchall(
+            "SELECT id, domain, service, `signal`, reason, enabled FROM suppress_blacklist WHERE tenant_id=%s",
+            (tenant_id,),
+        )
+        return [
+            {"id": r[0], "domain": r[1], "service": r[2], "signal": r[3], "reason": r[4], "enabled": bool(r[5])}
+            for r in rows
+        ]
+
+    async def update_blacklist(self, tenant_id: str, entry_id: int, patch: dict) -> dict | None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        sets, args = [], [tenant_id, entry_id]
+        for key in ("domain", "service", "signal", "reason"):
+            if key in patch:
+                sets.append(f"{key}=%s")
+                args.append(patch[key])
+        if "enabled" in patch:
+            sets.append("enabled=%s")
+            args.append(1 if patch["enabled"] else 0)
+        if sets:
+            sets_sql = ", ".join(sets)
+            await self._pool.execute(
+                f"UPDATE suppress_blacklist SET {sets_sql} WHERE tenant_id=%s AND id=%s", tuple(args)
+            )
+        row = await self._pool.fetchone(
+            "SELECT id, domain, service, `signal`, reason, enabled FROM suppress_blacklist "
+            "WHERE tenant_id=%s AND id=%s",
+            (tenant_id, entry_id),
+        )
+        if row is None:
+            return None
+        return {
+            "id": row[0], "domain": row[1], "service": row[2], "signal": row[3],
+            "reason": row[4], "enabled": bool(row[5]),
+        }
+
+    async def delete_blacklist(self, tenant_id: str, entry_id: int) -> None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        await self._pool.execute(
+            "DELETE FROM suppress_blacklist WHERE tenant_id=%s AND id=%s", (tenant_id, entry_id)
+        )

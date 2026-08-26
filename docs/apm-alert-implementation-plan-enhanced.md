@@ -1512,6 +1512,8 @@ async def run_domain(ctx: DetectionContext) -> "DomainResult":
 
 ## M6 — 调度、多租户、API、恢复闭环
 
+> **已实现**（2026-08-26）。实现日志见 [`docs/logs/M6.md`](../logs/M6.md)，历史规格归档见 [`docs/archive/M6-scheduler-apis.md`](../archive/M6-scheduler-apis.md)，实现计划见 [`docs/plans/M6-implementation-plan.md`](../plans/M6-implementation-plan.md)。剩余项：真实 LLM L2 摘要、detector params 写入侧校验、fpr 回写、MySQL 真库实测随 M7/后续。
+
 ### 基础信息
 
 - **目标**：完整可运行服务：scheduler 自动跑、API 自服务、多租户安全、异常消失自动关单

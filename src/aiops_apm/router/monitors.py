@@ -1,4 +1,4 @@
-"""监控端点管理 API（M3）：``/v1/monitors`` CRUD + 连通性测试。
+"""监控端点管理 API（M3）：``/v1/monitors`` CRUD + 连通性测试 + 手动单跑（M6 UC-6.2）。
 
 所有端点从 ``X-Tenant-Id`` 头解析租户；创建/更新先过出站安全网关校验
 （``validate_url`` + ``validate_headers``），SSRF / 明文凭据在落库前被拒。
@@ -6,11 +6,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Request
 
 from ..collectors import CollectContext, SharedHttpClient, collector_for
 from ..collectors._gateway import OutboundGateway
 from ..exceptions import AppException, ErrorCode
+from ..poller import run_round
 from .deps import get_tenant_id
 
 router = APIRouter(prefix="/v1/monitors", tags=["monitors"])
@@ -107,4 +110,33 @@ async def test_monitor(request: Request, target_id: str) -> dict:
         "status": "ok",
         "signal_count": len(signals),
         "signals": [s.model_dump() for s in signals[:_SAMPLE_LIMIT]],
+    }
+
+
+@router.post("/{target_id}/run")
+async def run_monitor(request: Request, target_id: str) -> dict:
+    """手动单跑（UC-6.2）：单 target 一次采集 + 漏斗，返回 DomainResult。"""
+    tenant = get_tenant_id(request)
+    target = await _store(request).get(tenant, target_id)
+    if target is None:
+        raise AppException(ErrorCode.NOT_FOUND, f"monitor target not found: {target_id}")
+
+    state = request.app.state
+    result = await run_round(
+        registry=state.registry,
+        storage=state.storage,
+        tenant_id=tenant,
+        domain=str(target.get("domain", "application")),
+        targets=[target],
+        now=datetime.now(timezone.utc),
+        http=state.http_client,
+        settings=state.settings,
+    )
+    return {
+        "domain": result.domain,
+        "records": [r.model_dump() for r in result.records],
+        "suppressed_count": result.suppressed_count,
+        "anomaly_count": result.anomaly_count,
+        "degraded_sources": result.degraded_sources,
+        "timeline": result.timeline,
     }

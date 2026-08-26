@@ -27,6 +27,18 @@ class _ConnectionHandle:
         async with self._conn.cursor() as cur:
             await cur.execute(sql, args)
 
+    async def execute_lastid(self, sql: str, args: tuple = ()) -> int:
+        """执行写入并返回 ``cursor.lastrowid``（M6 lease 原子取号用）。"""
+        async with self._conn.cursor() as cur:
+            await cur.execute(sql, args)
+            return int(cur.lastrowid or 0)
+
+    async def execute_affected(self, sql: str, args: tuple = ()) -> int:
+        """执行写入并返回受影响行数 ``cursor.rowcount``（M6 lease 接管/续约用）。"""
+        async with self._conn.cursor() as cur:
+            await cur.execute(sql, args)
+            return cur.rowcount
+
     async def fetchone(self, sql: str, args: tuple = ()) -> tuple | None:
         async with self._conn.cursor() as cur:
             await cur.execute(sql, args)
@@ -81,6 +93,26 @@ class ConnectionPool:
         try:
             await handle.execute(sql, args)
             await handle.commit()
+        finally:
+            await self.release(handle)
+
+    async def execute_lastid(self, sql: str, args: tuple = ()) -> int:
+        """便捷：执行写入并返回 lastrowid（自动 acquire→commit→release）。"""
+        handle = await self.acquire()
+        try:
+            lastid = await handle.execute_lastid(sql, args)
+            await handle.commit()
+            return lastid
+        finally:
+            await self.release(handle)
+
+    async def execute_affected(self, sql: str, args: tuple = ()) -> int:
+        """便捷：执行写入并返回受影响行数（自动 acquire→commit→release）。"""
+        handle = await self.acquire()
+        try:
+            affected = await handle.execute_affected(sql, args)
+            await handle.commit()
+            return affected
         finally:
             await self.release(handle)
 
