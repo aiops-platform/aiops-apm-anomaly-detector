@@ -59,7 +59,7 @@ class MySQLWatermarkStore(WatermarkStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         await self._pool.execute(
-            "INSERT INTO collect_watermark (tenant_id, target_id, last_ts) VALUES (%s, %s, %s) "
-            "ON DUPLICATE KEY UPDATE last_ts=VALUES(last_ts)",
+            "INSERT INTO collect_watermark (tenant_id, target_id, last_ts) VALUES (%s, %s, %s) AS new "
+            "ON DUPLICATE KEY UPDATE last_ts=new.last_ts",
             (tenant_id, target_id, last_ts),
         )

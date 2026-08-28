@@ -26,9 +26,9 @@ def ms(*, service="svc-a", metric="cpu_usage", value=0.95, labels=None) -> Metri
     return MetricSignal(service=service, metric=metric, value=value, timestamp=TS, labels=labels or {})
 
 
-def ls(*, service="svc-a", level="ERROR", message="boom", stack_trace=None, timestamp=TS, signature=None) -> LogSignal:
+def ls(*, service="svc-a", level="ERROR", message="boom", stack_trace=None, timestamp=TS, signature=None, trace_id=None) -> LogSignal:
     return LogSignal(
-        service=service, level=level, message=message, stack_trace=stack_trace, timestamp=timestamp, signature=signature
+        service=service, level=level, message=message, stack_trace=stack_trace, timestamp=timestamp, signature=signature, trace_id=trace_id
     )
 
 
@@ -233,3 +233,21 @@ async def test_signature_aggregate_severity_default_and_override():
     assert (await SignatureAggregateDetector().detect(logs, {"min_count": 3}))[0].severity == "warning"
     out = await SignatureAggregateDetector().detect(logs, {"min_count": 3, "severity": "high"})
     assert out[0].severity == "high"
+
+
+@pytest.mark.asyncio
+async def test_signature_aggregate_collects_trace_ids_dedup_sorted():
+    logs = [
+        ls(stack_trace=STACK, trace_id="tid-b"),
+        ls(stack_trace=STACK, trace_id="tid-a"),
+        ls(stack_trace=STACK, trace_id="tid-a"),
+    ]
+    out = await SignatureAggregateDetector().detect(logs, {"min_count": 3})
+    assert out[0].trace_ids == ["tid-a", "tid-b"]  # 去重 + 排序
+
+
+@pytest.mark.asyncio
+async def test_signature_aggregate_trace_ids_empty_without_trace_id():
+    logs = [ls(stack_trace=STACK) for _ in range(3)]
+    out = await SignatureAggregateDetector().detect(logs, {"min_count": 3})
+    assert out[0].trace_ids == []

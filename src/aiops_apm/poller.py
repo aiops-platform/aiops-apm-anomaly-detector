@@ -7,6 +7,11 @@
 M7（UC-7.1/7.2）：每轮写入 ``detection_round``（create running → update success/partial/failed），
 收尾 ``record_round_metrics`` 打点；``run_domain`` 异常 → 记 failed + 审计 + re-raise
 （保留 scheduler/alerts 调用方行为）。
+V5：每轮下每 target 一行 ``detection_round_target``（create_target running →
+采集后逐 target update_target_status ok/failed + signals_count/error），
+供 per-target 审计与孤儿恢复。
+V6：漏斗后按 service 归因回填 per-target 计数（anomaly/record/suppressed），
+``update_target_status(status=None)`` 只更新计数字段、不动采集状态。
 
 采集器 duck-type 只用 ``ctx.tenant_id``/``ctx.watermark_store``/``ctx.snapshot_store``
 （M3 已冻结），因此这里用窄 ``CollectContext``，不构造完整 ``DetectionContext``。
@@ -54,38 +59,60 @@ async def run_round(
         started_at=now,
         target_ids=[str(t.get("target_id", "unknown")) for t in targets],
     )
+    # round → target 一对多明细：每 target 一行 running（V5 子表）
+    for t in targets:
+        await rounds.create_target(
+            tenant_id, trace_id, str(t.get("target_id", "unknown")), started_at=now
+        )
     perf_start = time.perf_counter()
 
     collect_ctx = CollectContext(
         tenant_id=tenant_id,
         watermark_store=storage.watermarks,
         snapshot_store=storage.snapshots,
+        now=now,  # 滚动窗口（§8.2）：采集时间窗口按本轮 trigger 时间算
     )
     degraded: list[str] = []
 
-    async def _one(target: dict) -> list:
+    async def _one(target: dict) -> tuple[str, list, str | None]:
+        target_id = str(target.get("target_id", "unknown"))
         try:
             collector = collector_for(target, http=http, settings=settings)
-            return await collector.collect(collect_ctx, target)
-        except Exception:
-            degraded.append(str(target.get("target_id", "unknown")))
-            return []
+            signals = await collector.collect(collect_ctx, target)
+            return target_id, list(signals), None
+        except Exception as exc:  # noqa: BLE001 -- 单个 target 降级，不拖垮整轮
+            degraded.append(target_id)
+            return target_id, [], f"{type(exc).__name__}: {exc}"
 
     results = await asyncio.gather(*(_one(t) for t in targets))
-    signals = [s for batch in results for s in batch]
+    signals = [s for _, batch, _ in results for s in batch]
 
-    ctx: DetectionContext = await build_context(
-        tenant_id=tenant_id,
-        domain=domain,
-        registry=registry,
-        storage=storage,
-        now=now,
-        trace_id=trace_id,
-        signals=signals,
-        degraded_sources=degraded,
-        summary_provider=summary_provider,
-    )
+    # 采集收尾：逐 target 更新 ok/failed（含各自信号量与错误原因）
+    collect_ended = datetime.now(timezone.utc)
+    for target_id, batch, error in results:
+        if error is None:
+            await rounds.update_target_status(
+                tenant_id, trace_id, target_id, "ok",
+                finished_at=collect_ended, signals_count=len(batch),
+            )
+        else:
+            await rounds.update_target_status(
+                tenant_id, trace_id, target_id, "failed",
+                finished_at=collect_ended, signals_count=0, error=error,
+            )
+
     try:
+        ctx: DetectionContext = await build_context(
+            tenant_id=tenant_id,
+            domain=domain,
+            registry=registry,
+            storage=storage,
+            now=now,
+            trace_id=trace_id,
+            signals=signals,
+            degraded_sources=degraded,
+            summary_provider=summary_provider,
+        )
         result = await run_domain(ctx)
     except Exception as exc:  # noqa: BLE001 -- 记录 failed 轮次后仍向上抛，保留调用方语义
         duration = time.perf_counter() - perf_start
@@ -101,6 +128,26 @@ async def run_round(
         raise
 
     duration = time.perf_counter() - perf_start
+
+    # 漏斗后归因回填（V6）：按 target.service 匹配漏斗结果，把 per-target 计数补到子表。
+    # status=None → 只更新 anomaly_count/record_count/suppressed_count，不覆盖采集状态。
+    # 采集失败的 target（degraded，0 信号）跳过——它的 service 计数应由真正采集成功的 target 承担。
+    failed_targets = {tid for tid, _, err in results if err is not None}
+    anomalies_by_service = result.anomalies_by_service or {}
+    records_by_service = result.records_by_service or {}
+    suppressed_by_service = result.suppressed_by_service or {}
+    for t in targets:
+        tid = str(t.get("target_id", "unknown"))
+        if tid in failed_targets:
+            continue
+        svc = str(t.get("service", "unknown"))
+        await rounds.update_target_status(
+            tenant_id, trace_id, tid,
+            anomaly_count=anomalies_by_service.get(svc, 0),
+            record_count=records_by_service.get(svc, 0),
+            suppressed_count=suppressed_by_service.get(svc, 0),
+        )
+
     status = "partial" if degraded else "success"
     await rounds.update_status(
         tenant_id, trace_id, status,

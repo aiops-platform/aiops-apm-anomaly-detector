@@ -107,10 +107,12 @@ def test_update_patches_and_revalidates(client):
 def test_delete_is_soft(client):
     client.post("/v1/monitors", json=_metric_body())
     assert client.delete("/v1/monitors/MT-0001").status_code == 204
-    # 软删：get 仍返回但 enabled=False
+    # 软删：get 仍返回但 deleted=True，enabled 保持不变；列表不再包含
     detail = client.get("/v1/monitors/MT-0001")
     assert detail.status_code == 200
-    assert detail.json()["enabled"] is False
+    assert detail.json()["deleted"] is True
+    assert detail.json()["enabled"] is True
+    assert client.get("/v1/monitors").json()["items"] == []
 
 
 # ---- UC-3.7 SSRF 拦截 ----

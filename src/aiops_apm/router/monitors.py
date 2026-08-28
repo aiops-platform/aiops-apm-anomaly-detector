@@ -71,7 +71,7 @@ async def update_monitor(request: Request, target_id: str, body: dict) -> dict:
 
 @router.delete("/{target_id}", status_code=204)
 async def delete_monitor(request: Request, target_id: str) -> None:
-    """软删端点（enabled=0）。"""
+    """软删端点（deleted=1，enabled 保持不变）。"""
     tenant = get_tenant_id(request)
     await _store(request).delete(tenant, target_id)
 

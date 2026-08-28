@@ -153,10 +153,20 @@ class ConnectionPool:
 
 
 def _as_json(value: Any) -> str:
-    """把 Python 值转成 MySQL JSON 列可接收的 JSON 字符串。"""
-    import json
+    """把 Python 值转成 MySQL JSON 列可接收的 JSON 字符串。
 
-    return json.dumps(value, ensure_ascii=False)
+    JSON 列里的 datetime/date 转 isoformat（emit 的 metric_anomalies.detected_at 等是
+    ``datetime``，json.dumps 默认序列化不了 → TypeError；单测走 InMemory 从未暴露）。
+    """
+    import json
+    from datetime import date, datetime
+
+    def _default(o: Any) -> Any:
+        if isinstance(o, (datetime, date)):
+            return o.isoformat()
+        raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+    return json.dumps(value, ensure_ascii=False, default=_default)
 
 
 def _decode_json(value: Any) -> Any:

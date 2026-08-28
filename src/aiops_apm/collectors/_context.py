@@ -8,6 +8,7 @@ M5 pipeline 会引入完整 ``DetectionContext``；M1 已把 ``Collector.collect
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from ..storage.snapshots import SnapshotStore
 from ..storage.watermarks import WatermarkStore
@@ -20,3 +21,5 @@ class CollectContext:
     tenant_id: str
     watermark_store: WatermarkStore | None = None
     snapshot_store: SnapshotStore | None = None
+    # 滚动时间窗口（本计划 §8.2）：本轮 trigger 时间；None 时采集器回退当前时间。
+    now: datetime | None = None

@@ -48,6 +48,7 @@ class OutboundGateway:
     """出站安全网关。"""
 
     ALLOWED_SCHEMES = {"http", "https"}
+    LOOPBACK_NETWORKS = (ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128"))
     BLOCKED_NETWORKS = [
         ipaddress.ip_network("127.0.0.0/8"),
         ipaddress.ip_network("10.0.0.0/8"),
@@ -56,6 +57,20 @@ class OutboundGateway:
         ipaddress.ip_network("169.254.0.0/16"),  # 云元数据（如 169.254.169.254）
         ipaddress.ip_network("::1/128"),
     ]
+    # 本地联调开关（APM_ALLOW_LOOPBACK=true 放行回环）；类级状态，lifespan 启动时由 Settings 设置。
+    _allow_loopback: bool = False
+
+    @classmethod
+    def set_allow_loopback(cls, value: bool) -> None:
+        """打开/关闭回环放行（默认关闭 = fail-closed 全拦截）。"""
+        cls._allow_loopback = value
+
+    @classmethod
+    def _effective_blocked(cls) -> list:
+        """回环放行时从拦截清单剔除 127.0.0.0/8 与 ::1/128；内网/云元数据始终拦截。"""
+        if not cls._allow_loopback:
+            return cls.BLOCKED_NETWORKS
+        return [n for n in cls.BLOCKED_NETWORKS if n not in cls.LOOPBACK_NETWORKS]
     SECRET_REF_PATTERN = re.compile(r"\$\{(env|vault):[^}]+\}")
     PLAINTEXT_CRED_PATTERN = re.compile(
         r"(Bearer\s+[A-Za-z0-9\-_\.]+|AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}|sk-[A-Za-z0-9]{20,})",
@@ -99,7 +114,7 @@ class OutboundGateway:
     def _check_blocked(cls, url: str, ips: list) -> None:
         """任一 IP 命中私网/云元数据 → 拒绝（含审计）。"""
         for ip in ips:
-            for net in cls.BLOCKED_NETWORKS:
+            for net in cls._effective_blocked():
                 if ip in net:
                     SecurityAudit.log_gateway_event(url, True, f"blocked network: {ip}")
                     raise AppException(ErrorCode.VALIDATION, f"blocked network: {ip}")

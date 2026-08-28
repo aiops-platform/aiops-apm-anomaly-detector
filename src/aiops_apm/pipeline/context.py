@@ -69,6 +69,11 @@ class DomainResult:
     anomaly_count: int
     degraded_sources: list
     timeline: list
+    # M7 per-target 归因：按 service 计数（漏斗在合并信号集上跑、按 service 键），
+    # 供 poller 回填 detection_round_target。可选默认 None → 旧构造方（如 scheduler 测试的 Recorder）兼容。
+    anomalies_by_service: dict | None = None
+    records_by_service: dict | None = None
+    suppressed_by_service: dict | None = None
 
 
 async def build_context(

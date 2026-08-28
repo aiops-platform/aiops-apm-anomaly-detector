@@ -31,6 +31,43 @@ def test_validate_url_rejects_private_networks(url):
     assert "blocked network" in excinfo.value.reason
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:9200/logs/_search",  # IPv4 回环字面量
+        "http://[::1]:8080/",  # IPv6 回环字面量
+        "http://localhost:9200/logs/_search",  # hostname 解析到回环
+    ],
+)
+def test_validate_url_allows_loopback_when_enabled(monkeypatch, url):
+    # 开启回环放行后，回环地址不再拦截；结束还原默认（防串扰）
+    monkeypatch.setattr("aiops_apm.collectors._gateway._resolve_ips", lambda host: ["127.0.0.1", "::1"])
+    OutboundGateway.set_allow_loopback(True)
+    try:
+        assert OutboundGateway.validate_url(url) == url
+    finally:
+        OutboundGateway.set_allow_loopback(False)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://10.0.0.1/metrics",  # 内网
+        "http://192.168.1.1:8080/logs",
+        "http://169.254.169.254/latest/meta-data/",  # 云元数据
+    ],
+)
+def test_validate_url_still_blocks_private_with_loopback_enabled(url):
+    # 即使开启回环放行，内网/云元数据仍必须拦截
+    OutboundGateway.set_allow_loopback(True)
+    try:
+        with pytest.raises(AppException) as excinfo:
+            OutboundGateway.validate_url(url)
+        assert "blocked network" in excinfo.value.reason
+    finally:
+        OutboundGateway.set_allow_loopback(False)
+
+
 def test_validate_url_rejects_disallowed_scheme():
     with pytest.raises(AppException) as excinfo:
         OutboundGateway.validate_url("file:///etc/passwd")

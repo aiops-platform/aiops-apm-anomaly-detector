@@ -85,6 +85,81 @@ async def test_list_rounds_tenant_isolated(store: InMemoryRoundStore) -> None:
     assert await store.get_round("t2", "R-0001") is None  # 租户隔离
 
 
+# ---- detection_round_target 子表：round → target 一对多明细 ----
+
+
+async def test_create_target_and_latest(store: InMemoryRoundStore) -> None:
+    await store.create_target("t1", "R-0001", "MT-0001", started_at=TS1)
+    row = await store.latest_target("t1", "MT-0001")
+    assert row is not None
+    assert row["round_id"] == "R-0001"
+    assert row["status"] == "running"
+    assert row["signals_count"] == 0
+    assert row["anomaly_count"] == 0
+    assert row["record_count"] == 0
+    assert row["suppressed_count"] == 0
+    assert row["finished_at"] is None
+    # 同一 target 多轮 → latest 取 started_at 最新的
+    await store.create_target("t1", "R-0002", "MT-0001", started_at=TS2)
+    assert (await store.latest_target("t1", "MT-0001"))["round_id"] == "R-0002"
+
+
+async def test_update_target_status_counts_only(store: InMemoryRoundStore) -> None:
+    # V6 漏斗后回填：status=None → 只更新计数字段，不动采集状态/时间
+    await store.create_target("t1", "R-0001", "MT-0001", started_at=TS1)
+    await store.update_target_status("t1", "R-0001", "MT-0001", "ok", finished_at=TS2, signals_count=5)
+    await store.update_target_status(
+        "t1", "R-0001", "MT-0001",
+        anomaly_count=2, record_count=1, suppressed_count=3,
+    )
+    row = await store.latest_target("t1", "MT-0001")
+    assert row["status"] == "ok"  # 未覆盖
+    assert row["finished_at"] == TS2  # 未覆盖
+    assert row["signals_count"] == 5  # 未覆盖
+    assert row["anomaly_count"] == 2
+    assert row["record_count"] == 1
+    assert row["suppressed_count"] == 3
+
+
+async def test_update_target_status(store: InMemoryRoundStore) -> None:
+    await store.create_target("t1", "R-0001", "MT-0001", started_at=TS1)
+    await store.update_target_status(
+        "t1", "R-0001", "MT-0001", "failed", finished_at=TS2, signals_count=7, error="boom"
+    )
+    row = await store.latest_target("t1", "MT-0001")
+    assert row["status"] == "failed"
+    assert row["finished_at"] == TS2
+    assert row["signals_count"] == 7
+    assert row["error"] == "boom"
+
+
+async def test_latest_target_status_filter(store: InMemoryRoundStore) -> None:
+    await store.create_target("t1", "R-0001", "MT-0001", started_at=TS1)
+    await store.update_target_status("t1", "R-0001", "MT-0001", "interrupted", finished_at=TS2)
+    await store.create_target("t1", "R-0002", "MT-0001", started_at=TS3)
+    # 按 ok 过滤：最新 ok 无（本轮 running）→ None
+    assert await store.latest_target("t1", "MT-0001", status="ok") is None
+    assert (await store.latest_target("t1", "MT-0001", status="running"))["round_id"] == "R-0002"
+
+
+async def test_targets_tenant_isolated(store: InMemoryRoundStore) -> None:
+    await store.create_target("t1", "R-0001", "MT-0001", started_at=TS1)
+    assert await store.latest_target("t2", "MT-0001") is None
+
+
+async def test_list_targets_by_round(store: InMemoryRoundStore) -> None:
+    await store.create_target("t1", "R-0001", "MT-0002", started_at=TS1)
+    await store.create_target("t1", "R-0001", "MT-0001", started_at=TS1)
+    await store.create_target("t1", "R-0002", "MT-0009", started_at=TS2)  # 别的轮
+    rows = await store.list_targets("t1", "R-0001")
+    assert [r["target_id"] for r in rows] == ["MT-0001", "MT-0002"]
+    assert await store.list_targets("t2", "R-0001") == []  # 租户隔离
+
+
+async def test_latest_target_no_rows_returns_none(store: InMemoryRoundStore) -> None:
+    assert await store.latest_target("t1", "MT-NONE") is None
+
+
 @pytest.mark.parametrize(
     "method,args,kwargs",
     [
@@ -92,6 +167,10 @@ async def test_list_rounds_tenant_isolated(store: InMemoryRoundStore) -> None:
         ("update_status", ("", "R-1", "success"), {"ended_at": TS2}),
         ("get_round", ("", "R-1"), {}),
         ("list_rounds", ("",), {}),
+        ("create_target", ("", "R-1", "MT-1"), {"started_at": TS1}),
+        ("update_target_status", ("", "R-1", "MT-1", "ok"), {"finished_at": TS2}),
+        ("latest_target", ("", "MT-1"), {}),
+        ("list_targets", ("", "R-1"), {}),
     ],
 )
 async def test_tenant_id_required(store: InMemoryRoundStore, method: str, args: tuple, kwargs: dict) -> None:
@@ -148,3 +227,55 @@ async def test_mysql_list_rounds_sql_with_filters() -> None:
     assert "AND domain=%s" in sql
     assert "AND status=%s" in sql
     assert "ORDER BY started_at DESC LIMIT %s OFFSET %s" in sql
+
+
+async def test_mysql_create_target_sql() -> None:
+    logs: list = []
+    await _store(logs).create_target("t1", "R-0001", "MT-0001", started_at=TS1)
+    sql = next(s for (kind, s, _) in logs if kind == "execute")
+    assert sql.startswith("INSERT INTO detection_round_target")
+    assert "'running'" in sql
+    assert "started_at" in sql
+
+
+async def test_mysql_update_target_status_sql() -> None:
+    logs: list = []
+    await _store(logs).update_target_status(
+        "t1", "R-0001", "MT-0001", "failed", finished_at=TS2, signals_count=3, error="boom"
+    )
+    sql = next(s for (kind, s, _) in logs if kind == "execute")
+    assert "UPDATE detection_round_target SET status=%s, finished_at=%s, signals_count=%s, error=%s" in sql
+    assert "WHERE round_id=%s AND tenant_id=%s AND target_id=%s" in sql
+
+
+async def test_mysql_update_target_status_counts_only_sql() -> None:
+    # V6 漏斗后回填：只有计数字段 → SET 只含这三个列，status/finished_at 不出现
+    logs: list = []
+    await _store(logs).update_target_status(
+        "t1", "R-0001", "MT-0001",
+        anomaly_count=2, record_count=1, suppressed_count=3,
+    )
+    sql = next(s for (kind, s, _) in logs if kind == "execute")
+    assert (
+        "SET anomaly_count=%s, record_count=%s, suppressed_count=%s" in sql
+    )
+    assert "status=" not in sql
+    assert "finished_at=" not in sql
+    assert "WHERE round_id=%s AND tenant_id=%s AND target_id=%s" in sql
+
+
+async def test_mysql_latest_target_sql() -> None:
+    logs: list = []
+    await _store(logs).latest_target("t1", "MT-0001", status="running")
+    sql = next(s for (kind, s, _) in logs if kind == "fetchone")
+    assert "FROM detection_round_target WHERE tenant_id=%s AND target_id=%s" in sql
+    assert "AND status=%s" in sql
+    assert "ORDER BY started_at DESC LIMIT 1" in sql
+
+
+async def test_mysql_list_targets_sql() -> None:
+    logs: list = []
+    await _store(logs).list_targets("t1", "R-0001")
+    sql = next(s for (kind, s, _) in logs if kind == "fetchall")
+    assert "FROM detection_round_target WHERE tenant_id=%s AND round_id=%s" in sql
+    assert "ORDER BY target_id" in sql

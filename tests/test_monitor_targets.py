@@ -36,7 +36,18 @@ async def test_target_id_is_unique_per_tenant(store):
     await store.create("tenant-a", _target())
     assert await store.create("tenant-b", _target()) == "MT-0001" or True  # 不同租户从头计数
     ids_a = [t["target_id"] for t in await store.list("tenant-a")]
-    assert ids_a == ["MT-0001", "MT-0002"]
+    assert ids_a == ["MT-0002", "MT-0001"]  # 时间倒序：新创建的排最前
+
+
+async def test_list_newest_first_by_created_at(store):
+    await store.create("tenant-a", _target())
+    await store.create("tenant-a", _target())
+    rows = await store.list("tenant-a")
+    assert len(rows) == 2
+    # 后创建的 created_at 不早于先创建的，且排在最前
+    assert rows[0]["target_id"] == "MT-0002"
+    assert rows[0]["created_at"] >= rows[1]["created_at"]
+    assert "created_at" in rows[0]
 
 
 async def test_get_and_list_filters(store):
@@ -62,9 +73,30 @@ async def test_update_patches_fields(store):
 async def test_delete_is_soft(store):
     created = await store.create("tenant-a", _target())
     await store.delete("tenant-a", created["target_id"])
-    # get 仍返回（enabled=False），load_all_targets 不再包含
-    assert (await store.get("tenant-a", created["target_id"]))["enabled"] is False
+    # get 仍返回（deleted=True），enabled 保持不变，load_all_targets 不再包含
+    row = await store.get("tenant-a", created["target_id"])
+    assert row["deleted"] is True
+    assert row["enabled"] is True
     assert await store.load_all_targets("tenant-a") == []
+
+
+async def test_delete_sets_deleted_not_enabled(store):
+    created = await store.create("tenant-a", _target())
+    await store.delete("tenant-a", created["target_id"])
+    row = await store.get("tenant-a", created["target_id"])
+    assert row["deleted"] is True
+    assert row["enabled"] is True  # 软删走 deleted，不动 enabled
+    # list 只返回 deleted=0
+    assert await store.list("tenant-a") == []
+
+
+async def test_list_excludes_deleted(store):
+    await store.create("tenant-a", _target(service="keep"))
+    deleted = await store.create("tenant-a", _target(service="gone"))
+    await store.delete("tenant-a", deleted["target_id"])
+    rows = await store.list("tenant-a")
+    assert [r["service"] for r in rows] == ["keep"]
+    assert "deleted" in rows[0]
 
 
 async def test_load_all_targets_returns_only_enabled(store):

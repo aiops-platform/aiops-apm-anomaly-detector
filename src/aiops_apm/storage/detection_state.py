@@ -137,8 +137,8 @@ class MySQLDetectionStateStore(DetectionStateStore):
             }
         )
         await self._pool.execute(
-            "INSERT INTO detection_state (tenant_id, domain, state_key, state_value) VALUES (%s, %s, %s, %s) "
-            "ON DUPLICATE KEY UPDATE state_value=VALUES(state_value)",
+            "INSERT INTO detection_state (tenant_id, domain, state_key, state_value) VALUES (%s, %s, %s, %s) AS new "
+            "ON DUPLICATE KEY UPDATE state_value=new.state_value",
             (tenant_id, domain, key, state_value),
         )
 

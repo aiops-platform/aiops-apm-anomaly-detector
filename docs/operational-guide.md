@@ -178,11 +178,11 @@ APM 告警管理系统
 │   ├── 问题列表（ProblemListPage）        ← GET /v1/problems
 │   ├── 问题详情（ProblemDetailPage）      ← GET /v1/problems/{id} + POST resolve
 │   └── 检测状态（DetectionStatePage）     ← 内部 detection_state 表
-├── 监控管理
-│   ├── 监控端点列表（MonitorListPage）    ← GET /v1/monitors
-│   ├── 新建端点（MonitorFormPage）        ← POST /v1/monitors
-│   ├── 端点详情（MonitorDetailPage）      ← GET/PUT/DELETE /v1/monitors/{id}
-│   └── 采集测试（CollectorTestPage）      ← POST /v1/monitors/{id}/test
+├── 监控管理 
+│   ├── 监控端点列表（MonitorListPage）    ← GET /v1/monitors	✅
+│   ├── 新建端点（MonitorFormPage）        ← POST /v1/monitors ✅
+│   ├── 端点详情（MonitorDetailPage）      ← GET/PUT/DELETE /v1/monitors/{id} ✅
+│   └── 采集测试（CollectorTestPage）      ← POST /v1/monitors/{id}/test ✅
 ├── 配置管理
 │   ├── 检测规则（DomainConfigPage）       ← GET/PUT /v1/config/{domain}
 │   ├── 规则版本历史（ConfigVersionPage）

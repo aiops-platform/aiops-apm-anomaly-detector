@@ -105,8 +105,8 @@ class MySQLDomainConfigStore(DomainConfigStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         await self._pool.execute(
-            "INSERT INTO domain_config (tenant_id, domain, config, enabled) VALUES (%s, %s, %s, 1) "
-            "ON DUPLICATE KEY UPDATE config=VALUES(config), enabled=VALUES(enabled), version=version+1",
+            "INSERT INTO domain_config (tenant_id, domain, config, enabled) VALUES (%s, %s, %s, 1) AS new "
+            "ON DUPLICATE KEY UPDATE config=new.config, enabled=new.enabled, version=version+1",
             (tenant_id, domain, _as_json(_dump(config))),
         )
         row = await self._pool.fetchone(
@@ -119,7 +119,7 @@ class MySQLDomainConfigStore(DomainConfigStore):
             raise ValueError("tenant_id is required")
         for item in seed:
             await self._pool.execute(
-                "INSERT INTO domain_config (tenant_id, domain, config, enabled) VALUES (%s, %s, %s, %s) "
-                "ON DUPLICATE KEY UPDATE config=VALUES(config), enabled=VALUES(enabled)",
+                "INSERT INTO domain_config (tenant_id, domain, config, enabled) VALUES (%s, %s, %s, %s) AS new "
+                "ON DUPLICATE KEY UPDATE config=new.config, enabled=new.enabled",
                 (tenant_id, item["id"], _as_json(item["config"]), 1 if item.get("enabled", True) else 0),
             )

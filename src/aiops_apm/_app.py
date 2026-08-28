@@ -5,11 +5,13 @@ M6 起：lifespan 启动 scheduler + reconciler 后台任务；``settings.api_ke
 """
 
 import asyncio
+import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import generate_latest
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -17,6 +19,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .audit import set_audit_enabled
 from .auth.middleware import AuthMiddleware
 from .collectors import SharedHttpClient
+from .collectors._gateway import OutboundGateway
 from .exceptions import AppException, ErrorCode
 from .plugins.registry import PluginRegistry
 from .reconcile import Reconciler
@@ -24,6 +27,36 @@ from .router.api import api_router
 from .scheduler import Scheduler
 from .settings import Settings
 from .storage import build_storage
+
+logger = logging.getLogger(__name__)
+
+
+async def _supervise(
+    coro_factory: Callable[[], Awaitable[None]],
+    name: str,
+    *,
+    delay: float = 1.0,
+    max_delay: float = 60.0,
+) -> None:
+    """守护后台任务：worker 意外异常时记录并退避重启；停止时取消直接传播。
+
+    与 ``_run_group`` 的单轮隔离互补：那层保证单轮失败不 kill 调度循环，
+    这层保证即使 worker 循环自身崩溃（lease/找目标等阶段的异常）也能复活，
+    不会出现「应用还活着、但调度静默停止」的状态。
+    """
+    while True:
+        try:
+            await coro_factory()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- 守护重启
+            logger.error(
+                "background task %s crashed: %s: %s; restart in %.1fs",
+                name, type(exc).__name__, exc, delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
 
 
 @asynccontextmanager
@@ -38,6 +71,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     settings: Settings = app.state.settings
     set_audit_enabled(settings.audit_enabled)
+    OutboundGateway.set_allow_loopback(settings.allow_loopback)  # 本地联调放行回环（默认关）
     app.state.storage = await build_storage(settings)
     app.state.http_client = SharedHttpClient(settings)
     app.state.registry = PluginRegistry().load(
@@ -50,10 +84,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.enable_scheduler:
         scheduler = Scheduler(settings, app.state.registry, app.state.storage, http=app.state.http_client)
         app.state.scheduler = scheduler
-        background_tasks.append(asyncio.create_task(scheduler.run()))
+        background_tasks.append(asyncio.create_task(_supervise(scheduler.run, "scheduler")))
         reconciler = Reconciler(settings, app.state.storage)
         app.state.reconciler = reconciler
-        background_tasks.append(asyncio.create_task(reconciler.run()))
+        background_tasks.append(asyncio.create_task(_supervise(reconciler.run, "reconciler")))
 
     try:
         yield
@@ -93,6 +127,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     if app.state.settings.api_keys:
         app.add_middleware(AuthMiddleware, api_keys=app.state.settings.api_keys)
+
+    if app.state.settings.allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=app.state.settings.allowed_origins,
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            allow_headers=["X-Tenant-Id", "Authorization", "Content-Type"],
+        )
 
     app.include_router(api_router)
 

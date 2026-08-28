@@ -18,6 +18,17 @@ def test_get_domain_config_from_seed(client):
     assert data["version"] >= 1
 
 
+def test_list_domain_configs(client):
+    resp = client.get("/v1/config")
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert items, "items should be non-empty (seeded application)"
+    app = next((i for i in items if i["domain"] == "application"), None)
+    assert app is not None
+    assert "enabled" in app and "version" in app
+    assert app["version"] >= 1
+
+
 def test_get_domain_config_unknown_404(client):
     assert client.get("/v1/config/nonexistent").status_code == 404
 

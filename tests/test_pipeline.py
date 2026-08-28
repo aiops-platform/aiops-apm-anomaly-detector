@@ -28,8 +28,10 @@ def metric_signal(*, service="svc-a", metric="cpu_usage", value=0.95, ts=TS) -> 
     return MetricSignal(service=service, metric=metric, value=value, timestamp=ts)
 
 
-def log_signal(*, service="svc-a", level="ERROR", message="boom", signature="java.lang.OOMError", ts=TS) -> LogSignal:
-    return LogSignal(service=service, level=level, message=message, signature=signature, timestamp=ts)
+def log_signal(
+    *, service="svc-a", level="ERROR", message="boom", signature="java.lang.OOMError", ts=TS, trace_id=None
+) -> LogSignal:
+    return LogSignal(service=service, level=level, message=message, signature=signature, timestamp=ts, trace_id=trace_id)
 
 
 def domain_with(
@@ -319,6 +321,60 @@ async def test_uc510_degraded_source_marked() -> None:
         rec = result.records[0]
         assert any(e["type"] == "degraded" for e in rec.evidence)
         assert result.degraded_sources == ["MT-0001"]
+    finally:
+        await storage.close()
+
+
+# --- trace_id 透传：采集器带业务 trace_id 时 → LogAnomaly.trace_ids → record.evidence ---
+
+
+async def test_trace_ids_flow_into_problem_record_evidence() -> None:
+    storage = await make_storage()
+    try:
+        registry = PluginRegistry().load()
+        dc = domain_with(
+            [DetectorSpec(signal="ERROR", plugin="signature_aggregate", params={"min_count": 2}, severity="high")]
+        )
+        signals = [
+            log_signal(trace_id="tid-b"),
+            log_signal(trace_id="tid-a"),
+            log_signal(trace_id="tid-a"),
+        ]
+        ctx = await build_context(
+            tenant_id="default", domain="application", registry=registry, storage=storage, now=TS,
+            signals=signals, domain_config=dc,
+        )
+        result = await run_domain(ctx)
+        assert len(result.records) == 1
+        rec = result.records[0]
+        # LogAnomaly 聚合去重 + 排序
+        assert rec.log_anomalies[0].trace_ids == ["tid-a", "tid-b"]
+        # emit 写 evidence 条目（去重、计数）
+        trace_ev = next(e for e in rec.evidence if e["type"] == "log_trace_ids")
+        assert trace_ev["trace_ids"] == ["tid-a", "tid-b"]
+        assert trace_ev["count"] == 2
+        # round 自己的 trace_id 独立于业务 trace_id（仍是 pipeline 单 trace_id）
+        assert rec.trace_id
+    finally:
+        await storage.close()
+
+
+async def test_no_trace_id_no_evidence_entry() -> None:
+    storage = await make_storage()
+    try:
+        registry = PluginRegistry().load()
+        dc = domain_with(
+            [DetectorSpec(signal="ERROR", plugin="signature_aggregate", params={"min_count": 2}, severity="high")]
+        )
+        ctx = await build_context(
+            tenant_id="default", domain="application", registry=registry, storage=storage, now=TS,
+            signals=[log_signal(), log_signal()], domain_config=dc,
+        )
+        result = await run_domain(ctx)
+        assert len(result.records) == 1
+        rec = result.records[0]
+        assert rec.log_anomalies[0].trace_ids == []
+        assert all(e["type"] != "log_trace_ids" for e in rec.evidence)
     finally:
         await storage.close()
 

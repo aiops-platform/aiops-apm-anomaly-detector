@@ -224,13 +224,13 @@ class MySQLRecordStore(RecordStore):
         # JSON_MERGE_PRESERVE 把新 evidence 数组按元素拼接到已有 evidence
         args.append(_as_json(record.evidence))
         sql = (
-            f"INSERT INTO problem_record ({cols}) VALUES ({placeholders}) "
+            f"INSERT INTO problem_record ({cols}) VALUES ({placeholders}) AS new "
             "ON DUPLICATE KEY UPDATE "
-            "evidence = JSON_MERGE_PRESERVE(IFNULL(evidence, JSON_ARRAY()), CAST(%s AS JSON)), "
-            "occurrence_count = occurrence_count + 1, "
-            "last_seen_at = VALUES(last_seen_at), "
-            "severity = IF(FIELD(VALUES(severity),'warning','high','critical') > "
-            "FIELD(severity,'warning','high','critical'), VALUES(severity), severity), "
+            "evidence = JSON_MERGE_PRESERVE(IFNULL(problem_record.evidence, JSON_ARRAY()), CAST(%s AS JSON)), "
+            "occurrence_count = problem_record.occurrence_count + 1, "
+            "last_seen_at = new.last_seen_at, "
+            "severity = IF(FIELD(new.severity,'warning','high','critical') > "
+            "FIELD(problem_record.severity,'warning','high','critical'), new.severity, problem_record.severity), "
             "updated_at = CURRENT_TIMESTAMP(3)"
         )
         await self._pool.execute(sql, tuple(args))

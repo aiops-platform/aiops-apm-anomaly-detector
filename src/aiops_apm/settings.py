@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     # 为空 = 放行（不挂 AuthMiddleware，既有 API 测试零改动）。
     api_keys: dict[str, str] = {}
 
+    # ---- 前端 CORS（本计划 §8.1，配置了才挂中间件；空=不挂）----
+    # APM_ALLOWED_ORIGINS：逗号分隔或 JSON 数组，如 "http://localhost:8080" 或 '["http://localhost:8080"]'。
+    allowed_origins: list[str] = []
+
+    # ---- SSRF 出站网关（本地联调开关）----
+    # APM_ALLOW_LOOPBACK：true 放行回环地址（localhost/127.0.0.1/::1），本地联调用；
+    # 默认 false = 保持 fail-closed 全拦截。内网/云元数据（10/172.16/192.168/169.254）始终拦截。
+    allow_loopback: bool = False
+
     # ---- 可观测性 / 安全（M7 起生效）----
     # 安全审计日志开关（APM_AUDIT_ENABLED，默认开；日志即审计，不落库）。
     audit_enabled: bool = True

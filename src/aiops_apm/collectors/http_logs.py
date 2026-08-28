@@ -16,6 +16,7 @@ from ..signature import signature
 from ._field_mapping import FieldMapper, _extract_path
 from ._gateway import OutboundGateway
 from ._http_client import SharedHttpClient
+from ._window import apply_time_window
 
 
 class HttpLogsCollector(Collector):
@@ -35,7 +36,10 @@ class HttpLogsCollector(Collector):
         resolved = {k: self.gateway.resolve_secret(v) for k, v in headers.items()}
 
         params = dict(sc.get("params", {}))
-        if ctx.watermark_store is not None:
+        # 滚动窗口（§8.2）优先；未设 window_sec 时回退水位线增量（既有行为）。
+        if int(sc.get("window_sec", 0) or 0) > 0:
+            apply_time_window(sc, ctx, params)
+        elif ctx.watermark_store is not None:
             watermark = await ctx.watermark_store.get(ctx.tenant_id, target["target_id"])
             if watermark and watermark.get("last_ts"):
                 params["start"] = watermark["last_ts"].isoformat()

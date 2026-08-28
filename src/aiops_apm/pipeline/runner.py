@@ -58,12 +58,24 @@ async def run_domain(ctx: DetectionContext) -> DomainResult:
     for a in ctx.anomalies:
         by_service[a.service].append(a)
 
+    # M7 per-target 归因：按 service 计异常/开单/被抑制，供 detection_round_target 回填。
+    # 漏斗在合并信号集上跑、键是 service（信号不带 target_id），多 target 共用 service 时共享计数。
+    anomalies_by_service: dict[str, int] = defaultdict(int)
+    for service, anoms in by_service.items():
+        anomalies_by_service[service] = len(anoms)
+    suppressed_by_service: dict[str, int] = defaultdict(int)
+    for item in ctx.suppressed:
+        suppressed_by_service[getattr(item["signal"], "service", "unknown")] += 1
+
     records: list[Any] = []
+    records_by_service: dict[str, int] = defaultdict(int)
     for service, anoms in by_service.items():
         corr, change_related, recent_change = correlations[service]
         # M6 §13 用例 2：related（指标+日志同源）时组合升 critical 判定依据
         verification = await l3_verify(ctx, service, anoms, related=corr.related)
-        records.extend(await emit(ctx, service, anoms, corr, change_related, recent_change, verification))
+        emitted = await emit(ctx, service, anoms, corr, change_related, recent_change, verification)
+        records.extend(emitted)
+        records_by_service[service] = len(emitted)
 
     await ctx.state_store.sweep(ctx.tenant_id, ctx.domain, ctx.seen_keys)  # miss 计数（UC-5.6）
     timeline.append({"step": "record_created", "count": len(records)})
@@ -75,4 +87,7 @@ async def run_domain(ctx: DetectionContext) -> DomainResult:
         anomaly_count=len(ctx.anomalies),
         degraded_sources=list(ctx.degraded_sources),
         timeline=timeline,
+        anomalies_by_service=dict(anomalies_by_service),
+        records_by_service=dict(records_by_service),
+        suppressed_by_service=dict(suppressed_by_service),
     )

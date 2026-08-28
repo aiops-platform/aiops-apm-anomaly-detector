@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
+from ..exceptions import AppException, ErrorCode
 from .deps import get_tenant_id
 
 router = APIRouter(prefix="/v1/audit", tags=["audit"])
@@ -28,6 +29,17 @@ async def list_rounds(
         tenant, domain=domain, status=status, limit=limit, offset=offset
     )
     return {"items": items, "count": len(items)}
+
+
+@router.get("/rounds/{round_id}/targets")
+async def list_round_targets(request: Request, round_id: str) -> dict:
+    """某轮下每个 target 的采集明细（status/signals_count/error），孤儿恢复后可见 interrupted。"""
+    tenant = get_tenant_id(request)
+    round_row = await request.app.state.storage.rounds.get_round(tenant, round_id)
+    if round_row is None:
+        raise AppException(ErrorCode.NOT_FOUND, f"detection round not found: {round_id}")
+    items = await request.app.state.storage.rounds.list_targets(tenant, round_id)
+    return {"round_id": round_id, "items": items, "count": len(items)}
 
 
 @router.get("/suppressed")

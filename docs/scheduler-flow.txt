@@ -1,0 +1,136 @@
+================================================================================
+ Monitor Target 配置好之后 —— Scheduler 如何执行（流程图）
+ 模块: scheduler.py / poller.py / reconcile.py / _app.py
+ 标注: [串行]=一个接一个  [并发]=同时进行   DB=读写哪张表
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ ① 启动  make dev（_app.py lifespan）                                         │
+│    APM_ENABLE_SCHEDULER=true → 起两个后台任务                                │
+│      ├─ Scheduler  （按 schedule 自动跑检测）    ─┐                           │
+│      └─ Reconciler （每 30s 自动关单）            ─┤  [并发] 三个 asyncio     │
+│    + 同时对外提供 API                             ─┘  任务同时运行            │
+│    DB: 仅建立连接池（无具体表读写；首轮才碰表）                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ ② 调度主循环：每 scheduler_tick_sec=1s 执行一次 tick()   [串行] 单循环按节奏  │
+│                                                                             │
+│   1) 抢 lease                                          [串行] 一次一个持约    │
+│        DB 写 scheduler_lease（INSERT..ON DUPLICATE KEY UPDATE）              │
+│        多副本只有一个能抢到；抢不到 → 本轮跳过（返回 0）                      │
+│   2) 找「到点」的 target                               [串行] 逐租户逐条遍历  │
+│        DB 读 monitor_target（list_tenants: 去重租户; load_all_targets:       │
+│            WHERE enabled=1 AND deleted=0）                                  │
+│        条件: enabled=1 且 deleted=0（已停用/已删的不调度）                    │
+│        首次观测初始化为 now+interval → 刚建的不立即跑（防风暴）               │
+│   3) 按 (tenant, domain) 分组 → 信号量(max_concurrent_rounds=10)             │
+│        分组本身 [串行]（内存里归组）；                                        │
+│        每组调 run_round() → 各组之间 [并发]（最多同时 10 组）                │
+│   4) 轮末续约 lease  DB 写 scheduler_lease（UPDATE）                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ ③ run_round()（poller.py）—— 一组 target 的一轮                               │
+│                                                                             │
+│   1) 写轮次审计行           [串行] DB 写 detection_round（INSERT）            │
+│   2) 并行采集该组所有 target [并发] 组内 target 同时采（asyncio.gather）       │
+│        每个 target 依次：                                                   │
+│          读 collect_watermark（增量起点）  DB 读 collect_watermark           │
+│          请求外部数据源（http, 非 DB）                                       │
+│          写快照 / 推水位线                 DB 写 signal_snapshot +           │
+│                                              collect_watermark（UPDATE）     │
+│        单个失败 → 记 degraded_sources，不拖垮整轮                            │
+│   3) build_context 组装上下文 [串行]                                          │
+│        DB 读 domain_config（规则；空表时先 seed 写入）                        │
+│        DB 读 maintenance_window / suppress_blacklist / fpr_table /           │
+│               change_record（动态配置，每轮重读）                             │
+│   4) run_domain 漏斗（单轮内）                [串行] L0→L1→L2→L3 顺序执行    │
+│        L0 抑制: 用已载入的维护窗口/黑名单                                     │
+│        L1 检测: 纯函数判异常                                                  │
+│        L2 关联: 指标+日志同源 / 变更关联                                       │
+│        L3 验证: 持续性/误报率闸门            DB 读+写 detection_state         │
+│        emit 落单:                            DB 写 record_seq（取号）+        │
+│                                                problem_record（去重写）       │
+│   5) 更新轮次状态            [串行] DB 写 detection_round（UPDATE,           │
+│                                             success/partial/failed + 指标）  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ ④ 结果闭环（Reconciler，独立后台任务）        与 ②③ [并发]（同时可跑）        │
+│    reconcile_once 内部 [串行] 逐租户逐单扫描：                               │
+│      DB 读 problem_record（list: 找 open 单）                                │
+│      DB 读 detection_state（list_by_domain: 比对 miss_rounds）               │
+│      连续 resolve_after_rounds=3 轮无异常 →                                  │
+│      DB 写 problem_record（resolve, reason="auto" 关单）                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+ 并发性一句话总结
+================================================================================
+
+  全局:  Scheduler、Reconciler、API 三个 asyncio 任务 [并发]
+  调度:  每 tick [串行] 抢 lease+找目标；到点的组之间 [并发]（≤10 组）
+  一轮:  组内采集 [并发]（target 并行抓数据）；漏斗 L0-L3 [串行] 顺序算
+  并发上限 = min(到点组数, APM_MAX_CONCURRENT_ROUNDS=10)
+
+
+================================================================================
+ 表 → 读写点 速查
+================================================================================
+
+  monitor_target       读  scheduler② list_tenants / load_all_targets
+  scheduler_lease      读写 scheduler② 抢约/续约（多副本门控）
+  detection_round      写  scheduler③ 每轮审计行 + 状态
+  collect_watermark    读写 scheduler③ 采集增量水位线
+  signal_snapshot      写  scheduler③ 每轮信号快照
+  domain_config        读写 scheduler③ 检测规则（空表 seed）
+  maintenance_window   读  scheduler③ L0 抑制（动态）
+  suppress_blacklist   读  scheduler③ L0 抑制（动态）
+  fpr_table            读  scheduler③ L3 误报率（动态）
+  change_record        读  scheduler③ L2 变更关联（动态）
+  detection_state      读写 scheduler③ L3 持续性 + reconcile④ 比对
+  record_seq           写  scheduler③ emit 取 problem id
+  problem_record       读写 scheduler③ 落单（去重写）+ reconcile④ 关单
+
+
+================================================================================
+ 你还需要配置什么（checklist）
+================================================================================
+
+ 1. Monitor Target（弹窗表单）
+    [X] Enabled 勾选          ← 不勾=不调度
+    [ ] Interval (sec)        ← 调度触发间隔，如 60
+    [ ] source_config.url      ← 数据源可达；本地 localhost 需 APM_ALLOW_LOOPBACK=true
+    [ ] signal_type/source_type/field_mapping  ← 和数据源返回结构匹配
+    [ ] domain                 ← 默认 application（已自动 seed 检测规则）
+
+ 2. domain_config（检测规则）⚠️ 关键
+    - 默认 application 域：domains.yaml 自动 seed（cpu_usage 静态阈值 /
+      error_rate 环比 / ERROR 堆栈签名聚合）
+    - 若 target 用别的 domain 且没有对应规则
+        → 该轮 build_context 抛 "no domain config for domain=..."
+        → 需先 PUT /v1/config/{domain} 配置，再 POST /v1/config/reload
+
+ 3. 动态配置（可选，空表不影响）
+    - 维护窗口 / 黑名单（L0 抑制）：每轮自动重读
+    - 误报率回写（fpr）：自动
+
+ 4. 调度参数（.env 已配好，一般不用动）
+    APM_SCHEDULER_TICK_SEC=1.0         tick 频率
+    APM_MAX_CONCURRENT_ROUNDS=10       并发组数上限
+    APM_TOTAL_TIMEOUT_SEC=30.0         单轮总超时
+    APM_ENABLE_SCHEDULER=true          总开关
+    scheduler_lease_ttl_sec=30         多副本 lease TTL
+
+================================================================================
+ 快速验证（不用等 Interval）
+================================================================================
+
+ 手动跑单 target:  POST /v1/monitors/{target_id}/run
+ 手动全量跑:      POST /v1/alerts/run
+ 查轮次结果:      GET  /v1/audit/rounds   ← 看 success/partial/failed 与 degraded_sources

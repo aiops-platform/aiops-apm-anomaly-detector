@@ -234,6 +234,44 @@ async def test_logs_dedup_by_service_signature_timestamp():
     assert len(signals) == 1
 
 
+async def test_logs_collect_maps_trace_id_from_field_mapping():
+    # field_mapping 里配置 trace_id → 映射到 LogSignal.trace_id（可选，透传全链路 id）
+    target = _log_target(
+        source_config={
+            "url": "https://elk.example.com:9200/logs/_search",
+            "method": "GET",
+            "rows_path": "hits.hits",
+            "field_mapping": {
+                "level": "_source.level",
+                "message": "_source.message",
+                "stack_trace": "_source.stack_trace",
+                "timestamp": "_source.@timestamp",
+                "trace_id": "_source.trace_id",
+            },
+        }
+    )
+
+    def hits(params):
+        return [
+            {
+                "_source": {
+                    "level": "ERROR",
+                    "message": "boom",
+                    "stack_trace": "E: x",
+                    "@timestamp": "2026-08-26T12:00:00",
+                    "trace_id": "tid-123",
+                }
+            },
+            {"_source": {"level": "ERROR", "message": "boom", "stack_trace": "E: x", "@timestamp": "2026-08-26T12:00:01"}},
+        ]
+
+    http = FakeHttp(lambda params: {"hits": {"hits": hits(params)}})
+    collector = HttpLogsCollector(http, OutboundGateway())
+    signals = await collector.collect(CollectContext("tenant-a"), target)
+
+    assert [s.trace_id for s in signals] == ["tid-123", None]  # 缺省字段取不到 → None
+
+
 # ---- UC-3.6 超时降级 ----
 
 
@@ -273,3 +311,85 @@ def test_collector_for_dispatches_by_source():
     with pytest.raises(AppException) as excinfo:
         collector_for({"signal_type": "log", "source_type": "prometheus"})
     assert excinfo.value.code == ErrorCode.CONFIG_ERROR
+
+
+# ---- §8.2 滚动时间窗口（方案 B）----
+
+
+def _sc_with_window(target_builder, **extra):
+    """在 target 的 source_config 上叠加 window_sec / time_params 等键。"""
+    sc = {**target_builder()["source_config"], **extra}
+    return target_builder(source_config=sc)
+
+
+async def test_window_sec_pushes_start_end_and_ignores_watermark():
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpMetricsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0001", datetime(2024, 3, 9, 15, 30, 0))
+    now = datetime(2024, 3, 9, 16, 0, 0)
+    ctx = CollectContext("tenant-a", watermark_store=wm, now=now)
+
+    await collector.collect(ctx, _sc_with_window(_metric_target, window_sec=180))
+
+    params = http.calls[0]["params"]
+    assert params["start"] == "2024-03-09T15:57:00"  # now - 180s，而非水位线 last_ts
+    assert params["end"] == "2024-03-09T16:00:00"
+    assert params["query"] == "cpu_usage"  # 原始静态 params 保留
+
+
+async def test_window_sec_time_params_mapping():
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpLogsCollector(http, OutboundGateway())
+    now = datetime(2024, 3, 9, 16, 0, 0)
+    ctx = CollectContext("tenant-a", now=now)
+
+    await collector.collect(
+        ctx,
+        _sc_with_window(_log_target, window_sec=300, time_params={"start": "from", "end": "to"}),
+    )
+
+    params = http.calls[0]["params"]
+    assert params["from"] == "2024-03-09T15:55:00"
+    assert params["to"] == "2024-03-09T16:00:00"
+    assert "start" not in params
+    assert "end" not in params
+
+
+async def test_window_sec_zero_falls_back_to_watermark():
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpMetricsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0001", datetime(2024, 3, 9, 15, 30, 0))
+    ctx = CollectContext("tenant-a", watermark_store=wm)
+
+    await collector.collect(ctx, _sc_with_window(_metric_target, window_sec=0))
+
+    assert http.calls[0]["params"]["start"] == "2024-03-09T15:30:00"
+    assert "end" not in http.calls[0]["params"]
+
+
+async def test_window_sec_negative_treated_as_unset():
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpMetricsCollector(http, OutboundGateway())
+
+    await collector.collect(CollectContext("tenant-a"), _sc_with_window(_metric_target, window_sec=-5))
+
+    assert "start" not in http.calls[0]["params"]
+    assert "end" not in http.calls[0]["params"]
+
+
+async def test_window_sec_without_now_falls_back_to_wall_clock():
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpMetricsCollector(http, OutboundGateway())
+
+    await collector.collect(CollectContext("tenant-a"), _sc_with_window(_metric_target, window_sec=60))
+
+    params = http.calls[0]["params"]
+    # ctx.now=None → 回退当前时间：start 恰为 end 前 60s
+    from datetime import datetime as _dt
+
+    start = _dt.fromisoformat(params["start"])
+    end = _dt.fromisoformat(params["end"])
+    assert (end - start).total_seconds() == 60
+    assert end.tzinfo is not None

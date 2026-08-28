@@ -96,4 +96,5 @@ class FieldMapper:
             message=_field(row, mapping, "message"),
             stack_trace=_field(row, mapping, "stack_trace"),
             timestamp=_parse_ts(_field(row, mapping, "timestamp")),
+            trace_id=_field(row, mapping, "trace_id"),  # 可选：业务全链路 request/trace id
         )

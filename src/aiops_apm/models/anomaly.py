@@ -43,6 +43,8 @@ class LogAnomaly(BaseModel):
     first_seen: datetime
     severity: str
     detected_at: datetime | None = None
+    # 触发该异常的业务 trace/request id（可选；采集器带 trace_id 时透传，进 problem_record 证据）
+    trace_ids: list[str] = Field(default_factory=list)
 
     def anomaly_key(self) -> str:
         """转发到 fingerprint.anomaly_key（去重真源）。"""

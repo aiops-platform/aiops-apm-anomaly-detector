@@ -29,6 +29,14 @@ async def emit(
     evidence: list[dict] = []
     if ctx.degraded_sources:
         evidence.append({"type": "degraded", "target_ids": list(ctx.degraded_sources)})
+    # 业务 trace/request id 透传（可选）：采集器带 trace_id 时写入 evidence，便于下游按 id 追全链路
+    log_trace_ids: list[str] = []
+    for a in log_anoms:
+        for tid in a.trace_ids:
+            if tid not in log_trace_ids:
+                log_trace_ids.append(tid)
+    if log_trace_ids:
+        evidence.append({"type": "log_trace_ids", "trace_ids": log_trace_ids, "count": len(log_trace_ids)})
     # M6 摘要钩子：ctx.summary_provider 缺省用确定性模板（零 LLM 调用）
     provider = ctx.summary_provider if ctx.summary_provider is not None else TemplateSummaryProvider()
     summary = provider.summarize(service=service, metric_anoms=metric_anoms, log_anoms=log_anoms)

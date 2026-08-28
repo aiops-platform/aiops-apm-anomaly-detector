@@ -76,3 +76,35 @@ def test_list_suppressed_service_filter(client):
     rows = client.get("/v1/audit/suppressed", params={"service": "svc-a"}).json()["items"]
     assert len(rows) == 1
     assert rows[0]["service"] == "svc-a"
+
+
+def test_list_round_targets(client):
+    _seed_rounds(client)
+    store = client.app.state.storage.rounds
+    asyncio.run(store.create_target("default", "R-0001", "MT-0001", started_at=TS1))
+    asyncio.run(store.update_target_status("default", "R-0001", "MT-0001", "ok", finished_at=TS2, signals_count=3))
+    asyncio.run(store.create_target("default", "R-0001", "MT-0002", started_at=TS1))
+    asyncio.run(store.update_target_status("default", "R-0001", "MT-0002", "failed", finished_at=TS2, error="boom"))
+    resp = client.get("/v1/audit/rounds/R-0001/targets")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["round_id"] == "R-0001"
+    assert len(body["items"]) == 2
+    by_id = {r["target_id"]: r for r in body["items"]}
+    assert by_id["MT-0001"]["status"] == "ok"
+    assert by_id["MT-0001"]["signals_count"] == 3
+    assert by_id["MT-0002"]["status"] == "failed"
+    assert by_id["MT-0002"]["error"] == "boom"
+
+
+def test_list_round_targets_round_not_found(client):
+    resp = client.get("/v1/audit/rounds/NOPE/targets")
+    assert resp.status_code == 404
+
+
+def test_list_round_targets_tenant_isolated(client):
+    _seed_rounds(client)
+    store = client.app.state.storage.rounds
+    asyncio.run(store.create_target("default", "R-0001", "MT-0001", started_at=TS1))
+    resp = client.get("/v1/audit/rounds/R-0001/targets", headers={"X-Tenant-Id": "tenant-b"})
+    assert resp.status_code == 404  # 另一租户看不到该轮

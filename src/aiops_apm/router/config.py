@@ -43,6 +43,16 @@ async def reload_config(request: Request) -> dict:
     return {"plugins": reg.list()}
 
 
+@router.get("")
+async def list_domain_configs(request: Request) -> dict:
+    """列出该租户所有域（供前端域下拉）。读接口，无需 admin。"""
+    tenant = get_tenant_id(request)
+    rows = await DomainConfigLoader(_storage(request).domain_configs).load(tenant)
+    return {"items": [
+        {"domain": r["domain"], "enabled": r["enabled"], "version": r["version"]} for r in rows
+    ]}
+
+
 @router.get("/{domain}")
 async def get_domain_config(request: Request, domain: str) -> dict:
     """读该租户某域的检测规则。"""

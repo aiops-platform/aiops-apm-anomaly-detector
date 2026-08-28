@@ -30,6 +30,8 @@ class SignatureAggregateDetector(Detector):
         for sig, logs in groups.items():
             if len(logs) < min_count:
                 continue
+            # 业务 trace/request id（可选，去重保留）：采集器带 trace_id 时透传到 problem_record 证据
+            trace_ids = sorted({item.trace_id for item in logs if item.trace_id})
             anomalies.append(
                 LogAnomaly(
                     kind="log",
@@ -42,6 +44,7 @@ class SignatureAggregateDetector(Detector):
                     first_seen=min(item.timestamp for item in logs),
                     severity=params.get("severity", "warning"),
                     detected_at=max(item.timestamp for item in logs),
+                    trace_ids=trace_ids,
                 )
             )
         return anomalies

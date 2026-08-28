@@ -126,9 +126,10 @@ async def test_mysql_acquire_generates_atomic_takeover_sql() -> None:
     acquire_sql = next(sql for (kind, sql, _) in logs if kind == "execute_affected")
     assert "INSERT INTO scheduler_lease" in acquire_sql
     assert "ON DUPLICATE KEY UPDATE" in acquire_sql
-    # 原子接管：过期才换 holder / 续 expires_at
-    assert "IF(expires_at < NOW(3), VALUES(holder), holder)" in acquire_sql
-    assert "IF(expires_at < NOW(3), VALUES(expires_at), expires_at)" in acquire_sql
+    # 原子接管：过期才换 holder / 续 expires_at（别名语法，规避 MySQL 8.0.20+ VALUES() 弃用告警；
+    # 旧值用表名限定避免与 new 行别名歧义 → MySQL 1052）
+    assert "IF(scheduler_lease.expires_at < NOW(3), new.holder, scheduler_lease.holder)" in acquire_sql
+    assert "IF(scheduler_lease.expires_at < NOW(3), new.expires_at, scheduler_lease.expires_at)" in acquire_sql
     # 单 handle 内 SELECT holder 确认接管成功
     assert any(kind == "fetchone" and "SELECT holder" in sql for (kind, sql, _) in logs)
 

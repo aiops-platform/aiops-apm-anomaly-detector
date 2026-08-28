@@ -69,10 +69,13 @@ def test_split_statements_ignores_comments_and_quoted_semicolons() -> None:
 def test_load_scripts_parses_version() -> None:
     runner = _runner(FakeConn())
     scripts = runner._load_scripts()
-    assert [s.version for s in scripts] == [1, 2, 3]
+    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6]
     assert "problem_record" in scripts[0].sql
     assert "collect_watermark" in scripts[1].sql
     assert "detection_round" in scripts[2].sql
+    assert "monitor_target" in scripts[3].sql
+    assert "detection_round_target" in scripts[4].sql
+    assert "detection_round_target" in scripts[5].sql
 
 
 def test_v1_script_contains_twelve_tables_and_dedup_mechanism() -> None:
@@ -106,12 +109,15 @@ async def test_migrate_applies_new_scripts_in_order() -> None:
     conn = FakeConn(current_version=0)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 3
+    assert applied == 6
     assert conn.schema_versions_created
     assert any(s.startswith("CREATE DATABASE IF NOT EXISTS aiops_apm_runtime") for s in conn.statements)
     assert any(s.strip().startswith("CREATE TABLE IF NOT EXISTS problem_record") for s in conn.statements)
     assert any(s.strip().startswith("CREATE TABLE IF NOT EXISTS collect_watermark") for s in conn.statements)
     assert any("ALTER TABLE detection_round ADD COLUMN domain" in s for s in conn.statements)
+    assert any("ALTER TABLE monitor_target ADD COLUMN deleted" in s for s in conn.statements)
+    assert any("CREATE TABLE IF NOT EXISTS detection_round_target" in s for s in conn.statements)
+    assert any("ALTER TABLE detection_round_target ADD COLUMN anomaly_count" in s for s in conn.statements)
     # 版本号已记录
     assert any("INSERT INTO schema_versions" in s for s in conn.statements)
 
@@ -120,11 +126,14 @@ async def test_migrate_idempotent_skips_applied_versions() -> None:
     conn = FakeConn(current_version=1)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 2  # V1 已应用，仅补 V2、V3
+    assert applied == 5  # V1 已应用，仅补 V2、V3、V4、V5、V6
     # 已应用版本不重复执行其建表语句
     assert not any("CREATE TABLE IF NOT EXISTS problem_record" in s for s in conn.statements)
     assert any("CREATE TABLE IF NOT EXISTS collect_watermark" in s for s in conn.statements)
     assert any("ALTER TABLE detection_round ADD COLUMN domain" in s for s in conn.statements)
+    assert any("ALTER TABLE monitor_target ADD COLUMN deleted" in s for s in conn.statements)
+    assert any("CREATE TABLE IF NOT EXISTS detection_round_target" in s for s in conn.statements)
+    assert any("ALTER TABLE detection_round_target ADD COLUMN anomaly_count" in s for s in conn.statements)
 
 
 def test_v2_script_contains_collect_watermark() -> None:
@@ -141,3 +150,36 @@ def test_v3_script_adds_detection_round_domain() -> None:
     sql = runner._load_scripts()[2].sql
     assert "ALTER TABLE detection_round ADD COLUMN domain" in sql
     assert "DEFAULT 'application'" in sql
+
+
+def test_v4_script_adds_monitor_target_deleted() -> None:
+    runner = _runner(FakeConn())
+    sql = runner._load_scripts()[3].sql
+    assert "ALTER TABLE monitor_target ADD COLUMN deleted" in sql
+    assert "TINYINT(1) NOT NULL DEFAULT 0" in sql
+    assert "AFTER enabled" in sql
+    assert "idx_tenant_deleted" in sql
+
+
+def test_v5_script_creates_detection_round_target() -> None:
+    runner = _runner(FakeConn())
+    sql = runner._load_scripts()[4].sql
+    assert "CREATE TABLE IF NOT EXISTS detection_round_target" in sql
+    # round → target 一对多：复合主键 (round_id, tenant_id, target_id)
+    assert "PRIMARY KEY (round_id, tenant_id, target_id)" in sql
+    # 独立采集状态 + 信号量，供孤儿恢复与 per-target 审计
+    assert "status" in sql
+    assert "signals_count" in sql
+    assert "error" in sql
+    assert "idx_tenant_target" in sql
+
+
+def test_v6_script_adds_detection_round_target_counts() -> None:
+    runner = _runner(FakeConn())
+    sql = runner._load_scripts()[5].sql
+    assert "ALTER TABLE detection_round_target" in sql
+    # per-target 漏斗计数：异常/开单/被抑制，按 service 归因
+    assert "ADD COLUMN anomaly_count" in sql
+    assert "ADD COLUMN record_count" in sql
+    assert "ADD COLUMN suppressed_count" in sql
+    assert "NOT NULL DEFAULT 0" in sql

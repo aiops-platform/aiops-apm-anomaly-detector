@@ -78,10 +78,10 @@ class MySQLLeaseStore(LeaseStore):
         try:
             await handle.execute_affected(
                 "INSERT INTO scheduler_lease (lease_name, holder, acquired_at, expires_at) "
-                "VALUES (%s, %s, NOW(3), DATE_ADD(NOW(3), INTERVAL %s SECOND)) "
+                "VALUES (%s, %s, NOW(3), DATE_ADD(NOW(3), INTERVAL %s SECOND)) AS new "
                 "ON DUPLICATE KEY UPDATE "
-                "holder = IF(expires_at < NOW(3), VALUES(holder), holder), "
-                "expires_at = IF(expires_at < NOW(3), VALUES(expires_at), expires_at)",
+                "holder = IF(scheduler_lease.expires_at < NOW(3), new.holder, scheduler_lease.holder), "
+                "expires_at = IF(scheduler_lease.expires_at < NOW(3), new.expires_at, scheduler_lease.expires_at)",
                 (lease_name, holder, ttl_sec),
             )
             row = await handle.fetchone(

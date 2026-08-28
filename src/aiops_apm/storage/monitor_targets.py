@@ -5,17 +5,32 @@
 - ``MySQLMonitorTargetStore``：生产实现。
 
 行结构：``{"target_id", "service", "signal_type", "source_type", "domain",
-"source_config"(dict), "schedule"(dict), "enabled"}``。
-``target_id`` 形如 ``MT-0001``，由 store 生成，对外唯一。
+"source_config"(dict), "schedule"(dict), "enabled", "created_at", "deleted"}``。
+``target_id`` 形如 ``MT-0001``，由 store 生成，对外唯一；``list`` 按
+``created_at DESC, id DESC`` 返回（新创建的排最前，供前端直接展示）。
+软删走独立 ``deleted`` 标记（1=已删）：``list``/``load_all_targets``/``list_tenants``
+只返回 ``deleted=0``，``delete`` 置 ``deleted=1``，不动 ``enabled``。
 """
 
 import builtins
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from typing import Any
 
 from .connection import ConnectionPool, _as_json, _decode_json
 
-_PUBLIC_FIELDS = ("target_id", "service", "signal_type", "source_type", "domain", "source_config", "schedule", "enabled")
+_PUBLIC_FIELDS = (
+    "target_id",
+    "service",
+    "signal_type",
+    "source_type",
+    "domain",
+    "source_config",
+    "schedule",
+    "enabled",
+    "created_at",
+    "deleted",
+)
 
 
 def _public(row: Any) -> dict:
@@ -31,6 +46,8 @@ def _public(row: Any) -> dict:
         "source_config": _decode_json(row[5]),
         "schedule": _decode_json(row[6]),
         "enabled": bool(row[7]),
+        "created_at": row[8],
+        "deleted": bool(row[9]),
     }
 
 
@@ -63,15 +80,15 @@ class MonitorTargetStore(ABC):
 
     @abstractmethod
     async def delete(self, tenant_id: str, target_id: str) -> None:
-        """软删端点（``enabled=0``）。"""
+        """软删端点（``deleted=1``，不动 ``enabled``）。"""
 
     @abstractmethod
     async def load_all_targets(self, tenant_id: str) -> builtins.list[dict]:
-        """加载该租户 enabled 的端点（M6 调度器用）。"""
+        """加载该租户 enabled 且未删除的端点（M6 调度器用）。"""
 
     @abstractmethod
     async def list_tenants(self) -> builtins.list[str]:
-        """去重返回有启用端点的租户列表（M6 调度器扫描用）。"""
+        """去重返回有启用且未删除端点的租户列表（M6 调度器扫描用）。"""
 
 
 class InMemoryMonitorTargetStore(MonitorTargetStore):
@@ -100,6 +117,8 @@ class InMemoryMonitorTargetStore(MonitorTargetStore):
             "source_config": dict(target["source_config"]),
             "schedule": dict(target.get("schedule", {"interval_sec": 60})),
             "enabled": bool(target.get("enabled", True)),
+            "created_at": datetime.now(timezone.utc),
+            "deleted": False,
         }
         self._next_id += 1
         self._rows.append(row)
@@ -110,14 +129,15 @@ class InMemoryMonitorTargetStore(MonitorTargetStore):
             raise ValueError("tenant_id is required")
         out = []
         for r in self._rows:
-            if r["tenant_id"] != tenant_id:
+            if r["tenant_id"] != tenant_id or r["deleted"]:
                 continue
             if service is not None and r["service"] != service:
                 continue
             if signal_type is not None and r["signal_type"] != signal_type:
                 continue
-            out.append(_public(r))
-        return out
+            out.append(r)
+        out.sort(key=lambda r: (r["created_at"], r["id"]), reverse=True)
+        return [_public(r) for r in out]
 
     async def get(self, tenant_id: str, target_id: str) -> dict | None:
         if not tenant_id:
@@ -147,16 +167,16 @@ class InMemoryMonitorTargetStore(MonitorTargetStore):
             raise ValueError("tenant_id is required")
         for r in self._rows:
             if r["tenant_id"] == tenant_id and r["target_id"] == target_id:
-                r["enabled"] = False
+                r["deleted"] = True
                 return
 
     async def load_all_targets(self, tenant_id: str) -> builtins.list[dict]:
         if not tenant_id:
             raise ValueError("tenant_id is required")
-        return [_public(r) for r in self._rows if r["tenant_id"] == tenant_id and r["enabled"]]
+        return [_public(r) for r in self._rows if r["tenant_id"] == tenant_id and r["enabled"] and not r["deleted"]]
 
     async def list_tenants(self) -> builtins.list[str]:
-        tenants = sorted({r["tenant_id"] for r in self._rows if r["enabled"]})
+        tenants = sorted({r["tenant_id"] for r in self._rows if r["enabled"] and not r["deleted"]})
         return tenants
 
 
@@ -196,8 +216,8 @@ class MySQLMonitorTargetStore(MonitorTargetStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         sql = (
-            "SELECT target_id, service, signal_type, source_type, domain, source_config, schedule, enabled "
-            "FROM monitor_target WHERE tenant_id=%s"
+            "SELECT target_id, service, signal_type, source_type, domain, source_config, schedule, enabled, created_at, deleted "
+            "FROM monitor_target WHERE tenant_id=%s AND deleted=0"
         )
         args: list[Any] = [tenant_id]
         if service:
@@ -206,6 +226,8 @@ class MySQLMonitorTargetStore(MonitorTargetStore):
         if signal_type:
             sql += " AND signal_type=%s"
             args.append(signal_type)
+        # 新创建的排最前：created_at 倒序，id 兜底保证同一毫秒内的创建顺序也稳定
+        sql += " ORDER BY created_at DESC, id DESC"
         rows = await self._pool.fetchall(sql, tuple(args))
         return [_public(r) for r in rows]
 
@@ -213,7 +235,7 @@ class MySQLMonitorTargetStore(MonitorTargetStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         row = await self._pool.fetchone(
-            "SELECT target_id, service, signal_type, source_type, domain, source_config, schedule, enabled "
+            "SELECT target_id, service, signal_type, source_type, domain, source_config, schedule, enabled, created_at, deleted "
             "FROM monitor_target WHERE tenant_id=%s AND target_id=%s",
             (tenant_id, target_id),
         )
@@ -246,21 +268,21 @@ class MySQLMonitorTargetStore(MonitorTargetStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         await self._pool.execute(
-            "UPDATE monitor_target SET enabled=0 WHERE tenant_id=%s AND target_id=%s", (tenant_id, target_id)
+            "UPDATE monitor_target SET deleted=1 WHERE tenant_id=%s AND target_id=%s", (tenant_id, target_id)
         )
 
     async def load_all_targets(self, tenant_id: str) -> builtins.list[dict]:
         if not tenant_id:
             raise ValueError("tenant_id is required")
         rows = await self._pool.fetchall(
-            "SELECT target_id, service, signal_type, source_type, domain, source_config, schedule, enabled "
-            "FROM monitor_target WHERE tenant_id=%s AND enabled=1",
+            "SELECT target_id, service, signal_type, source_type, domain, source_config, schedule, enabled, created_at, deleted "
+            "FROM monitor_target WHERE tenant_id=%s AND enabled=1 AND deleted=0",
             (tenant_id,),
         )
         return [_public(r) for r in rows]
 
     async def list_tenants(self) -> builtins.list[str]:
         rows = await self._pool.fetchall(
-            "SELECT DISTINCT tenant_id FROM monitor_target WHERE enabled=1"
+            "SELECT DISTINCT tenant_id FROM monitor_target WHERE enabled=1 AND deleted=0"
         )
         return sorted(r[0] for r in rows)
