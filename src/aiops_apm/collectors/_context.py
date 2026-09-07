@@ -7,7 +7,7 @@ M5 pipeline 会引入完整 ``DetectionContext``；M1 已把 ``Collector.collect
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from ..storage.snapshots import SnapshotStore
@@ -23,3 +23,7 @@ class CollectContext:
     snapshot_store: SnapshotStore | None = None
     # 滚动时间窗口（本计划 §8.2）：本轮 trigger 时间；None 时采集器回退当前时间。
     now: datetime | None = None
+    # V8：本轮采集实际下发的出站请求参数快照（target_id -> {method, url, params}）。
+    # 采集器在 params 完全构造后写入；poller 在 collect 后读取并落 detection_round_target。
+    # 按 target_id 键控：同一 ctx 并行采集多个 target 时互不覆盖。只存 URL 查询参数，不含 headers。
+    request_params: dict = field(default_factory=dict)

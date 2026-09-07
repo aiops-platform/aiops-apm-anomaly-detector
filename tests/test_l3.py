@@ -55,7 +55,7 @@ def test_calibrate_severity_empty_warning() -> None:
     assert calibrate_severity([]) == "warning"
 
 
-# --- persistence 门（increment-first：连续 N 轮第 N 轮开单） ---
+# --- persistence 门（increment-first：累计出现 N 轮第 N 轮开单，断轮不清零） ---
 
 
 async def test_l3_persistence_gate_two_rounds() -> None:

@@ -76,6 +76,7 @@ Service Ops
 | Params | `source_config.params` | JSON 编辑器 | — | `{}` | 额外查询参数（指标采集还会自动下推 `start` 水位线）；error 过滤如 `{"level":"error"}` 放这里 |
 | Window (sec) | `source_config.window_sec` | 数字 | — | 未设 | **方案 B**：回看窗口（秒）。设了即每轮动态下推 `start=now-window_sec` / `end=now`（固定滚动窗口，覆盖水位线）；未设走水位线增量。**建议 `window_sec >= interval_sec` 防漏** |
 | Time Params | `source_config.time_params` | JSON 编辑器 | — | `{"start":"start","end":"end"}` | **方案 B**：窗口参数名映射（源用 `from`/`to` 等时改这里，如 `{"start":"from","end":"to"}`） |
+| Timezone | `source_config.timezone` | 文本 | — | — | 源所在时区（IANA，如 `Asia/Shanghai`）。出站时间统一 `yyyy-MM-dd'T'HH:mm:ss.SSS` + 时区后缀（UTC→`Z`）；**Spring 等源按本地墙钟解析查询参数（忽略时区后缀）**，水位线是 UTC，配了 `timezone` 才转源时区再发，否则漂移 8 小时重复采集 |
 
 **Field Mapping 模板（「Template」下拉一键填入，降低误配）：**
 - Prometheus 形状：`{"metric": "metric.__name__", "value": "value[1]", "timestamp": "value[0]", "service": "service"}`

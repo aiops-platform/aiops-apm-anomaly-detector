@@ -43,6 +43,10 @@ class DomainConfigStore(ABC):
     async def seed(self, tenant_id: str, seed: list[dict]) -> None:
         """幂等 seed（INSERT ... ON DUPLICATE KEY UPDATE）。seed 项形如 ``{"id", "enabled", "config"}``。"""
 
+    @abstractmethod
+    async def delete(self, tenant_id: str, domain: str) -> None:
+        """硬删该租户某域的规则行（前端 Delete 用，需先过引用守卫）。"""
+
 
 class InMemoryDomainConfigStore(DomainConfigStore):
     def __init__(self) -> None:
@@ -82,6 +86,13 @@ class InMemoryDomainConfigStore(DomainConfigStore):
                     "version": 1,
                 }
             )
+
+    async def delete(self, tenant_id: str, domain: str) -> None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        self._rows[:] = [
+            r for r in self._rows if not (r["tenant_id"] == tenant_id and r["domain"] == domain)
+        ]
 
 
 class MySQLDomainConfigStore(DomainConfigStore):
@@ -123,3 +134,10 @@ class MySQLDomainConfigStore(DomainConfigStore):
                 "ON DUPLICATE KEY UPDATE config=new.config, enabled=new.enabled",
                 (tenant_id, item["id"], _as_json(item["config"]), 1 if item.get("enabled", True) else 0),
             )
+
+    async def delete(self, tenant_id: str, domain: str) -> None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        await self._pool.execute(
+            "DELETE FROM domain_config WHERE tenant_id=%s AND domain=%s", (tenant_id, domain)
+        )

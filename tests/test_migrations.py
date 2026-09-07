@@ -69,13 +69,15 @@ def test_split_statements_ignores_comments_and_quoted_semicolons() -> None:
 def test_load_scripts_parses_version() -> None:
     runner = _runner(FakeConn())
     scripts = runner._load_scripts()
-    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6]
+    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6, 7, 8]
     assert "problem_record" in scripts[0].sql
     assert "collect_watermark" in scripts[1].sql
     assert "detection_round" in scripts[2].sql
     assert "monitor_target" in scripts[3].sql
     assert "detection_round_target" in scripts[4].sql
     assert "detection_round_target" in scripts[5].sql
+    assert "signal_snapshot" in scripts[6].sql
+    assert "detection_round_target" in scripts[7].sql
 
 
 def test_v1_script_contains_twelve_tables_and_dedup_mechanism() -> None:
@@ -109,7 +111,7 @@ async def test_migrate_applies_new_scripts_in_order() -> None:
     conn = FakeConn(current_version=0)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 6
+    assert applied == 8
     assert conn.schema_versions_created
     assert any(s.startswith("CREATE DATABASE IF NOT EXISTS aiops_apm_runtime") for s in conn.statements)
     assert any(s.strip().startswith("CREATE TABLE IF NOT EXISTS problem_record") for s in conn.statements)
@@ -118,6 +120,8 @@ async def test_migrate_applies_new_scripts_in_order() -> None:
     assert any("ALTER TABLE monitor_target ADD COLUMN deleted" in s for s in conn.statements)
     assert any("CREATE TABLE IF NOT EXISTS detection_round_target" in s for s in conn.statements)
     assert any("ALTER TABLE detection_round_target ADD COLUMN anomaly_count" in s for s in conn.statements)
+    assert any("ALTER TABLE signal_snapshot MODIFY COLUMN signature" in s for s in conn.statements)
+    assert any("ALTER TABLE detection_round_target ADD COLUMN request_params" in s for s in conn.statements)
     # 版本号已记录
     assert any("INSERT INTO schema_versions" in s for s in conn.statements)
 
@@ -126,7 +130,7 @@ async def test_migrate_idempotent_skips_applied_versions() -> None:
     conn = FakeConn(current_version=1)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 5  # V1 已应用，仅补 V2、V3、V4、V5、V6
+    assert applied == 7  # V1 已应用，仅补 V2、V3、V4、V5、V6、V7、V8
     # 已应用版本不重复执行其建表语句
     assert not any("CREATE TABLE IF NOT EXISTS problem_record" in s for s in conn.statements)
     assert any("CREATE TABLE IF NOT EXISTS collect_watermark" in s for s in conn.statements)
@@ -183,3 +187,21 @@ def test_v6_script_adds_detection_round_target_counts() -> None:
     assert "ADD COLUMN record_count" in sql
     assert "ADD COLUMN suppressed_count" in sql
     assert "NOT NULL DEFAULT 0" in sql
+
+
+def test_v7_script_widens_signal_snapshot_signature() -> None:
+    runner = _runner(FakeConn())
+    sql = runner._load_scripts()[6].sql
+    assert "ALTER TABLE signal_snapshot MODIFY COLUMN signature" in sql
+    # 长堆栈日志签名可超 255（实测 Spring 异常 ≈ 376），varchar(255) 报 1406
+    assert "VARCHAR(1024)" in sql
+
+
+def test_v8_script_adds_detection_round_target_request_params() -> None:
+    runner = _runner(FakeConn())
+    sql = runner._load_scripts()[7].sql
+    assert "ALTER TABLE detection_round_target" in sql
+    # 本轮采集实际下发的出站请求参数（url/method/params），JSON 列供审计排查
+    assert "ADD COLUMN request_params" in sql
+    assert "JSON" in sql
+    assert "AFTER error" in sql

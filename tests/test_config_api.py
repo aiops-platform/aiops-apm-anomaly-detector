@@ -41,3 +41,52 @@ def test_put_domain_config_bumps_version(client):
     assert v1 >= 1
     got = client.get("/v1/config/application").json()
     assert got["config"]["verify"]["persistence_rounds"] == 1
+
+
+def _put_custom_domain(client, domain="infra"):
+    """建一个自定义域（upsert 即创建），返回 version。"""
+    body = {"detectors": [{"signal": "cpu_usage", "plugin": "static_threshold", "params": {"threshold": 0.9}}]}
+    resp = client.put(f"/v1/config/{domain}", json=body)
+    assert resp.status_code == 200
+    return resp.json()["version"]
+
+
+def test_delete_domain_config(client):
+    _put_custom_domain(client, "infra")
+    resp = client.delete("/v1/config/infra")
+    assert resp.status_code == 204
+    assert client.get("/v1/config/infra").status_code == 404
+
+
+def test_delete_domain_config_unknown_404(client):
+    assert client.delete("/v1/config/nonexistent").status_code == 404
+
+
+def test_delete_domain_config_blocked_when_referenced(client):
+    """删被 enabled monitor_target 引用的域 → 400，reason 含 target_id。"""
+    _put_custom_domain(client, "infra")
+    # 建一个 domain=infra 的 target（POST /v1/monitors 落库）
+    body = {
+        "service": "svc-a",
+        "signal_type": "metric",
+        "source_type": "mock",
+        "domain": "infra",
+        "source_config": {"url": "http://example.com/metrics"},
+    }
+    created = client.post("/v1/monitors", json=body)
+    assert created.status_code == 201
+    target_id = created.json()["target_id"]
+
+    resp = client.delete("/v1/config/infra")
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "CONFIG_ERROR"
+    assert target_id in resp.json()["reason"]
+    # 域仍在（未被删）
+    assert client.get("/v1/config/infra").status_code == 200
+
+
+def test_delete_domain_config_removes_from_list(client):
+    _put_custom_domain(client, "infra")
+    assert client.delete("/v1/config/infra").status_code == 204
+    items = client.get("/v1/config").json()["items"]
+    assert all(i["domain"] != "infra" for i in items)

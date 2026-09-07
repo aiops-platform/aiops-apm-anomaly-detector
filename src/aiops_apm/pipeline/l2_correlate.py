@@ -49,10 +49,30 @@ def _change_within_window(changes: list, anomalies: list, window_sec: int) -> tu
     return False, None
 
 
+def _log_message(sig: str) -> str:
+    """日志摘要文本：取签名首行冒号后的 message（去掉 ``|`` 之后的堆栈帧），无冒号时整行。
+
+    签名格式 ``"ExceptionType: message|at frame1|..."``（``signature.py``），
+    这里只留给人读的 message，去掉异常类型前缀与堆栈帧，避免 symptom 太代码化。
+    """
+    if not sig:
+        return ""
+    first = sig.split("|")[0]
+    if ":" in first:
+        msg = first.split(":", 1)[1].strip()
+        if msg:
+            return msg
+    return first
+
+
 def template_summary(metric_anoms: list, log_anoms: list) -> str:
-    """模板兜底摘要：metric 拼 ``"{service} {metric} {value}"``，log 拼 ``"{service} {signature} x{count}"``。"""
-    parts = [f"{m.service} {m.metric} {m.value}" for m in metric_anoms]
-    parts += [f"{log.service} {log.signature} x{log.count}" for log in log_anoms]
+    """模板兜底摘要：metric 拼 ``"{metric} = {value}"``，log 拼 ``"{message} x{count}"``。
+
+    2026-08-28 调整：log 部分不再拼整条堆栈签名（原 ``"{service} {signature} x{count}"``），
+    改取签名冒号后的 message；summary 本就是按 service 分组产出，service 前缀冗余去掉。
+    """
+    parts = [f"{m.metric} = {m.value}" for m in metric_anoms]
+    parts += [f"{_log_message(log.signature)} x{log.count}" for log in log_anoms]
     return "；".join(parts)
 
 

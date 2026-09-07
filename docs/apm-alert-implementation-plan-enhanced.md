@@ -1422,18 +1422,17 @@ async def run_domain(ctx: DetectionContext) -> "DomainResult":
 断言: change_related=true；recent_change 包含 change_id + summary
 ```
 
-#### UC-5.6 用例 6：瞬时抖动过滤（修正 P0#2）
+#### UC-5.6 用例 6：瞬时抖动过滤（修正 P0#2；持续性按**累计出现轮数**计）
 
 ```
 前置: persistence_rounds=2；detection_state 持久化
-流程:
-  1. 第一轮: cpu_usage=0.91 → L1 anomaly → L3 consecutive=1 < 2 → 不通过
+流程（瞬时抖动 = 单轮脉冲：只出现 1 轮后消失）:
+  1. 第一轮: cpu_usage=0.91 → L1 anomaly → L3 累计=1 < 2 → 不通过
   2. detection_state 写入: consecutive_rounds=1
-  3. 第二轮: cpu_usage=0.85（正常）→ L1 无 anomaly
-  4. detection_state 更新: miss_rounds=1, consecutive_rounds=0
-  5. 第三轮: cpu_usage=0.91 → L1 anomaly → L3 consecutive=0 < 2 → 不通过
-  6. detection_state 更新: consecutive_rounds=1
-断言: 三轮均不开单；detection_state 正确反映 consecutive/miss rounds
+  3. 第二轮: cpu_usage=0.85（正常）→ L1 无 anomaly → sweep miss_rounds=1（consecutive 不清零，仍 1）
+  4. 第三轮: cpu_usage=0.85（正常）→ L1 无 anomaly → sweep miss_rounds=2（consecutive 仍 1）
+断言: 三轮均不开单（累计出现 1 次 < persistence_rounds=2）；detection_state 正确反映 cumulative/miss rounds
+      ★ 语义变更（累计）：若第 3 轮又出现 0.91 → 累计 2 次 ≥ 2 → 开单（见 test_persistence_cumulative_gap_then_reappear_opens）
       ★ 修正前: 内存 state 进程重启即丢 → 退化为直接开单
 ```
 

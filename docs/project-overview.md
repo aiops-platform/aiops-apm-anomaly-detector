@@ -81,7 +81,7 @@ make docker-up / docker-down / loadtest   # M7 交付（本机无 docker/locust 
 
 ## 9. 已知边界（问答时先想到的坑）
 
-- **L3 开单要连续 2 轮**：`verify.persistence_rounds` 默认 2，同一 anomaly_key 连续 2 轮命中第 2 轮才落 `problem_record`。
+- **L3 开单要累计出现 2 轮**：`verify.persistence_rounds` 默认 2，同一 anomaly_key **累计出现** 2 轮（中间断轮不清零）第 2 轮才落 `problem_record`。
 - **API 建的 mock 端点不产信号**：`_mock_signals` 为测试私有字段，经 store 会被丢弃 → mock 只用于链路验证；产告警需接真实 HTTP 源（`http_metrics`/`http_logs`）。
 - **SSRF 网关拦截本地/私网**：`127.0.0.0/8`、`::1`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16` 全拦，域名解析命中私网或解析失败也拒（fail-closed）。本地/容器演示需临时豁免（详见 operational-guide §4.2）。
 - **`docker compose up` 产不出告警**（M7 待补跑遗留）：`seed.py` 用 `metric_path/log_path` 但采集器期望 `rows_path`+`field_mapping`；`mock_source.py` 每行缺 `timestamp/service`。

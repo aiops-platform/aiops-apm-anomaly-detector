@@ -1,7 +1,7 @@
-"""``DetectionStateStore``：L3 持续性 consecutive / miss 计数。
+"""``DetectionStateStore``：L3 持续性 cumulative-appear / miss 计数。
 
-覆盖：get 无返回 None；upsert 后 get 反映字段；覆盖写；sweep 未见 key miss+1/consecutive 归 0、
-见到的 key 不动；tenant/domain 隔离。
+覆盖：get 无返回 None；upsert 后 get 反映字段；覆盖写；sweep 未见 key miss+1、
+consecutive（累计出现轮数）**不清零**；见到的 key 不动；tenant/domain 隔离。
 """
 
 from datetime import datetime, timezone
@@ -36,14 +36,15 @@ async def test_upsert_overwrites() -> None:
     assert state["consecutive_rounds"] == 2
 
 
-async def test_sweep_unseen_key_miss_and_reset() -> None:
+async def test_sweep_unseen_key_miss_increments_without_reset() -> None:
     s = InMemoryDetectionStateStore()
     await s.upsert("default", "application", "k1", consecutive_rounds=3, miss_rounds=0, first_seen=TS, last_seen=TS)
     await s.sweep("default", "application", set())  # k1 本轮未到
     state = await s.get("default", "application", "k1")
     assert state is not None
     assert state["miss_rounds"] == 1
-    assert state["consecutive_rounds"] == 0
+    # 累计语义：miss 不清零累计出现轮数
+    assert state["consecutive_rounds"] == 3
 
 
 async def test_sweep_seen_key_untouched() -> None:

@@ -90,15 +90,19 @@ async def run_round(
     # 采集收尾：逐 target 更新 ok/failed（含各自信号量与错误原因）
     collect_ended = datetime.now(timezone.utc)
     for target_id, batch, error in results:
+        # V8：本轮实际下发的出站请求参数（时间窗口/水位线/时区转换后），mock 源无请求 → None
+        request_params = collect_ctx.request_params.get(target_id)
         if error is None:
             await rounds.update_target_status(
                 tenant_id, trace_id, target_id, "ok",
                 finished_at=collect_ended, signals_count=len(batch),
+                request_params=request_params,
             )
         else:
             await rounds.update_target_status(
                 tenant_id, trace_id, target_id, "failed",
                 finished_at=collect_ended, signals_count=0, error=error,
+                request_params=request_params,
             )
 
     try:

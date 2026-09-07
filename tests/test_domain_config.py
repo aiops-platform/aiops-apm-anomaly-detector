@@ -86,6 +86,24 @@ async def test_upsert_returns_version_and_validates_tenant(yaml_seed: str) -> No
         await store.seed("", [{"id": "application"}])
 
 
+async def test_store_delete_removes_row() -> None:
+    store = InMemoryDomainConfigStore()
+    await store.upsert("default", "infra", _domain_config())
+    await store.upsert("default", "application", _domain_config())
+    await store.delete("default", "infra")
+    domains = [r["domain"] for r in await store.load("default")]
+    assert "infra" not in domains
+    assert "application" in domains  # 只删指定域
+    # 删除不存在的域不抛
+    await store.delete("default", "infra")
+
+
+async def test_store_delete_requires_tenant() -> None:
+    store = InMemoryDomainConfigStore()
+    with pytest.raises(ValueError):
+        await store.delete("", "application")
+
+
 async def test_uc26_fallback_to_cache_on_db_failure(yaml_seed: str) -> None:
     class FailingStore(InMemoryDomainConfigStore):
         fail = False

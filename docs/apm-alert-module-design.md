@@ -479,10 +479,10 @@ async def l1_detect(ctx):
 | `simple_compare` | 指标 | `value > baseline * ratio`（当前值 vs 基线，基线来自 params 或 label） | `baseline`, `ratio` |
 | `signature_aggregate` | 日志 | 堆栈签名聚合，`count >= min_count` 判定突增 | `min_count`, `n_frames` |
 
-**堆栈签名**（`signature_aggregate` 内部）：
+**堆栈签名**（`signature_aggregate` 内部；2026-08-28 用户确认调整：保留完整异常消息 + 帧行号，不再去行号）：
 
 ```
-signature = 异常类型 + 顶部 N 帧（类名+方法名，去行号，N=3~5）
+signature = 完整异常首行（异常类型 + 消息）+ 顶部 N 帧（类名.方法(文件:行号)，N=3~5）
 47 条相同 OOM → 1 条 log_anomaly(count=47)
 ```
 
@@ -491,8 +491,8 @@ def signature(log: LogSignal, n_frames: int = 3) -> str:
     if not log.stack_trace:
         return log.message[:120]
     lines = log.stack_trace.strip().split("\n")
-    exc = lines[0].split(":")[0] if lines else log.message
-    frames = [ln.strip().split("(")[0] for ln in lines[1:1 + n_frames]]
+    exc = lines[0] if lines else log.message          # 完整首行：异常类型 + 消息（保留冒号后内容）
+    frames = [ln.strip() for ln in lines[1:1 + n_frames]]  # 帧保留类名.方法(文件:行号)
     return "|".join([exc, *frames])
 ```
 
@@ -528,7 +528,10 @@ def l2_correlate(ctx) -> tuple[Correlation, bool]:
 
 ```python
 def template_summary(metric_anoms, log_anoms) -> str:
-    # 兜底：如 "payment-service cpu_usage 飙高至 0.92 且出现 OutOfMemoryError 堆栈"
+    # 兜底（2026-08-28 调整：log 只留签名冒号后的 message，去掉堆栈帧与 service 前缀）：
+    #   metric 拼 "{metric} = {value}"，如 "cpu_usage = 0.95"
+    #   log 拼 "{message} x{count}"，如 "Required request parameter 'serviceName' is not present x2"
+    #   多异常用 "；" 连接
     ...
 ```
 
@@ -730,6 +733,15 @@ class ProblemRecord(BaseModel):
 ```
 
 **写入约束**：`metric_anomalies` 与 `log_anomalies` 至少一个非空，且 `verification.passed=true`。
+
+**evidence 条目**（2026-08-28 起每条带 `round_id`，用于跨轮追溯 evidence → detection_round → target）：
+
+```json
+{"type": "log_trace_ids", "round_id": "trace-xxx", "target_ids": ["MT-0005"], "trace_ids": ["..."], "count": 5}
+{"type": "degraded", "round_id": "trace-xxx", "target_ids": ["MT-0001"]}
+```
+
+- `round_id` 即该轮 `trace_id`（poller 建轮次时二者同一值），命中已 open 记录 append evidence 时，每条证据仍能定位到产生它的那一轮；该轮 `detection_round.target_ids` 亦内联写入，审计可直接查 `/v1/audit/rounds/{round_id}/targets`。
 
 ### 7.2 DDL（aiops_apm_runtime 库，Python 直连）
 
@@ -1227,6 +1239,8 @@ async def run_round(registry, storage, domains, targets, state) -> RoundResult:
 | 9 | 无信号 | 提前终止 | 零 LLM 调用 |
 | 10 | 日志源超时 | 降级 | record 带 `degraded`，不崩溃 |
 | 11 | 单条 info 弱信号 | — | 不升级为事件 |
+
+> 注：L3 持续性按**累计出现轮数**计（`persistence_rounds`），中间断轮不清零——用例 6「瞬时抖动」指**单轮脉冲**（只出现 1 轮），累计 1 < 2 不生成；若后续轮再出现，累计到 N 会正常开单。
 
 ---
 

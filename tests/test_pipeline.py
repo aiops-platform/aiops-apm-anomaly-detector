@@ -177,14 +177,14 @@ async def test_uc55_error_rate_change_related() -> None:
         await storage.close()
 
 
-# --- UC-5.6：瞬时抖动过滤（三轮不开单，detection_state 反映 consecutive/miss） ---
+# --- UC-5.6：瞬时抖动过滤（三轮不开单，detection_state 反映 cumulative/miss） ---
 
 
 async def test_uc56_transient_spike_filtered() -> None:
     storage = await make_storage()
     try:
         registry = PluginRegistry().load()
-        # 第 1 轮 spike 出现，第 2/3 轮消失 → 永远到不了 persistence_rounds=2
+        # 第 1 轮 spike 出现（累计 1 次），第 2/3 轮消失 → 累计 1 < persistence_rounds=2，始终不开单
         ctx1 = await build_context(
             tenant_id="default", domain="application", registry=registry, storage=storage, now=TS,
             signals=[metric_signal(value=0.98, ts=TS)], domain_config=CPU_DOMAIN,
@@ -210,8 +210,53 @@ async def test_uc56_transient_spike_filtered() -> None:
 
         state = await storage.detection_state.get("default", "application", cpu_key())
         assert state is not None
-        assert state["consecutive_rounds"] == 0
+        assert state["consecutive_rounds"] == 1  # 累计 1 次出现，断轮（miss）不清零
         assert state["miss_rounds"] == 2
+    finally:
+        await storage.close()
+
+
+# --- 持续性累计语义：断一轮仍算（第 1 轮出现 → 第 2 轮断 → 第 3 轮再出现 → 累计 2 次开单） ---
+
+
+async def test_persistence_cumulative_gap_then_reappear_opens() -> None:
+    storage = await make_storage()
+    try:
+        registry = PluginRegistry().load()
+        # 第 1 轮：cpu 飙高 → 累计 1 次，未到 persistence_rounds=2 → 不开单
+        ctx1 = await build_context(
+            tenant_id="default", domain="application", registry=registry, storage=storage, now=TS,
+            signals=[metric_signal(value=0.98, ts=TS)], domain_config=CPU_DOMAIN,
+        )
+        r1 = await run_domain(ctx1)
+        assert r1.records == []
+
+        # 第 2 轮：cpu 正常 → 无异常，sweep 记 miss（累计不清零）
+        ctx2 = await build_context(
+            tenant_id="default", domain="application", registry=registry, storage=storage,
+            now=TS + timedelta(seconds=60), signals=[metric_signal(value=0.5, ts=TS + timedelta(seconds=60))],
+            domain_config=CPU_DOMAIN,
+        )
+        r2 = await run_domain(ctx2)
+        assert r2.records == []
+
+        # 第 3 轮：cpu 再次飙高 → 累计 2 次 ≥ 2 → 开单（断一轮不打断持续性）
+        ctx3 = await build_context(
+            tenant_id="default", domain="application", registry=registry, storage=storage,
+            now=TS + timedelta(seconds=120), signals=[metric_signal(value=0.97, ts=TS + timedelta(seconds=120))],
+            domain_config=CPU_DOMAIN,
+        )
+        r3 = await run_domain(ctx3)
+        assert len(r3.records) == 1
+        rec = r3.records[0]
+        assert rec.severity == "high"
+        assert rec.service == "svc-a"
+
+        state = await storage.detection_state.get("default", "application", cpu_key())
+        assert state is not None
+        assert state["consecutive_rounds"] == 2  # 累计 2 次出现：断的那一轮没清零
+        # 第 3 轮再次出现 → l3_verify 出现时重置 miss_rounds=0（reconcile 防误关）
+        assert state["miss_rounds"] == 0
     finally:
         await storage.close()
 
@@ -319,7 +364,9 @@ async def test_uc510_degraded_source_marked() -> None:
         result = await run_domain(ctx)
         assert len(result.records) == 1
         rec = result.records[0]
-        assert any(e["type"] == "degraded" for e in rec.evidence)
+        degraded = next(e for e in rec.evidence if e["type"] == "degraded")
+        assert degraded["target_ids"] == ["MT-0001"]
+        assert degraded["round_id"] == rec.trace_id
         assert result.degraded_sources == ["MT-0001"]
     finally:
         await storage.close()
@@ -355,6 +402,9 @@ async def test_trace_ids_flow_into_problem_record_evidence() -> None:
         assert trace_ev["count"] == 2
         # round 自己的 trace_id 独立于业务 trace_id（仍是 pipeline 单 trace_id）
         assert rec.trace_id
+        # evidence 携带 round_id（= trace_id）以便跨轮追溯；未建 detection_round 时 target_ids 为空
+        assert trace_ev["round_id"] == rec.trace_id
+        assert trace_ev["target_ids"] == []
     finally:
         await storage.close()
 
@@ -375,6 +425,36 @@ async def test_no_trace_id_no_evidence_entry() -> None:
         rec = result.records[0]
         assert rec.log_anomalies[0].trace_ids == []
         assert all(e["type"] != "log_trace_ids" for e in rec.evidence)
+    finally:
+        await storage.close()
+
+
+async def test_evidence_carries_round_and_target_ids() -> None:
+    """建 detection_round + target 后，log_trace_ids evidence 携带 round_id 与该轮 target_ids。"""
+    storage = await make_storage()
+    try:
+        registry = PluginRegistry().load()
+        dc = domain_with(
+            [DetectorSpec(signal="ERROR", plugin="signature_aggregate", params={"min_count": 2}, severity="high")]
+        )
+        round_id = "trace-round-1"
+        await storage.rounds.create_round(
+            "default", round_id, "application", started_at=TS, target_ids=["MT-0001", "MT-0006"]
+        )
+        for tid in ["MT-0001", "MT-0006"]:
+            await storage.rounds.create_target("default", round_id, tid, started_at=TS)
+        ctx = await build_context(
+            tenant_id="default", domain="application", registry=registry, storage=storage, now=TS,
+            trace_id=round_id,
+            signals=[log_signal(trace_id="tid-x"), log_signal(trace_id="tid-x")], domain_config=dc,
+        )
+        result = await run_domain(ctx)
+        assert len(result.records) == 1
+        rec = result.records[0]
+        trace_ev = next(e for e in rec.evidence if e["type"] == "log_trace_ids")
+        assert trace_ev["round_id"] == round_id
+        assert trace_ev["target_ids"] == ["MT-0001", "MT-0006"]
+        assert trace_ev["trace_ids"] == ["tid-x"]
     finally:
         await storage.close()
 

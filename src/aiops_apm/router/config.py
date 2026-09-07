@@ -81,3 +81,29 @@ async def put_domain_config(request: Request, domain: str, body: dict) -> dict:
     version = await _storage(request).domain_configs.upsert(tenant, domain, cfg)
     SecurityAudit.log_config_event(domain, "put", "success", detail=f"version={version}")
     return {"domain": domain, "version": version}
+
+
+@router.delete("/{domain}", status_code=204)
+async def delete_domain_config(request: Request, domain: str) -> None:
+    """删除该租户某域的检测规则（admin）。
+
+    引用守卫：仍被 enabled 的 ``monitor_target`` 引用时拒绝（400）——
+    ``build_context`` 对缺失域抛 ``ValueError``，删了会让该目标调度直接失败。
+    """
+    require_admin(get_principal(request))
+    tenant = get_tenant_id(request)
+    storage = _storage(request)
+    # 先确认存在（与 GET 一致；loader 空表会 seed application）
+    rows = await DomainConfigLoader(storage.domain_configs).load(tenant)
+    if not any(r["domain"] == domain for r in rows):
+        raise AppException(ErrorCode.NOT_FOUND, f"no domain config for domain={domain!r}")
+    # 引用守卫：load_all_targets 只返回 enabled 且未删的目标（调度真会跑的）
+    refs = [t for t in await storage.monitor_targets.load_all_targets(tenant) if t.get("domain") == domain]
+    if refs:
+        raise AppException(
+            ErrorCode.CONFIG_ERROR,
+            f"cannot delete domain config {domain!r}: still referenced by enabled targets "
+            + ", ".join(t["target_id"] for t in refs),
+        )
+    await storage.domain_configs.delete(tenant, domain)
+    SecurityAudit.log_config_event(domain, "delete", "success")

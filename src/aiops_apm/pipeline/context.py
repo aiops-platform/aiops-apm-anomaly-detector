@@ -17,6 +17,7 @@ from aiops_apm.plugins.registry import PluginRegistry
 from aiops_apm.storage import Storage
 from aiops_apm.storage.detection_state import DetectionStateStore
 from aiops_apm.storage.records import RecordStore
+from aiops_apm.storage.rounds import RoundStore
 from aiops_apm.storage.sequence import SequenceStore
 from aiops_apm.storage.snapshots import SnapshotStore
 from aiops_apm.storage.watermarks import WatermarkStore
@@ -43,6 +44,7 @@ class DetectionContext:
     watermark_store: WatermarkStore | None = None
     snapshot_store: SnapshotStore | None = None
     summary_provider: object | None = None  # SummaryProvider；None → emit 走模板
+    rounds_store: RoundStore | None = None  # detection_round 查询：emit 写 evidence 时按 round_id 取 target_ids 追溯
     # 本轮数据
     targets: list = field(default_factory=list)
     signals: list = field(default_factory=list)
@@ -124,6 +126,7 @@ async def build_context(
         watermark_store=storage.watermarks,
         snapshot_store=storage.snapshots,
         summary_provider=summary_provider,
+        rounds_store=storage.rounds,
         signals=list(signals or []),
         changes=list(changes or []),
         degraded_sources=list(degraded_sources or []),

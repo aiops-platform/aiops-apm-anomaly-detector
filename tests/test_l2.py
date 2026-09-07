@@ -92,7 +92,29 @@ def test_change_within_window_wrong_service() -> None:
 
 def test_template_summary_metric_and_log() -> None:
     out = template_summary([ma(metric="cpu_usage", value=0.95)], [la(sig="java.lang.OOMError", count=47)])
-    assert out == "svc-a cpu_usage 0.95；svc-a java.lang.OOMError x47"
+    assert out == "cpu_usage = 0.95；java.lang.OOMError x47"
+
+
+def test_template_summary_log_extracts_message() -> None:
+    """日志摘要去掉异常类型前缀与堆栈帧，只留冒号后的 message。"""
+    sig = (
+        "org.springframework.web.bind.MissingServletRequestParameterException: "
+        "Required request parameter 'serviceName' is not present"
+        "|at org.springframework.web.method.annotation.RequestParamMethodArgumentResolver.handleMissingValueInternal"
+        "|at org.x.Ctrl.handle(Controller.java:42)"
+    )
+    out = template_summary([], [la(sig=sig, count=3)])
+    assert out == "Required request parameter 'serviceName' is not present x3"
+
+
+def test_template_summary_log_keeps_first_line_without_colon() -> None:
+    """无堆栈、无冒号的签名（即 message[:120]）整行保留。"""
+    out = template_summary([], [la(sig="boom happened", count=2)])
+    assert out == "boom happened x2"
+
+
+def test_template_summary_empty() -> None:
+    assert template_summary([], []) == ""
 
 
 # --- l2_correlate ---

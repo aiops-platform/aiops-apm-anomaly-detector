@@ -1,5 +1,8 @@
-"""L3 持续性状态：``detection_state`` 表 consecutive / miss 计数。
+"""L3 持续性状态：``detection_state`` 表 cumulative-appear / miss 计数。
 
+- ``consecutive_rounds`` 字段语义实为**累计出现轮数**：仅在该异常出现的轮 +1，
+  断轮（miss）不清零（L3 持续性按累计出现 N 轮判定，不再要求严格连续）。
+- ``miss_rounds``：连续未出现轮数，仅用于 Reconciler 自动关单（读 miss 不清零字段）。
 - ``DetectionStateStore``（ABC）：M5 ``l3_verify`` 读写持续性、``run_domain`` sweep miss。
 - ``InMemoryDetectionStateStore``：单测/demo 真源。
 - ``MySQLDetectionStateStore``：``state_value`` 存 JSON，sweep 用 ``JSON_SET`` 增量。
@@ -38,7 +41,7 @@ class DetectionStateStore(ABC):
 
     @abstractmethod
     async def sweep(self, tenant_id: str, domain: str, seen_keys: set) -> None:
-        """本域 store 里本轮到到（∉ seen_keys）的 key → miss_rounds+1、consecutive_rounds=0（UC-5.6）。"""
+        """本域 store 里本轮未到（∉ seen_keys）的 key → miss_rounds+1（consecutive_rounds 不清零，累计语义）。"""
 
     @abstractmethod
     async def list_by_domain(self, tenant_id: str, domain: str) -> dict:
@@ -80,8 +83,8 @@ class InMemoryDetectionStateStore(DetectionStateStore):
             raise ValueError("tenant_id is required")
         for (t, d, k), row in self._rows.items():
             if t == tenant_id and d == domain and k not in seen_keys:
+                # miss 只累计 miss_rounds；consecutive_rounds 不清零（累计出现语义）
                 row["miss_rounds"] += 1
-                row["consecutive_rounds"] = 0
 
     async def list_by_domain(self, tenant_id: str, domain: str) -> dict:
         if not tenant_id:
@@ -151,10 +154,10 @@ class MySQLDetectionStateStore(DetectionStateStore):
         for (key,) in rows:
             if key in seen_keys:
                 continue
+            # miss 只累计 miss_rounds；consecutive_rounds 不清零（累计出现语义）
             await self._pool.execute(
                 "UPDATE detection_state SET state_value=JSON_SET(state_value, "
-                "'$.miss_rounds', JSON_EXTRACT(state_value, '$.miss_rounds') + 1, "
-                "'$.consecutive_rounds', 0) "
+                "'$.miss_rounds', JSON_EXTRACT(state_value, '$.miss_rounds') + 1) "
                 "WHERE tenant_id=%s AND domain=%s AND state_key=%s",
                 (tenant_id, domain, key),
             )

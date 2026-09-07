@@ -78,7 +78,7 @@
                        ▼
    L3 验证 l3_verify        emit
   ───────────────────▶ ────────────────────────────────▶
-  per-key consecutive    取号 PR-YYYYMMDD-NNNN（SequenceStore）
+  per-key 累计出现轮数   取号 PR-YYYYMMDD-NNNN（SequenceStore）
   ≥ persistence_rounds   组装 ProblemRecord
   （默认 2 轮才开单）     write_or_append 原子去重落库
   fpr 误报率闸门（降级    severity 组合升 critical（M6）
@@ -88,8 +88,8 @@
                problem_record（state=pending）
 ```
 
-> **开单的关键门槛（演示时最容易踩）**：L3 持续性按 `anomaly_key` 统计**连续出现轮数**，
-> `verify.persistence_rounds` 默认为 2。即同一个异常**连续 2 轮都出现**，第 2 轮才会落 `problem_record`。
+> **开单的关键门槛（演示时最容易踩）**：L3 持续性按 `anomaly_key` 统计**累计出现轮数**（中间断轮不清零），
+> `verify.persistence_rounds` 默认为 2。即同一个异常**累计出现 2 轮**，第 2 轮才会落 `problem_record`。
 > 手动演示时同一端点要**触发两轮**才能看到问题单。
 
 ### 1.3 调度与恢复闭环
@@ -165,7 +165,13 @@
 | 黑名单 | `/v1/blacklist` | POST/GET | 新建 / 列出 | 租户 |
 | 黑名单 | `/v1/blacklist/{id}` | PUT/DELETE | 更新（可启停）/ 删除 | 租户 |
 | 审计 | `/v1/audit/rounds` | GET | 轮次审计（domain/status/limit/offset） | 租户 |
+| 审计 | `/v1/audit/rounds/{round_id}/targets` | GET | 某轮下每 target 明细（status/signals_count/error/**request_params**） | 租户 |
 | 审计 | `/v1/audit/suppressed` | GET | 被抑制信号摊平（?service=） | 租户 |
+
+> **`request_params`（V8，detection_round_target JSON 列）**：每轮每个 target 落「本次采集实际下发的出站请求参数」
+> `{method, url, params}` —— params 是时间窗口/水位线下推/时区转换后的**最终**查询参数。排查「源没采到/重复采」
+> 时看这里：`GET /v1/audit/rounds/{round_id}/targets`，确认 startTime/endTime 是否按源时区正确下发
+> （Spring 按本地墙钟解析，配错 `source_config.timezone` 会漂移 8 小时）。只存 URL 查询参数，不含 headers（防凭据落库）。
 
 ### 2.2 实现计划中的前端页面（未实现，仅设计）
 
@@ -250,6 +256,9 @@ APM 告警管理系统
 | `source_config.headers` | 请求头；`authorization`/`x-api-key` 必须用 `${env:X}` 或 `${vault:path#key}` 引用（拒明文凭据） |
 | `source_config.params` | 额外查询参数（指标采集还会下推 `start` 水位线） |
 | `source_config.signature_frames` | 日志堆栈签名帧数（默认 3） |
+| `source_config.window_sec` | 滚动回看窗口（秒）。设了即每轮动态下推 `start=now-window_sec` / `end=now`（**覆盖水位线**）；未设走水位线增量。建议 `window_sec >= interval_sec` 防漏 |
+| `source_config.time_params` | 时间参数名映射，默认 `{"start":"start","end":"end"}`（源用 `from`/`to` 等时改这里）。水位线/窗口分支都遵守该映射 |
+| `source_config.timezone` | 源所在时区（IANA，如 `Asia/Shanghai`）。出站时间统一 `yyyy-MM-dd'T'HH:mm:ss.SSS` + 时区后缀（UTC→`Z`）：**Spring 等源按本地墙钟解析查询时间参数（忽略时区后缀）**，水位线是 UTC，不转时区会漂移 8 小时导致每轮重复采集。未设=按 UTC 发 `Z` |
 | `schedule.interval_sec` | 调度间隔（默认 60s） |
 | `enabled` | 是否启用（默认 true；DELETE 为软删 enabled=0） |
 
@@ -531,10 +540,10 @@ curl -i -X POST http://127.0.0.1:7070/v1/monitors/MT-0001/test
 
 ```bash
 curl -i -X POST http://127.0.0.1:7070/v1/monitors/MT-0001/run
-# 第 1 轮：anomaly_count=1，但 record_created=0（consecutive=1 < persistence_rounds=2）
+# 第 1 轮：anomaly_count=1，但 record_created=0（累计出现 1 次 < persistence_rounds=2）
 
 curl -i -X POST http://127.0.0.1:7070/v1/monitors/MT-0001/run
-# 第 2 轮：consecutive=2 → 落单，records 里出现 record_id，如 PR-20260827-0001
+# 第 2 轮：累计出现 2 次 → 落单，records 里出现 record_id，如 PR-20260827-0001
 ```
 
 **Step B5 — 查问题单**
@@ -628,7 +637,7 @@ make dev
 | **`docker compose up`（`make docker-up`）产不出告警** | M7 交付待补跑：① mock-source 在 compose 私网（172.16/12）会被网关拦截；② `docker/seed.py` 的 `source_config` 用了 `metric_path`/`log_path`，与采集器期望的 `rows_path`+`field_mapping` 不一致，且 `docker/mock_source.py` 每行缺 `timestamp`/`service` 供 field_mapping 逐行映射。环境可用后需按 §4.2 的配置形态修正 seed 与 mock_source。 |
 | **MySQL 连不上启动即退出** | mysql backend 是 fail-fast（`build_storage` 抛异常）；memory backend 不受影响。检查 MySQL 是否运行、凭据、`APM_DB_NAME` 是否已建。 |
 | **`make migrate` 报 `2003 Can't connect`** | 本机 MySQL 未运行（brew services 无 mysql / 3306 无监听）。启动 MySQL 后重试；V2/V3 迁移由单测覆盖，待 DB 可用补跑。 |
-| **手动 run 第一次不开单** | L3 持续性 `persistence_rounds`（默认 2）：需连续 2 轮命中才落 `problem_record`。演示可临时把 verify 改 `{"persistence_rounds":1}`。 |
+| **手动 run 第一次不开单** | L3 持续性 `persistence_rounds`（默认 2）：需累计出现 2 轮（中间断轮不清零）才落 `problem_record`。演示可临时把 verify 改 `{"persistence_rounds":1}`。 |
 | **`PUT /v1/config/{domain}` 报 400 CONFIG_ERROR** | 写入侧参数校验：`static_threshold` 缺 `threshold`、`simple_compare` 缺 `baseline/ratio`、`signature_aggregate` 参数非正数、插件名不存在等。 |
 | **`simple_compare` 基线不自动** | 基线来自 `params["baseline"]`；signal_snapshot 滚动均值注入为 M5 后续演进项。 |
 | **`/v1/config/reload` 与 `/v1/config/{domain}` 路径** | reload 声明在 `{domain}` 之前避免路径冲突；两者均需 admin。 |

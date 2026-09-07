@@ -4,6 +4,7 @@
 不触网；watermark/snapshot 用 InMemory 真源。
 """
 
+import asyncio
 from datetime import datetime
 
 import httpx
@@ -156,9 +157,60 @@ async def test_metrics_watermark_pushdown_start_param():
 
     await collector.collect(ctx, _metric_target())
 
-    assert http.calls[0]["params"]["start"] == "2024-03-09T15:30:00"
+    assert http.calls[0]["params"]["start"] == "2024-03-09T15:30:00.000Z"
     assert http.calls[0]["params"]["query"] == "cpu_usage"  # 原始 params 保留
     assert http.calls[0]["headers"] == {}
+
+
+async def test_metrics_watermark_respects_time_params_mapping():
+    """水位线分支也应尊重 time_params 映射（与 apply_time_window 一致）——否则 Spring 等源收不到 startTime。
+
+    start/end 都映射时补 end=now：仅 start 时部分源（如 Spring）不过滤 → 每轮重复采集。
+    """
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpMetricsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0001", datetime(2024, 3, 9, 15, 30, 0))
+    now = datetime(2024, 3, 9, 16, 0, 0)
+    ctx = CollectContext("tenant-a", watermark_store=wm, now=now)
+
+    target = _metric_target(
+        source_config={
+            **_metric_target()["source_config"],
+            "time_params": {"start": "startTime", "end": "endTime"},
+        }
+    )
+    await collector.collect(ctx, target)
+
+    params = http.calls[0]["params"]
+    assert params["startTime"] == "2024-03-09T15:30:00.000Z"  # 水位线 → startTime（SSS+Z）
+    assert params["endTime"] == "2024-03-09T16:00:00.000Z"  # end 有映射 → endTime=now
+    assert "start" not in params  # 不再用硬编码键
+    assert "end" not in params
+    assert params["query"] == "cpu_usage"  # 原始静态 params 保留
+
+
+async def test_logs_watermark_respects_time_params_mapping():
+    http = FakeHttp(lambda params: {})
+    collector = HttpLogsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0002", datetime(2024, 3, 9, 15, 30, 0))
+    now = datetime(2024, 3, 9, 16, 0, 0)
+    ctx = CollectContext("tenant-a", watermark_store=wm, now=now)
+
+    target = _log_target(
+        source_config={
+            **_log_target()["source_config"],
+            "time_params": {"start": "startTime", "end": "endTime"},
+        }
+    )
+    await collector.collect(ctx, target)
+
+    params = http.calls[0]["params"]
+    assert params["startTime"] == "2024-03-09T15:30:00.000Z"
+    assert params["endTime"] == "2024-03-09T16:00:00.000Z"
+    assert "start" not in params
+    assert "end" not in params
 
 
 async def test_metrics_second_round_empty_and_watermark_not_regressed():
@@ -176,6 +228,22 @@ async def test_metrics_second_round_empty_and_watermark_not_regressed():
     assert second == []  # 第二轮 0 新信号（水位线下推生效）
     assert (await wm.get("tenant-a", "MT-0001"))["last_ts"] == datetime(2024, 3, 9, 16, 1, 0)  # 未回退
     assert len(snap._rows) == 2  # 没有追加行
+
+
+async def test_metrics_future_watermark_self_heals():
+    """未来水位线（脏数据，历史入站时区 bug 产物）跳过下推 → 全量重采并按真实信号重新推进水位线。"""
+    http = FakeHttp(lambda params: _json_result(_prometheus_rows(params)))
+    collector = HttpMetricsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0001", datetime(2024, 3, 9, 17, 0, 0))  # 超前 now 1h
+    now = datetime(2024, 3, 9, 16, 0, 0)
+    ctx = CollectContext("tenant-a", watermark_store=wm, now=now)
+
+    signals = await collector.collect(ctx, _metric_target())
+
+    assert len(signals) == 2  # 未下推 start → 全量返回
+    assert "start" not in http.calls[0]["params"]  # 未来水位线被忽略
+    assert (await wm.get("tenant-a", "MT-0001"))["last_ts"] == datetime(2024, 3, 9, 16, 1, 0)  # 已纠正
 
 
 # ---- UC-3.4 日志采集 ----
@@ -214,11 +282,27 @@ async def test_logs_collect_sets_signature_and_writes_snapshot():
 
     assert len(signals) == 2
     assert all(s.signature for s in signals)
-    assert signals[0].signature == "OutOfMemoryError|at com.A.run|at com.B.run|at com.C.run"
-    assert signals[1].signature == "OutOfMemoryError|at com.A.run|at com.B.run"
+    assert signals[0].signature == "OutOfMemoryError: heap|at com.A.run()|at com.B.run()|at com.C.run()"
+    assert signals[1].signature == "OutOfMemoryError: heap|at com.A.run()|at com.B.run()"
     # 快照行携带 signature 列
     assert [r["signature"] for r in snap._rows] == [s.signature for s in signals]
     assert all(r["signal_type"] == "log" for r in snap._rows)
+
+
+async def test_logs_future_watermark_self_heals():
+    """日志采集器同样跳过未来水位线，避免窗口反向永久卡死。"""
+    http = FakeHttp(lambda params: {"hits": {"hits": _elk_hits(params)}})
+    collector = HttpLogsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0002", datetime(2026, 8, 26, 21, 0, 0))  # 超前源时间戳 9h
+    now = datetime(2026, 8, 26, 12, 30, 0)
+    ctx = CollectContext("tenant-a", watermark_store=wm, now=now)
+
+    signals = await collector.collect(ctx, _log_target())
+
+    assert len(signals) == 2  # 未下推 start → 全量返回
+    assert "start" not in http.calls[0]["params"]
+    assert (await wm.get("tenant-a", "MT-0002"))["last_ts"] == datetime(2026, 8, 26, 12, 0, 1)  # 已纠正
 
 
 async def test_logs_dedup_by_service_signature_timestamp():
@@ -333,8 +417,8 @@ async def test_window_sec_pushes_start_end_and_ignores_watermark():
     await collector.collect(ctx, _sc_with_window(_metric_target, window_sec=180))
 
     params = http.calls[0]["params"]
-    assert params["start"] == "2024-03-09T15:57:00"  # now - 180s，而非水位线 last_ts
-    assert params["end"] == "2024-03-09T16:00:00"
+    assert params["start"] == "2024-03-09T15:57:00.000Z"  # now - 180s，而非水位线 last_ts
+    assert params["end"] == "2024-03-09T16:00:00.000Z"
     assert params["query"] == "cpu_usage"  # 原始静态 params 保留
 
 
@@ -350,8 +434,8 @@ async def test_window_sec_time_params_mapping():
     )
 
     params = http.calls[0]["params"]
-    assert params["from"] == "2024-03-09T15:55:00"
-    assert params["to"] == "2024-03-09T16:00:00"
+    assert params["from"] == "2024-03-09T15:55:00.000Z"
+    assert params["to"] == "2024-03-09T16:00:00.000Z"
     assert "start" not in params
     assert "end" not in params
 
@@ -365,7 +449,7 @@ async def test_window_sec_zero_falls_back_to_watermark():
 
     await collector.collect(ctx, _sc_with_window(_metric_target, window_sec=0))
 
-    assert http.calls[0]["params"]["start"] == "2024-03-09T15:30:00"
+    assert http.calls[0]["params"]["start"] == "2024-03-09T15:30:00.000Z"
     assert "end" not in http.calls[0]["params"]
 
 
@@ -393,3 +477,108 @@ async def test_window_sec_without_now_falls_back_to_wall_clock():
     end = _dt.fromisoformat(params["end"])
     assert (end - start).total_seconds() == 60
     assert end.tzinfo is not None
+
+
+# ---- 出站时间格式统一（SSS + Z/±HH:MM）+ 源时区转换（Spring 按本地墙钟解析）----
+
+
+async def test_watermark_converts_to_source_timezone():
+    """水位线是 UTC，Spring 按 +08:00 墙钟解析查询参数 → 必须转源时区再发，否则漂移 8 小时。
+
+    last_ts=2024-03-09T15:30:00 UTC == 2024-03-09T23:30:00+08:00；end=now 跨日。
+    """
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpMetricsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0001", datetime(2024, 3, 9, 15, 30, 0))
+    now = datetime(2024, 3, 9, 16, 0, 0)
+    ctx = CollectContext("tenant-a", watermark_store=wm, now=now)
+
+    target = _metric_target(
+        source_config={
+            **_metric_target()["source_config"],
+            "timezone": "Asia/Shanghai",
+            "time_params": {"start": "startTime", "end": "endTime"},
+        }
+    )
+    await collector.collect(ctx, target)
+
+    params = http.calls[0]["params"]
+    assert params["startTime"] == "2024-03-09T23:30:00.000+08:00"  # UTC → +08:00
+    assert params["endTime"] == "2024-03-10T00:00:00.000+08:00"  # 跨日
+
+
+async def test_window_sec_converts_to_source_timezone():
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpLogsCollector(http, OutboundGateway())
+    now = datetime(2024, 3, 9, 16, 0, 0)
+    ctx = CollectContext("tenant-a", now=now)
+
+    await collector.collect(
+        ctx,
+        _sc_with_window(
+            _log_target,
+            window_sec=300,
+            timezone="Asia/Shanghai",
+            time_params={"start": "startTime", "end": "endTime"},
+        ),
+    )
+
+    params = http.calls[0]["params"]
+    assert params["startTime"] == "2024-03-09T23:55:00.000+08:00"
+    assert params["endTime"] == "2024-03-10T00:00:00.000+08:00"
+
+
+async def test_invalid_timezone_raises_config_error():
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpMetricsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0001", datetime(2024, 3, 9, 15, 30, 0))
+    ctx = CollectContext("tenant-a", watermark_store=wm, now=datetime(2024, 3, 9, 16, 0, 0))
+
+    target = _metric_target(
+        source_config={**_metric_target()["source_config"], "timezone": "Not/AZone"}
+    )
+    with pytest.raises(AppException) as excinfo:
+        await collector.collect(ctx, target)
+    assert excinfo.value.code == ErrorCode.CONFIG_ERROR
+
+
+# ---- V8：采集器把本轮实际下发的请求参数写入 ctx.request_params（落 detection_round_target）----
+
+
+async def test_collect_captures_request_params_into_ctx():
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpMetricsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0001", datetime(2024, 3, 9, 15, 30, 0))
+    now = datetime(2024, 3, 9, 16, 0, 0)
+    ctx = CollectContext("tenant-a", watermark_store=wm, now=now)
+
+    target = _metric_target(
+        source_config={
+            **_metric_target()["source_config"],
+            "timezone": "Asia/Shanghai",
+            "time_params": {"start": "startTime", "end": "endTime"},
+        }
+    )
+    await collector.collect(ctx, target)
+
+    # 记录的是最终下发的出站请求参数：URL + method + 时区转换后的 params
+    captured = ctx.request_params["MT-0001"]
+    assert captured["method"] == "GET"
+    assert captured["url"] == "https://prometheus.example.com:9090/api/v1/query"
+    assert captured["params"]["startTime"] == "2024-03-09T23:30:00.000+08:00"
+    assert captured["params"]["endTime"] == "2024-03-10T00:00:00.000+08:00"
+
+
+async def test_collect_request_params_keyed_by_target_id_not_clobbered():
+    # 同一 ctx 并行采多个 target → request_params 按 target_id 键控，互不覆盖
+    http = FakeHttp(lambda params: _json_result([]))
+    collector = HttpMetricsCollector(http, OutboundGateway())
+    ctx = CollectContext("tenant-a", now=datetime(2024, 3, 9, 16, 0, 0))
+    t1 = _metric_target()
+    t2 = _metric_target(target_id="MT-0009")
+    await asyncio.gather(collector.collect(ctx, t1), collector.collect(ctx, t2))
+    assert set(ctx.request_params) == {"MT-0001", "MT-0009"}
+    assert ctx.request_params["MT-0001"]["url"] == t1["source_config"]["url"]

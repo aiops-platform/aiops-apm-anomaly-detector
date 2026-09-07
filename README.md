@@ -101,6 +101,29 @@ make migrate
 # 若未配置凭据/未连 MySQL，会报连接错误；不影响 memory backend 的 make dev
 ```
 
+### 2.6 数据库表说明（`aiops_apm_runtime` 单 schema，共 15 张表）
+
+> 所有业务表均带 `tenant_id` 列做多租户隔离。V1 建齐 12 张表；V2–V7 增量补表/加列；
+> `schema_versions` 由 `MigrationRunner` 自动创建，用于 `make migrate` 幂等版本追踪，不计入版本化迁移。
+
+| 表名 | 来源版本 | 用途说明 |
+|------|----------|----------|
+| `problem_record` | V1 | **M5 emit 最终产出**：异常告警单。含 `severity` 严重度、`state` 生命周期（pending/in_progress/resolved/closed/archived）、`open_group_key` 生成列 + `uk_open_group_key` UNIQUE 实现同 `group_key` 并发去重追加（resolved 后自动置 NULL 允许复发开新单）。`record_id` 形如 `PR-YYYYMMDD-NNNN` |
+| `change_record` | V1 | 变更记录（deployment/ddl/config），L2 变更关联用：命中变更窗口内的异常标记 `change_related` |
+| `domain_config` | V1 | 域检测规则（`config` JSON 存 detectors/suppressors/correlation/verify），`enabled` + `version` 版本号；`UNIQUE (tenant_id, domain)` |
+| `monitor_target` | V1✅ | **监控端点配置**（回答「监控谁、从哪采、多快采」） ✅ |
+| `maintenance_window` | V1 | L0 维护窗口：`(service, start_at, end_at)` 时间窗内的信号被抑制 |
+| `suppress_blacklist` | V1 | L0 黑名单：按 `(domain, service, signal)` 匹配的信号被抑制（`signal` 为 MySQL 保留字，DDL 用反引号） |
+| `fpr_table` | V1 | 误报率统计（`group_key` 维度 `false_positive_cnt`/`total_cnt`/`fpr`），L3 误报率闸门 + `POST /resolve {"false_positive":true}` 误报回写落库 |
+| `record_seq` | V1 | `record_id` 原子取号（按 `seq_date` 维护 `next_seq`，`PR-YYYYMMDD-NNNN` 每日自增） |
+| `scheduler_lease` | V1 | 多副本选主：`scheduler_lease` 行锁 + `expires_at` TTL 续约 + 崩溃自动接管（MySQL 原子 `INSERT...ON DUPLICATE KEY UPDATE`） |
+| `signal_snapshot` | V1✅ | 原始信号快照（metric/log 采集落库），`signature` 为日志堆栈签名（V7 由 VARCHAR(255) 加宽至 VARCHAR(1024)）。量大，建议按 `snapshot_ts` 分区/定期归档 |
+| `detection_state` | V1 | 检测状态：`state_key`（如 `previous_keys`）存 `state_value` JSON，L1 环比基线 / L3 持续性（consecutive/miss）计数 |
+| `detection_round` | V1✅ | 轮次审计主表 ✅ |
+| `collect_watermark` | V2 | **采集水位线**：每个 `monitor_target` 最近采集到的事件时间戳，`PRIMARY KEY (tenant_id, target_id)`，下轮下推 `start=last_ts` 实现增量采集 |
+| `detection_round_target` | V5✅ | 轮次审计字表 - taget ✅ |
+| `schema_versions` | 迁移自建 | 迁移版本追踪（`version` + `applied_at`），`make migrate` 据此幂等跳过已应用版本 |
+
 ### 3. 启动服务
 
 ```bash

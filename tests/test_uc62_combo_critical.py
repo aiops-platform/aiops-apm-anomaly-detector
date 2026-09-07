@@ -22,7 +22,7 @@ COMBO_DOMAIN = DomainConfig(
         DetectorSpec(signal="heap_usage", plugin="static_threshold", params={"threshold": 0.9}, severity="high"),
         DetectorSpec(signal="ERROR", plugin="signature_aggregate", params={"min_count": 1}, severity="high"),
     ],
-    verify=VerifySpec(persistence_rounds=2),  # 连续两轮 → 第二轮开单
+    verify=VerifySpec(persistence_rounds=2),  # 累计两轮 → 第二轮开单（断轮不清零）
 )
 
 

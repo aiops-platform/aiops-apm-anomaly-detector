@@ -26,14 +26,15 @@ def _log(**overrides):
     return LogSignal(**base)
 
 
-def test_signature_uses_exception_type_and_top_frames_without_line_numbers():
+def test_signature_keeps_full_message_and_line_numbers():
     sig = signature(_log())
-    assert sig == "OutOfMemoryError|at com.A.run|at com.B.run|at com.C.run"
-    assert "java:10" not in sig  # 去行号
+    assert sig == "OutOfMemoryError: heap space|at com.A.run(A.java:10)|at com.B.run(B.java:20)|at com.C.run(C.java:30)"
+    assert "java:10" in sig  # 保留行号（用户确认：消息 + 行号都要）
+    assert "heap space" in sig  # 保留异常消息
 
 
 def test_signature_n_frames_truncates():
-    assert signature(_log(), n_frames=2) == "OutOfMemoryError|at com.A.run|at com.B.run"
+    assert signature(_log(), n_frames=2) == "OutOfMemoryError: heap space|at com.A.run(A.java:10)|at com.B.run(B.java:20)"
 
 
 def test_signature_fallback_to_message_without_stack_trace():

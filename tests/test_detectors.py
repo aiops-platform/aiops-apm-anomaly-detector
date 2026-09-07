@@ -182,7 +182,7 @@ async def test_signature_aggregate_groups_and_counts():
     a = out[0]
     assert isinstance(a, LogAnomaly)
     assert a.count == 3
-    assert a.signature == "OutOfMemoryError|at com.app.Service.method|at com.app.Main.main"
+    assert a.signature == "OutOfMemoryError: heap space|at com.app.Service.method(Service.java:42)|at com.app.Main.main(Main.java:1)"
 
 
 @pytest.mark.asyncio

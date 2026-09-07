@@ -11,6 +11,9 @@
 - **per-target 漏斗计数**（V6 迁移）：``anomaly_count`` / ``record_count`` / ``suppressed_count``，
   按 target.service 归因回填（漏斗在合并信号集上跑、键是 service）。``update_target_status``
   的 status/finished_at 可选 → 采集后与漏斗后两段回填互不覆盖；采集失败的 target 跳过归因。
+- **per-target 出站请求参数**（V8 迁移）：``request_params`` JSON 列存本轮采集实际下发的
+  ``{method, url, params}``（params 为时间窗口/水位线下推/时区转换后的最终查询参数），
+  供审计排查「这轮到底请求了什么」。只存 URL 查询参数，不含 headers（可能带明文凭据）。
 
 每方法入口校验 ``tenant_id`` 非空（多租户隔离硬约束）。
 V3 迁移为 ``detection_round`` 补 ``domain`` 列（UC-7.2 审计按 domain 过滤）。
@@ -106,11 +109,13 @@ class RoundStore(ABC):
         record_count: int | None = None,
         suppressed_count: int | None = None,
         error: str | None = None,
+        request_params: dict | None = None,
     ) -> None:
         """更新某轮下某 target 的采集结果（ok/failed/interrupted）。
 
         只更新传入的字段（status/finished_at 为 None 时不动，供采集后与漏斗后两段回填）。
         漏斗计数（anomaly/record/suppressed）按 service 归因回填，多 target 共用 service 时共享。
+        ``request_params`` 存本轮实际下发的出站请求参数（V8，JSON 列）。
         """
 
     @abstractmethod
@@ -237,6 +242,7 @@ class InMemoryRoundStore(RoundStore):
             "record_count": 0,
             "suppressed_count": 0,
             "error": None,
+            "request_params": None,
             "started_at": started_at,
             "finished_at": None,
         }
@@ -254,6 +260,7 @@ class InMemoryRoundStore(RoundStore):
         record_count: int | None = None,
         suppressed_count: int | None = None,
         error: str | None = None,
+        request_params: dict | None = None,
     ) -> None:
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -274,6 +281,8 @@ class InMemoryRoundStore(RoundStore):
             row["suppressed_count"] = suppressed_count
         if error is not None:
             row["error"] = error
+        if request_params is not None:
+            row["request_params"] = _json_safe(request_params)
 
     async def latest_target(
         self, tenant_id: str, target_id: str, *, status: str | None = None
@@ -321,8 +330,9 @@ class MySQLRoundStore(RoundStore):
     _TARGET_COLUMNS = (
         "round_id", "tenant_id", "target_id", "status",
         "signals_count", "anomaly_count", "record_count", "suppressed_count",
-        "error", "started_at", "finished_at",
+        "error", "request_params", "started_at", "finished_at",
     )
+    _TARGET_JSON_COLUMNS = {"request_params"}
 
     def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
@@ -339,6 +349,9 @@ class MySQLRoundStore(RoundStore):
 
     def _target_row_to_dict(self, row: tuple) -> dict:
         d: dict = dict(zip(self._TARGET_COLUMNS, row, strict=True))
+        for col in self._TARGET_JSON_COLUMNS:
+            if d.get(col) is not None:
+                d[col] = _decode_json(d[col])
         for col in ("started_at", "finished_at"):
             if d.get(col) is not None:
                 d[col] = datetime.fromisoformat(str(d[col]))
@@ -467,6 +480,7 @@ class MySQLRoundStore(RoundStore):
         record_count: int | None = None,
         suppressed_count: int | None = None,
         error: str | None = None,
+        request_params: dict | None = None,
     ) -> None:
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -493,6 +507,9 @@ class MySQLRoundStore(RoundStore):
         if error is not None:
             sets.append("error=%s")
             args.append(error)
+        if request_params is not None:
+            sets.append("request_params=%s")
+            args.append(_as_json(_json_safe(request_params)))
         if not sets:
             return
         args.extend([round_id, tenant_id, target_id])

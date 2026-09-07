@@ -133,6 +133,27 @@ async def test_update_target_status(store: InMemoryRoundStore) -> None:
     assert row["error"] == "boom"
 
 
+async def test_update_target_status_request_params(store: InMemoryRoundStore) -> None:
+    # V8：本轮实际下发的出站请求参数（时间窗口/水位线/时区转换后的最终 params）
+    await store.create_target("t1", "R-0001", "MT-0001", started_at=TS1)
+    assert (await store.latest_target("t1", "MT-0001"))["request_params"] is None
+    await store.update_target_status(
+        "t1", "R-0001", "MT-0001", "ok",
+        finished_at=TS2, signals_count=5,
+        request_params={
+            "method": "GET",
+            "url": "https://elk.example.com:9200/logs/_search",
+            "params": {"startTime": "2024-03-09T15:30:00.000Z", "endTime": "2024-03-09T16:00:00.000Z"},
+        },
+    )
+    row = await store.latest_target("t1", "MT-0001")
+    assert row["request_params"]["params"]["startTime"] == "2024-03-09T15:30:00.000Z"
+    assert row["request_params"]["url"].startswith("https://elk")
+    # 漏斗后回填（status=None）不覆盖 request_params
+    await store.update_target_status("t1", "R-0001", "MT-0001", anomaly_count=1)
+    assert (await store.latest_target("t1", "MT-0001"))["request_params"]["method"] == "GET"
+
+
 async def test_latest_target_status_filter(store: InMemoryRoundStore) -> None:
     await store.create_target("t1", "R-0001", "MT-0001", started_at=TS1)
     await store.update_target_status("t1", "R-0001", "MT-0001", "interrupted", finished_at=TS2)
@@ -246,6 +267,21 @@ async def test_mysql_update_target_status_sql() -> None:
     sql = next(s for (kind, s, _) in logs if kind == "execute")
     assert "UPDATE detection_round_target SET status=%s, finished_at=%s, signals_count=%s, error=%s" in sql
     assert "WHERE round_id=%s AND tenant_id=%s AND target_id=%s" in sql
+
+
+async def test_mysql_update_target_status_request_params_sql() -> None:
+    # V8：request_params JSON 列，args 为 _as_json 序列化后的字符串
+    logs: list = []
+    await _store(logs).update_target_status(
+        "t1", "R-0001", "MT-0001", "ok", finished_at=TS2, signals_count=3,
+        request_params={"method": "GET", "url": "http://src/query", "params": {"start": "2024-03-09T15:30:00.000Z"}},
+    )
+    kind, sql, args = logs[0]
+    assert kind == "execute"
+    assert "SET status=%s, finished_at=%s, signals_count=%s, request_params=%s" in sql
+    assert "WHERE round_id=%s AND tenant_id=%s AND target_id=%s" in sql
+    assert isinstance(args[3], str)
+    assert '"start": "2024-03-09T15:30:00.000Z"' in args[3]
 
 
 async def test_mysql_update_target_status_counts_only_sql() -> None:

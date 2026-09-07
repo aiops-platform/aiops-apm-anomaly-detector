@@ -28,7 +28,7 @@
 | `suppressors` | **L0 抑制** | `l0_suppress.py:17` | 遍历每个 `{name, params}` → `registry.get("suppressor", name)` → `batch_check(ctx.signals, ctx, params)`。命中就从 `ctx.signals` 剔除、记入 `ctx.suppressed`（审计） |
 | `detectors` | **L1 检测** | `l1_detect.py:22-36` | 每项 `{signal, plugin, params, severity}`：`filter_signals(ctx.signals, signal)` 匹配 → `registry.get("detector", plugin).detect(matched, params)` → 产出 anomaly，且 `spec.severity` **权威覆盖** detector 自带 severity |
 | `correlation` | **L2 关联** | `l2_correlate.py:61,72,81` | `metric_log_window_sec` 判断指标+日志同源（`_within_window`）；`change_window_sec` 判断变更关联（`_change_within_window`） |
-| `verify` | **L3 验证** | `l3_verify.py:35,44,62` | `persistence_rounds`：同一 anomaly_key 连续 N 轮出现才开单；`false_positive_threshold`+`min_samples`：样本不足或 fpr 低于阈值才算误报，否则降级仍开单 |
+| `verify` | **L3 验证** | `l3_verify.py:35,44,62` | `persistence_rounds`：同一 anomaly_key **累计出现** N 轮才开单（中间断轮不清零）；`false_positive_threshold`+`min_samples`：样本不足或 fpr 低于阈值才算误报，否则降级仍开单 |
 
 ## 3. 两个容易混的点
 

@@ -30,7 +30,11 @@ class CorrelationSpec(BaseModel):
 
 
 class VerifySpec(BaseModel):
-    """L3 验证参数（持续性轮数 / 误报率闸门 / 最小样本数）。"""
+    """L3 验证参数（持续性轮数 / 误报率闸门 / 最小样本数）。
+
+    ``persistence_rounds`` 按**累计出现轮数**判定：异常出现一次计一次，中间断轮不清零，
+    累计达到 N 的那一轮开单（即「第 1 轮出现 → 断一轮 → 第 3 轮再出现」也算累计 2 次）。
+    """
 
     persistence_rounds: int = 2
     false_positive_threshold: float = 0.6
