@@ -90,6 +90,24 @@ class RecordStore(ABC):
         """关闭记录：state=resolved，open_group_key 自动变 NULL（允许复发开新单）。"""
 
     @abstractmethod
+    async def mark_in_progress(
+        self, tenant_id: str, record_id: str, *, run_id: str, workflow_id: str
+    ) -> bool:
+        """pending → in_progress（仅翻转一次，调用方保证/配合防重入）。
+
+        成功把 agent 分析 run 信息追加进 evidence（``{type:"agent_run", run_id,
+        workflow_id, started_at}``）；返回是否真正发生了翻转（记录不存在 / 租户
+        不符 / 已不在 pending → False，不抛错）。
+        """
+
+    @abstractmethod
+    async def append_evidence(self, tenant_id: str, record_id: str, entry: dict) -> bool:
+        """向记录 evidence 追加一条条目，不改状态（如 ``{type:"diagnose_session", …}``）。
+
+        返回记录是否存在且租户相符（不存在/不符 → False，不抛错）。
+        """
+
+    @abstractmethod
     async def list_tenants(self) -> builtins.list[str]:
         """所有出现过 problem_record 的租户（去重排序），reconcile 扫描用。"""
 
@@ -169,6 +187,42 @@ class InMemoryRecordStore(RecordStore):
         row["state"] = "resolved"
         row["resolved_at"] = datetime.now(timezone.utc)
         row["resolve_reason"] = reason
+
+    async def mark_in_progress(
+        self, tenant_id: str, record_id: str, *, run_id: str, workflow_id: str
+    ) -> bool:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        row = self._rows.get(record_id)
+        if row is None or row["tenant_id"] != tenant_id or row["state"] != "pending":
+            return False
+        row["state"] = "in_progress"
+        evidence = row.setdefault("evidence", [])
+        if evidence is None:
+            evidence = []
+            row["evidence"] = evidence
+        evidence.append(
+            {
+                "type": "agent_run",
+                "run_id": run_id,
+                "workflow_id": workflow_id,
+                "started_at": datetime.now(timezone.utc),
+            }
+        )
+        return True
+
+    async def append_evidence(self, tenant_id: str, record_id: str, entry: dict) -> bool:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        row = self._rows.get(record_id)
+        if row is None or row["tenant_id"] != tenant_id:
+            return False
+        evidence = row.setdefault("evidence", [])
+        if evidence is None:
+            evidence = []
+            row["evidence"] = evidence
+        evidence.append(entry)
+        return True
 
     async def list_tenants(self) -> builtins.list[str]:
         return sorted({r["tenant_id"] for r in self._rows.values()})
@@ -281,6 +335,37 @@ class MySQLRecordStore(RecordStore):
             "WHERE tenant_id=%s AND record_id=%s AND state <> 'resolved'",
             (reason, tenant_id, record_id),
         )
+
+    async def mark_in_progress(
+        self, tenant_id: str, record_id: str, *, run_id: str, workflow_id: str
+    ) -> bool:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        entry = {
+            "type": "agent_run",
+            "run_id": run_id,
+            "workflow_id": workflow_id,
+            "started_at": datetime.now(timezone.utc),
+        }
+        # WHERE state='pending' + execute_affected(rowcount)：原子单翻，并发双提交只有一方成功。
+        affected = await self._pool.execute_affected(
+            "UPDATE problem_record SET state='in_progress', "
+            "evidence = JSON_ARRAY_APPEND(IFNULL(evidence, JSON_ARRAY()), '$', CAST(%s AS JSON)) "
+            "WHERE tenant_id=%s AND record_id=%s AND state='pending'",
+            (_as_json(entry), tenant_id, record_id),
+        )
+        return affected == 1
+
+    async def append_evidence(self, tenant_id: str, record_id: str, entry: dict) -> bool:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        affected = await self._pool.execute_affected(
+            "UPDATE problem_record SET "
+            "evidence = JSON_ARRAY_APPEND(IFNULL(evidence, JSON_ARRAY()), '$', CAST(%s AS JSON)) "
+            "WHERE tenant_id=%s AND record_id=%s",
+            (_as_json(entry), tenant_id, record_id),
+        )
+        return affected == 1
 
     async def list_tenants(self) -> builtins.list[str]:
         rows = await self._pool.fetchall("SELECT DISTINCT tenant_id FROM problem_record ORDER BY tenant_id")

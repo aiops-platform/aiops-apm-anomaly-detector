@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # ---- 恢复闭环（M6 起生效，reconcile 自动关闭）----
     resolve_after_rounds: int = 3
     resolve_check_interval_sec: float = 30.0
+    # 自动关单后台任务开关（APM_ENABLE_RECONCILER，默认开）。false = 只关自动关单，
+    # 检测轮次照常跑；单靠后端手动 POST /v1/problems/{id}/resolve 关闭。
+    enable_reconciler: bool = True
 
     # ---- 鉴权（M6 起生效，配置了才强制）----
     # JSON env APM_API_KEYS：{"<api-key>": "tenant1,tenant2"}，值 "*" 表全租户。
@@ -56,6 +59,15 @@ class Settings(BaseSettings):
     # ---- 出站（M3 起生效）----
     outbound_timeout_sec: float = 10.0
     outbound_max_body_bytes: int = 5_000_000
+    # agentflow（multi-agent-workflow，Bug Solve 后端）根地址：Problem Center Analyze 联动 POST /run 用。
+    # APM_BUG_SOLVE_BASE_URL 可覆盖。
+    bug_solve_base_url: str = "http://localhost:8000"
+    # 诊断服务（HolmesGPT spike：aiops-agent-orchestration-spike）根地址：Problem Center「分析new」
+    # 按问题单拼装 POST /diagnose/logs 用（同源读 GET /status/{session_id}）。APM_DIAGNOSE_BASE_URL 可覆盖。
+    diagnose_base_url: str = "http://localhost:8017"
+    # 诊断请求的 repo 定位（spike 侧 repo 即仓库定位）。problem_record 无 repo 字段 →
+    # 缺省用本项；仍为空则回退 record.service。APM_DIAGNOSE_REPO 可覆盖。
+    diagnose_repo: str = ""
 
     # ---- 开关 ----
     enable_llm_summary: bool = False

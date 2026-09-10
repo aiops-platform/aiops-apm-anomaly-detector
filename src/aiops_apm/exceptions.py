@@ -16,6 +16,10 @@ class ErrorCode(str, Enum):
     PLUGIN_NOT_FOUND = "PLUGIN_NOT_FOUND"
     CONFIG_ERROR = "CONFIG_ERROR"
     UPSTREAM_TIMEOUT = "UPSTREAM_TIMEOUT"
+    # 状态冲突（如对非 pending 的问题发起 Analyze）→ HTTP 409。
+    CONFLICT = "STATE_CONFLICT"
+    # 上游 agentflow 调用失败（连接/超时/非 2xx）→ HTTP 502。
+    UPSTREAM = "UPSTREAM_ERROR"
 
 
 class AppException(Exception):

@@ -149,3 +149,47 @@ async def test_list_filters_by_state_and_service() -> None:
     assert [r["record_id"] for r in by_service] == ["PR-0002"]
     resolved = await store.list("default", state="resolved")
     assert [r["record_id"] for r in resolved] == ["PR-0002"]
+
+
+# ── mark_in_progress：pending → in_progress（agent 分析发起）──────────────────
+
+async def test_mark_in_progress_flips_and_appends_evidence() -> None:
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001"))
+    ok = await store.mark_in_progress("default", "PR-0001", run_id="run_abc", workflow_id="wf-1")
+    assert ok is True
+    row = await store.get("default", "PR-0001")
+    assert row is not None
+    assert row["state"] == "in_progress"
+    assert row["evidence"][-1]["type"] == "agent_run"
+    assert row["evidence"][-1]["run_id"] == "run_abc"
+    assert row["evidence"][-1]["workflow_id"] == "wf-1"
+    assert "started_at" in row["evidence"][-1]
+
+
+async def test_mark_in_progress_only_once() -> None:
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001"))
+    assert await store.mark_in_progress("default", "PR-0001", run_id="run_1", workflow_id="wf-1") is True
+    # 已在 in_progress：不再翻转、不再追加 evidence
+    assert await store.mark_in_progress("default", "PR-0001", run_id="run_2", workflow_id="wf-2") is False
+    row = await store.get("default", "PR-0001")
+    assert row is not None
+    agent_runs = [e for e in row["evidence"] if e.get("type") == "agent_run"]
+    assert len(agent_runs) == 1
+
+
+async def test_mark_in_progress_resolved_record_is_false() -> None:
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001"))
+    await store.resolve("default", "PR-0001", reason="manual")
+    assert await store.mark_in_progress("default", "PR-0001", run_id="run_x", workflow_id="wf-1") is False
+
+
+async def test_mark_in_progress_missing_or_wrong_tenant_is_false() -> None:
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001", tenant_id="t1"))
+    assert await store.mark_in_progress("t2", "PR-0001", run_id="run_x", workflow_id="wf-1") is False
+    assert await store.mark_in_progress("t1", "PR-9999", run_id="run_x", workflow_id="wf-1") is False
+    with pytest.raises(ValueError):
+        await store.mark_in_progress("", "PR-0001", run_id="run_x", workflow_id="wf-1")

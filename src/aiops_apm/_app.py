@@ -85,9 +85,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         scheduler = Scheduler(settings, app.state.registry, app.state.storage, http=app.state.http_client)
         app.state.scheduler = scheduler
         background_tasks.append(asyncio.create_task(_supervise(scheduler.run, "scheduler")))
-        reconciler = Reconciler(settings, app.state.storage)
-        app.state.reconciler = reconciler
-        background_tasks.append(asyncio.create_task(_supervise(reconciler.run, "reconciler")))
+        if settings.enable_reconciler:
+            # enable_reconciler=false 时只关自动关单（reconcile），检测轮次照常跑。
+            reconciler = Reconciler(settings, app.state.storage)
+            app.state.reconciler = reconciler
+            background_tasks.append(asyncio.create_task(_supervise(reconciler.run, "reconciler")))
 
     try:
         yield
@@ -112,6 +114,8 @@ def _status_for_code(code: ErrorCode) -> int:
         ErrorCode.VALIDATION: 400,
         ErrorCode.CONFIG_ERROR: 400,
         ErrorCode.PERMISSION: 403,
+        ErrorCode.CONFLICT: 409,
+        ErrorCode.UPSTREAM: 502,
     }
     return mapping.get(code, 500)
 

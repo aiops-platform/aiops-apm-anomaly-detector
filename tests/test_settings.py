@@ -15,3 +15,14 @@ def test_defaults() -> None:
 def test_env_override(monkeypatch) -> None:
     monkeypatch.setenv("APM_PORT", "9090")
     assert Settings().port == 9090
+
+
+def test_bug_solve_base_url_override(monkeypatch) -> None:
+    monkeypatch.setenv("APM_BUG_SOLVE_BASE_URL", "http://agentflow:8000")
+    assert Settings().bug_solve_base_url == "http://agentflow:8000"
+
+
+def test_enable_reconciler_defaults_on_and_overridable(monkeypatch) -> None:
+    assert Settings(_env_file=None).enable_reconciler is True
+    monkeypatch.setenv("APM_ENABLE_RECONCILER", "false")
+    assert Settings(_env_file=None).enable_reconciler is False
