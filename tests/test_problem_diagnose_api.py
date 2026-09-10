@@ -76,14 +76,25 @@ def _seed_metric_only(client, *, record_id="PR-0002", service="svc-m", summary="
 
 
 class CapturingHttp:
-    """替换 app.state.http_client 的桩：记录出站调用并返回预设响应。"""
+    """替换 app.state.http_client 的桩：记录出站调用并返回预设响应。
+
+    传入单个响应 → 每次调用都返回它；传入响应**序列**（list/tuple）→ 按序返回，用尽后沿用最后一个
+    （覆盖 reject 的两次出站：先 /remediate 再 /approve）。
+    """
 
     def __init__(self, resp):
         self.calls = []
-        self._resp = resp
+        if isinstance(resp, (list, tuple)):
+            self._queue = list(resp)
+            self._resp = self._queue[0] if self._queue else None
+        else:
+            self._queue = None
+            self._resp = resp
 
     async def request(self, method, url, **kwargs):
         self.calls.append({"method": method, "url": url, "json": kwargs.get("json")})
+        if self._queue:
+            self._resp = self._queue.pop(0)
         return self._resp
 
     async def aclose(self) -> None:
@@ -241,3 +252,22 @@ def test_get_diagnosis_upstream_failure_502(client):
     resp = client.get("/v1/problems/PR-0001/diagnose")
     assert resp.status_code == 502
     assert resp.json()["code"] == "UPSTREAM_ERROR"
+
+
+def test_diagnose_after_ignore_is_409(client):
+    """忽略关单（state=closed）后终态守卫生效：不可再发起诊断。"""
+    _seed_log_record(client)
+    client.app.state.http_client = CapturingHttp(_ok_resp(session_id="sess_abc"))
+    assert client.post("/v1/problems/PR-0001/diagnose").status_code == 200
+
+    client.app.state.http_client = CapturingHttp(_resp(200, {"status": "dismissed"}))
+    assert client.post(
+        "/v1/problems/PR-0001/diagnose/decision", json={"decision": "ignore"}
+    ).status_code == 200
+    assert client.get("/v1/problems/PR-0001").json()["state"] == "closed"
+
+    capture = CapturingHttp(_ok_resp(session_id="sess_new"))
+    client.app.state.http_client = capture
+    resp = client.post("/v1/problems/PR-0001/diagnose")
+    assert resp.status_code == 409
+    assert capture.calls == []

@@ -90,6 +90,15 @@ class RecordStore(ABC):
         """关闭记录：state=resolved，open_group_key 自动变 NULL（允许复发开新单）。"""
 
     @abstractmethod
+    async def close(self, tenant_id: str, record_id: str, reason: str = "manual") -> None:
+        """关闭记录：state=closed（与 resolved 并列的终态；open_group_key 自动变 NULL，
+        允许复发开新单）。
+
+        resolved = "已修复/已处理"，closed = "人判定不做"（忽略）。两者复用同一组审计列
+        ``resolved_at``/``resolve_reason``（通用的"关闭时间/原因"，非 resolved 专属）。
+        """
+
+    @abstractmethod
     async def mark_in_progress(
         self, tenant_id: str, record_id: str, *, run_id: str, workflow_id: str
     ) -> bool:
@@ -185,6 +194,16 @@ class InMemoryRecordStore(RecordStore):
         if row is None or row["tenant_id"] != tenant_id:
             return
         row["state"] = "resolved"
+        row["resolved_at"] = datetime.now(timezone.utc)
+        row["resolve_reason"] = reason
+
+    async def close(self, tenant_id: str, record_id: str, reason: str = "manual") -> None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        row = self._rows.get(record_id)
+        if row is None or row["tenant_id"] != tenant_id:
+            return
+        row["state"] = "closed"
         row["resolved_at"] = datetime.now(timezone.utc)
         row["resolve_reason"] = reason
 
@@ -333,6 +352,15 @@ class MySQLRecordStore(RecordStore):
         await self._pool.execute(
             "UPDATE problem_record SET state='resolved', resolved_at=NOW(3), resolve_reason=%s "
             "WHERE tenant_id=%s AND record_id=%s AND state <> 'resolved'",
+            (reason, tenant_id, record_id),
+        )
+
+    async def close(self, tenant_id: str, record_id: str, reason: str = "manual") -> None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        await self._pool.execute(
+            "UPDATE problem_record SET state='closed', resolved_at=NOW(3), resolve_reason=%s "
+            "WHERE tenant_id=%s AND record_id=%s AND state <> 'closed'",
             (reason, tenant_id, record_id),
         )
 

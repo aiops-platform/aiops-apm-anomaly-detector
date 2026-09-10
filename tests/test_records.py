@@ -193,3 +193,42 @@ async def test_mark_in_progress_missing_or_wrong_tenant_is_false() -> None:
     assert await store.mark_in_progress("t1", "PR-9999", run_id="run_x", workflow_id="wf-1") is False
     with pytest.raises(ValueError):
         await store.mark_in_progress("", "PR-0001", run_id="run_x", workflow_id="wf-1")
+
+
+# ── close：state=closed（与 resolved 并列的终态，忽略）────────────────────────
+
+async def test_close_sets_closed_and_audit_columns() -> None:
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001"))
+    await store.close("default", "PR-0001", reason="ignored")
+    row = await store.get("default", "PR-0001")
+    assert row is not None
+    assert row["state"] == "closed"
+    assert row["resolve_reason"] == "ignored"
+    assert isinstance(row["resolved_at"], datetime)
+
+
+async def test_closed_record_leaves_open_and_reopens_new() -> None:
+    store = InMemoryRecordStore()
+    r1 = _record("PR-0001")
+    await store.write_or_append("default", r1)
+    await store.close("default", "PR-0001", reason="ignored")
+    assert await store.find_open("default", r1.group_key) is None
+
+    # 复发 → 新开一单，而不是追加进已 closed 的单
+    await store.write_or_append("default", _record("PR-0002"))
+    rows = await store.list("default")
+    assert len(rows) == 2
+    opened = await store.find_open("default", r1.group_key)
+    assert opened is not None
+    assert opened["record_id"] == "PR-0002"
+
+
+async def test_close_missing_or_wrong_tenant_is_noop() -> None:
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001", tenant_id="t1"))
+    await store.close("t2", "PR-0001", reason="ignored")
+    assert (await store.get("t1", "PR-0001"))["state"] == "pending"
+    with pytest.raises(ValueError):
+        await store.close("", "PR-0001")
+
