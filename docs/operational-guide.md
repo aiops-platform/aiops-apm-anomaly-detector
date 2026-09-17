@@ -98,7 +98,7 @@
    ┌────────────────────────────────────────────────────────────────┐
    │  Scheduler（默认 APM_ENABLE_SCHEDULER=true）                    │
    │  每 tick (1s)：                                                 │
-   │   1. lease 门：多副本只让一个副本调度（MySQL 原子接管）           │
+   │   1. lease 门：多副本只让一个副本调度（PG 原子接管）              │
    │   2. 找 due 的 monitor_target（按 schedule.interval_sec）        │
    │   3. 按 (tenant_id, domain) 分组 → Semaphore 限流               │
    │   4. run_round → 打点 + 写 detection_round + 审计日志            │
@@ -225,13 +225,14 @@ APM 告警管理系统
 |------|------|------|
 | `APM_HOST` | `0.0.0.0` | 监听地址 |
 | `APM_PORT` | `8000` | 监听端口（`.env.example` 预置 7070） |
-| `APM_STORAGE_BACKEND` | `mysql` | `mysql`（生产）/ `memory`（本地 demo/单测） |
-| `APM_DB_HOST/PORT/USER/PASSWORD/NAME` | `127.0.0.1/3306/root//aiops_apm_runtime` | MySQL 连接 |
+| `APM_STORAGE_BACKEND` | `pg` | `pg`（生产，PostgreSQL）/ `memory`（本地 demo/单测） |
+| `APM_DB_HOST/PORT/USER/PASSWORD/NAME` | `127.0.0.1/5432/agentflow//agentflow` | PostgreSQL 连接（默认对齐 multi-agent-workflow 的 compose） |
+| `APM_DB_SCHEMA` | `aiops_apm_runtime` | 表所在 schema（与同库其它服务的表隔离） |
 | `APM_ENABLE_SCHEDULER` | `true` | 是否启动调度器 / Reconciler 后台任务 |
 | `APM_SCHEDULER_TICK_SEC` | `1.0` | 调度 tick 间隔（秒） |
 | `APM_MAX_CONCURRENT_ROUNDS` | `10` | 并行轮次上限 |
 | `APM_TOTAL_TIMEOUT_SEC` | `30.0` | 单轮总超时 |
-| `APM_SCHEDULER_LEASE_TTL_SEC` | `30.0` | 多副本 lease 有效期（MySQL） |
+| `APM_SCHEDULER_LEASE_TTL_SEC` | `30.0` | 多副本 lease 有效期（PG） |
 | `APM_RESOLVE_AFTER_ROUNDS` | `3` | Reconciler 连续 miss 多少轮自动关单 |
 | `APM_RESOLVE_CHECK_INTERVAL_SEC` | `30.0` | Reconciler 扫描间隔 |
 | `APM_API_KEYS` | 空 | 鉴权 JSON，如 `{"k1":"tenant-a","k2":"*"}`；空=放行 |
@@ -362,9 +363,9 @@ resolve{fp:true} ─────────────► fpr_table ───�
 
 两条路径，先易后难：
 
-- **路径 A（零外部依赖，推荐先跑通链路）**：`memory` backend，不依赖 MySQL/网络，纯 `curl` 走通「启动 → 探针 → 插件 → 监控端点 → 配置 → 手动跑 → 审计/指标」。`mock` 采集器经 API 建的端点不产信号，因此**用于验证链路通、轮次审计、指标打点**；要看真实告警见路径 B。
+- **路径 A（零外部依赖，推荐先跑通链路）**：`memory` backend，不依赖 PG/网络，纯 `curl` 走通「启动 → 探针 → 插件 → 监控端点 → 配置 → 手动跑 → 审计/指标」。`mock` 采集器经 API 建的端点不产信号，因此**用于验证链路通、轮次审计、指标打点**；要看真实告警见路径 B。
 - **路径 B（产真实告警）**：本地起一个 Prometheus 形状的演示源 + 临时演示豁免 SSRF 私网拦截（**仅本地演示，生产必须恢复**），`http_metrics` 采集到超阈值信号，跑两轮 → 看到 `problem_record` → resolve 误报回写 → 维护窗口抑制 → 恢复自动关单。
-- **路径 C（生产形态，可选）**：切换 MySQL backend + `make migrate`（其余操作同路径 B）。
+- **路径 C（生产形态，可选）**：切换 PG backend + `make migrate`（其余操作同路径 B）。
 
 > 约定：以下 `<port>` 指 `APM_PORT`（示例统一用 `7070`）；所有请求都带 `-H "X-Tenant-Id: default"`（可省，缺省即 `default`）。
 
@@ -580,27 +581,30 @@ Reconciler 会检测到所有 anomaly_key 连续 miss → `resolve(reason="auto"
 
 ✅ 路径 B 产出真实 `problem_record`，全链路（采集→L0→L1→L2→L3→emit→查询→误报回写）跑通。
 
-### 4.3 路径 C（可选）：切换 MySQL 生产形态
+### 4.3 路径 C（可选）：切换 PostgreSQL 生产形态
 
-仅需把 backend 换成 `mysql` 并建库建表，其余操作同路径 B：
+仅需把 backend 换成 `pg` 并建 schema 建表，其余操作同路径 B：
 
 ```bash
-# 1) 确保本机 MySQL 运行（brew services start mysql 或 docker）
-# 2) .env 设置
-APM_STORAGE_BACKEND=mysql
+# 1) 确保有可用的 PostgreSQL（复用 multi-agent-workflow 的实例即可）：
+#    cd ../multi-agent-workflow && docker-compose up -d postgres
+# 2) .env 设置（默认值已对齐 multi-agent-workflow 的 compose，通常无需改）
+APM_STORAGE_BACKEND=pg
 APM_DB_HOST=127.0.0.1
-APM_DB_PORT=3306
-APM_DB_USER=root
-APM_DB_PASSWORD=root123
-APM_DB_NAME=aiops_apm_runtime
-# 3) 建库建表（幂等）
+APM_DB_PORT=5432
+APM_DB_USER=agentflow
+APM_DB_PASSWORD=agentflow
+APM_DB_NAME=agentflow          # 库，必须已存在
+APM_DB_SCHEMA=aiops_apm_runtime # schema，由迁移器创建
+# 3) 建 schema 建表（幂等）
 make migrate
-# 4) 启动 + 按路径 B 操作（memory/mysql 对 API 无差别）
+# 4) 启动 + 按路径 B 操作（memory/pg 对 API 无差别）
 make dev
 ```
 
-> 本机 MySQL 未运行会触发 **fail-fast**：`build_storage` 连不上 DB → uvicorn 启动即退出（memory backend 无此约束）。
-> 另可试一键环境 `make docker-up`（mysql+mock-source+apm-alert+prometheus），见 §6 已知边界。
+> 本机 PG 未运行会触发 **fail-fast**：`build_storage` 连不上 DB → uvicorn 启动即退出（memory backend 无此约束）。
+> 另可试一键环境 `make docker-up`（postgres+mock-source+apm-alert+prometheus），见 §6 已知边界。
+> **真库集成测试**：`make test-pg APM_TEST_PG_DSN=postgresql://agentflow:agentflow@127.0.0.1:5432/agentflow`。
 
 ---
 
@@ -635,8 +639,10 @@ make dev
 | **`mock` 端点建了但跑不出告警** | `_mock_signals` 属测试私有字段，经 API/`monitor_target` 表存取会被丢弃（store 只保留公开字段）。API 建的 mock 端点恒 0 信号 → 用于链路验证，产告警请走路径 B。 |
 | **出站网关拦截本地/内网** | `BLOCKED_NETWORKS` 含 `127.0.0.0/8`、`::1`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`；域名二次解析命中私网或解析失败均拒绝（fail-closed）。本地演示按 §4.2 Step B1 临时豁免，**生产必须保留**。 |
 | **`docker compose up`（`make docker-up`）产不出告警** | M7 交付待补跑：① mock-source 在 compose 私网（172.16/12）会被网关拦截；② `docker/seed.py` 的 `source_config` 用了 `metric_path`/`log_path`，与采集器期望的 `rows_path`+`field_mapping` 不一致，且 `docker/mock_source.py` 每行缺 `timestamp`/`service` 供 field_mapping 逐行映射。环境可用后需按 §4.2 的配置形态修正 seed 与 mock_source。 |
-| **MySQL 连不上启动即退出** | mysql backend 是 fail-fast（`build_storage` 抛异常）；memory backend 不受影响。检查 MySQL 是否运行、凭据、`APM_DB_NAME` 是否已建。 |
-| **`make migrate` 报 `2003 Can't connect`** | 本机 MySQL 未运行（brew services 无 mysql / 3306 无监听）。启动 MySQL 后重试；V2/V3 迁移由单测覆盖，待 DB 可用补跑。 |
+| **PG 连不上启动即退出** | pg backend 是 fail-fast（`build_storage` 抛异常）；memory backend 不受影响。检查 PG 是否运行、凭据、`APM_DB_NAME` 指向的**库**是否已存在（PG 不能在事务里 `CREATE DATABASE`）。 |
+| **`make migrate` 连不上 / `relation does not exist`** | 连不上：PG 未运行或凭据不对。`relation does not exist`：schema 不存在（先跑 `make migrate`）或自建连接没带 `search_path`（见下条）。 |
+| **时间戳差若干小时 / 查不到刚写的行** | 自建连接（脚本、psql、第三方工具）没带会话参数。时间列是 naive `TIMESTAMP(3)`，**必须**带 `-c TimeZone=UTC`；表定位靠 `search_path`，**必须**带 `-c search_path=aiops_apm_runtime`（PG 没有 MySQL 的 `USE`）。 |
+| **`tenant_id` 大小写查不到数据** | PG 排序规则大小写敏感（MySQL 的 `utf8mb4_unicode_ci` 不敏感）。HTTP 入口已归一为小写，但直接查库时 `'Default'` ≠ `'default'`。 |
 | **手动 run 第一次不开单** | L3 持续性 `persistence_rounds`（默认 2）：需累计出现 2 轮（中间断轮不清零）才落 `problem_record`。演示可临时把 verify 改 `{"persistence_rounds":1}`。 |
 | **`PUT /v1/config/{domain}` 报 400 CONFIG_ERROR** | 写入侧参数校验：`static_threshold` 缺 `threshold`、`simple_compare` 缺 `baseline/ratio`、`signature_aggregate` 参数非正数、插件名不存在等。 |
 | **`simple_compare` 基线不自动** | 基线来自 `params["baseline"]`；signal_snapshot 滚动均值注入为 M5 后续演进项。 |
@@ -652,9 +658,9 @@ make dev
 # ── 工程 ─────────────────────────────────────────────
 make install      # 建 .venv 并安装 [dev]
 make lint         # ruff + mypy
-make test         # pytest（351 用例）
+make test         # pytest（490 常跑 + 20 真库集成自动 skip）
 make dev          # uvicorn 启动（读 .env，APM_STORAGE_BACKEND 选 backend）
-make migrate      # 建齐 aiops_apm_runtime 全部表（需 MySQL）
+make migrate      # 建齐 aiops_apm_runtime schema 全部表（需 PostgreSQL）
 
 # ── 探针 / 插件 ──────────────────────────────────────
 curl -i http://127.0.0.1:7070/health

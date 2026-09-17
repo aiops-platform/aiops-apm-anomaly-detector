@@ -26,12 +26,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
     def _scope(raw: str) -> list[str]:
         if raw.strip() == "*":
             return ["*"]
-        return [t.strip() for t in raw.split(",") if t.strip()]
+        # 归一为小写：与 router/deps.get_tenant_id 的入口归一保持一致（PG 排序规则
+        # 大小写敏感，见该函数的说明），否则 scope 比对会与库内查询的结论打架。
+        return [t.strip().lower() for t in raw.split(",") if t.strip()]
 
     async def dispatch(self, request, call_next):
         auth = request.headers.get("Authorization", "")
         key = auth[len("Bearer ") :].strip() if auth.startswith("Bearer ") else ""
-        requested = request.headers.get("X-Tenant-Id", "default")
+        requested = request.headers.get("X-Tenant-Id", "default").strip().lower()
         scope_raw = self._api_keys.get(key) if key else None
         if scope_raw is None:
             # 审计（UC-7.6）：不记 key 明文，SecurityAudit 只留 sha256 前缀

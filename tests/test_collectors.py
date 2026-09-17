@@ -98,6 +98,7 @@ class FakeHttp:
                 "url": url,
                 "headers": kwargs.get("headers"),
                 "params": kwargs.get("params"),
+                "json": kwargs.get("json"),
             }
         )
         body = self._factory(kwargs.get("params", {}))
@@ -287,6 +288,59 @@ async def test_logs_collect_sets_signature_and_writes_snapshot():
     # 快照行携带 signature 列
     assert [r["signature"] for r in snap._rows] == [s.signature for s in signals]
     assert all(r["signal_type"] == "log" for r in snap._rows)
+
+
+async def test_logs_es_mode_window_goes_in_body_not_params():
+    """ES 源的时间窗与服务过滤只能走 POST body，不得同时下发 URL 参数。
+
+    回归守卫（2026-09-17 实测踩到）：水位线分支若把时间窗也写进 URL 参数，ES 会因为
+    不认识的查询串参数直接返回 ``400 Bad Request``（``.../_search?start=...``），
+    整轮采集 ``failed``。ES 的日期 range 只认 body 里的 ``range`` filter。
+    """
+    http = FakeHttp(lambda params: {"hits": {"hits": []}})
+    collector = HttpLogsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0002", datetime(2026, 8, 26, 12, 0, 0))
+    ctx = CollectContext("tenant-a", watermark_store=wm)
+
+    target = _log_target(
+        source_config={
+            "url": "https://elk.example.com:9200/logs/_search",
+            "method": "POST",
+            "rows_path": "hits.hits",
+            "time_field": "@timestamp",
+            "service_field": "app.service.keyword",
+            "field_mapping": {"timestamp": "_source.@timestamp"},
+        }
+    )
+    await collector.collect(ctx, target)
+
+    call = http.calls[0]
+    assert call["params"] == {}, "ES 模式不得下发 URL 时间参数（ES 会 400）"
+    body = call["json"]
+    assert body is not None, "ES 模式必须构造 POST body"
+    filters = body["query"]["bool"]["filter"]
+    # 服务过滤：按本 target 的 service 做 term
+    assert {"term": {"app.service.keyword": "order-management"}} in filters
+    # 时间窗进 range filter（水位线下推）
+    rng = next(f["range"]["@timestamp"] for f in filters if "range" in f)
+    assert rng["gte"] == "2026-08-26T12:00:00.000Z"
+    assert body["sort"] == [{"@timestamp": "asc"}]
+
+
+async def test_logs_non_es_source_still_uses_url_params():
+    """非 ES 源不受影响：仍走 URL 时间参数，且不带 body（既有行为不回归）。"""
+    http = FakeHttp(lambda params: {"hits": {"hits": _elk_hits(params)}})
+    collector = HttpLogsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0002", datetime(2026, 8, 26, 12, 0, 0))
+    ctx = CollectContext("tenant-a", watermark_store=wm)
+
+    await collector.collect(ctx, _log_target())
+
+    call = http.calls[0]
+    assert call["params"] == {"start": "2026-08-26T12:00:00.000Z"}
+    assert call["json"] is None, "非 ES 源不应发 body"
 
 
 async def test_logs_future_watermark_self_heals():

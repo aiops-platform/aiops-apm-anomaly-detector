@@ -1,22 +1,22 @@
 """存储层聚合：``Storage`` + ``build_storage(settings)``。
 
-``storage_backend`` 决定用 ``mysql``（生产）还是 ``memory``（demo/单测，不引入 SQLite）。
+``storage_backend`` 决定用 ``pg``（生产，PostgreSQL）还是 ``memory``（demo/单测，不引入 SQLite）。
 """
 
 from __future__ import annotations
 
 from ..settings import Settings
 from .connection import ConnectionPool
-from .detection_state import DetectionStateStore, InMemoryDetectionStateStore, MySQLDetectionStateStore
-from .domain_config import DomainConfigStore, InMemoryDomainConfigStore, MySQLDomainConfigStore
-from .dynamic_config import DynamicConfigStore, InMemoryDynamicConfigStore, MySQLDynamicConfigStore
-from .lease import InMemoryLeaseStore, LeaseStore, MySQLLeaseStore
-from .monitor_targets import InMemoryMonitorTargetStore, MonitorTargetStore, MySQLMonitorTargetStore
-from .records import InMemoryRecordStore, MySQLRecordStore, RecordStore
-from .rounds import InMemoryRoundStore, MySQLRoundStore, RoundStore
-from .sequence import InMemorySequenceStore, MySQLSequenceStore, SequenceStore
-from .snapshots import InMemorySnapshotStore, MySQLSnapshotStore, SnapshotStore
-from .watermarks import InMemoryWatermarkStore, MySQLWatermarkStore, WatermarkStore
+from .detection_state import DetectionStateStore, InMemoryDetectionStateStore, PGDetectionStateStore
+from .domain_config import DomainConfigStore, InMemoryDomainConfigStore, PGDomainConfigStore
+from .dynamic_config import DynamicConfigStore, InMemoryDynamicConfigStore, PGDynamicConfigStore
+from .lease import InMemoryLeaseStore, LeaseStore, PGLeaseStore
+from .monitor_targets import InMemoryMonitorTargetStore, MonitorTargetStore, PGMonitorTargetStore
+from .records import InMemoryRecordStore, PGRecordStore, RecordStore
+from .rounds import InMemoryRoundStore, PGRoundStore, RoundStore
+from .sequence import InMemorySequenceStore, PGSequenceStore, SequenceStore
+from .snapshots import InMemorySnapshotStore, PGSnapshotStore, SnapshotStore
+from .watermarks import InMemoryWatermarkStore, PGWatermarkStore, WatermarkStore
 
 __all__ = [
     "Storage",
@@ -66,7 +66,7 @@ class Storage:
         self.pool = pool
 
     async def health_check(self) -> bool:
-        """memory 恒可用；mysql 走连接池探活。"""
+        """memory 恒可用；pg 走连接池探活。"""
         return True if self.pool is None else await self.pool.health_check()
 
     async def close(self) -> None:
@@ -90,20 +90,32 @@ async def build_storage(settings: Settings) -> Storage:
             leases=InMemoryLeaseStore(),
             rounds=InMemoryRoundStore(),
         )
-    if backend == "mysql":
-        pool = ConnectionPool(settings, db=settings.db_name)
+    if backend == "pg":
+        pool = ConnectionPool(settings)
         await pool.init()
+        # fail-fast：连上了不等于能用。PG 下库是共享的，schema 缺失时连接照样成功，
+        # 服务会正常启动、/ready 报 ready，而每个真实查询都 500
+        # （relation "xxx" does not exist）。这里显式探一次，把错误顶到启动期。
+        # 注意这个检查**不能**下沉到 ConnectionPool.init()：迁移执行器要连一个 schema
+        # 还不存在的库去建它，那样会自锁。
+        if not await pool.schema_ready():
+            await pool.close()
+            raise RuntimeError(
+                f"PostgreSQL 连上了，但在 search_path（{settings.db_schema!r}）上看不到 "
+                f"{settings.db_schema}.problem_record —— 多半是还没跑迁移。"
+                f"请先执行 `make migrate`（或 python -m aiops_apm.migrations.runner）。"
+            )
         return Storage(
-            records=MySQLRecordStore(pool),
-            domain_configs=MySQLDomainConfigStore(pool),
-            monitor_targets=MySQLMonitorTargetStore(pool),
-            snapshots=MySQLSnapshotStore(pool),
-            watermarks=MySQLWatermarkStore(pool),
-            sequence=MySQLSequenceStore(pool),
-            detection_state=MySQLDetectionStateStore(pool),
-            dynamic_config=MySQLDynamicConfigStore(pool),
-            leases=MySQLLeaseStore(pool),
-            rounds=MySQLRoundStore(pool),
+            records=PGRecordStore(pool),
+            domain_configs=PGDomainConfigStore(pool),
+            monitor_targets=PGMonitorTargetStore(pool),
+            snapshots=PGSnapshotStore(pool),
+            watermarks=PGWatermarkStore(pool),
+            sequence=PGSequenceStore(pool),
+            detection_state=PGDetectionStateStore(pool),
+            dynamic_config=PGDynamicConfigStore(pool),
+            leases=PGLeaseStore(pool),
+            rounds=PGRoundStore(pool),
             pool=pool,
         )
     raise ValueError(f"unknown storage_backend: {backend!r}")

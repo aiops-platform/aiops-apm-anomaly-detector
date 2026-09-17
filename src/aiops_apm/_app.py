@@ -64,7 +64,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """应用生命周期钩子：M2 接线 storage；M3 接线共享出站 HTTP 客户端；M4 加载插件 registry；
     M6 启动 scheduler/reconciler 后台任务。
 
-    **fail-fast**（用户确认）：mysql backend 连不上 DB 时 ``build_storage`` 抛异常，
+    **fail-fast**（用户确认）：pg backend 连不上 DB 时 ``build_storage`` 抛异常，
     lifespan 启动失败 → uvicorn 进程退出。memory backend（demo/单测）无此约束。
     插件 registry 从 entry_points 发现并原子快照加载（单插件失败只告警不拖垮）。
     多副本下 scheduler 靠 lease 门控，仅一个副本实际调度（UC-6.9）。

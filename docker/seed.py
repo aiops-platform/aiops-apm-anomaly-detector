@@ -1,7 +1,7 @@
 """UC-7.4 seed：写 2 个 monitor_target（http_metrics + http_logs，domain=demo）+ demo 域配置。
 
 幂等：重复运行不重复插入（monitor_target 按 (tenant_id, target_id) 判重；domain_config upsert）。
-用法：``python seed.py``（容器内已设 ``APM_STORAGE_BACKEND=mysql``）。
+用法：``python seed.py``（容器内已设 ``APM_STORAGE_BACKEND=pg``）。
 """
 
 from __future__ import annotations

@@ -9,12 +9,13 @@ RUN pip install --no-cache-dir --upgrade pip && pip wheel --no-cache-dir --no-de
 FROM python:3.11-slim AS runtime
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
-    APM_STORAGE_BACKEND=mysql \
-    APM_DB_HOST=mysql \
-    APM_DB_PORT=3306 \
-    APM_DB_USER=root \
-    APM_DB_PASSWORD=root123 \
-    APM_DB_NAME=aiops_apm_runtime
+    APM_STORAGE_BACKEND=pg \
+    APM_DB_HOST=postgres \
+    APM_DB_PORT=5432 \
+    APM_DB_USER=agentflow \
+    APM_DB_PASSWORD=agentflow \
+    APM_DB_NAME=agentflow \
+    APM_DB_SCHEMA=aiops_apm_runtime
 COPY --from=builder /wheels /wheels
 COPY --from=builder /build/src /app/src
 RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels

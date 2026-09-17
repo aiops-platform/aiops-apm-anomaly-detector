@@ -17,7 +17,7 @@ from ..exceptions import AppException, ErrorCode
 def format_time_param(dt: datetime, *, timezone_name: str | None = None) -> str:
     """把出站时间参数统一成 ``yyyy-MM-dd'T'HH:mm:ss.SSS`` + 时区后缀（UTC → ``Z``，否则 ``±HH:MM``）。
 
-    - 朴素时间（水位线 last_ts 来自 MySQL DATETIME(3)、``ctx.now`` 均无 tzinfo）按 **UTC** 解释。
+    - 朴素时间（水位线 last_ts 来自 TIMESTAMP(3) 列、``ctx.now`` 均无 tzinfo）按 **UTC** 解释。
     - 可选 ``source_config.timezone``（IANA，如 ``Asia/Shanghai``）：把时间先转到源所在时区
       再格式化。Spring 等源按**本地墙钟**解析查询时间参数（忽略时区后缀），
       不转时区会把 UTC 当本地时间，漂移 8 小时导致每轮重复采集。

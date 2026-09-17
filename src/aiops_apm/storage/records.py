@@ -2,7 +2,7 @@
 
 - ``RecordStore``（ABC）：M5 emit 与 M6 API 消费的窄接口。
 - ``InMemoryRecordStore``：demo/单测真源（UC-2.2/2.3/2.4）。
-- ``MySQLRecordStore``：生产实现，``open_group_key`` 生成列 + UNIQUE + ON DUPLICATE KEY UPDATE 原子去重。
+- ``PGRecordStore``：生产实现，``open_group_key`` 生成列 + UNIQUE + ON CONFLICT DO UPDATE 原子去重。
 
 每个方法入口校验 ``tenant_id`` 非空（多租户隔离硬约束）。
 """
@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..models.record import ProblemRecord
-from .connection import ConnectionPool, _as_json
+from .connection import ConnectionPool, _as_json, _decode_json
 
 _OPEN_STATES = ("pending", "in_progress")
 _SEVERITY_RANK = {"warning": 0, "high": 1, "critical": 2}
@@ -247,16 +247,8 @@ class InMemoryRecordStore(RecordStore):
         return sorted({r["tenant_id"] for r in self._rows.values()})
 
 
-def _decode_json(value: Any) -> Any:
-    import json
-
-    if isinstance(value, (dict, list)):
-        return value
-    return json.loads(value)
-
-
-class MySQLRecordStore(RecordStore):
-    """MySQL 实现：``open_group_key`` 生成列 + UNIQUE 原子去重。"""
+class PGRecordStore(RecordStore):
+    """PostgreSQL 实现：``open_group_key`` 生成列 + UNIQUE 原子去重。"""
 
     def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
@@ -291,19 +283,31 @@ class MySQLRecordStore(RecordStore):
             val = d[col]
             if col in _JSON_COLUMNS:
                 val = _as_json(val)
+            elif col == "change_related":
+                # change_related 是 SMALLINT 列。psycopg3 按 Python 类型选 dumper，bool 会走
+                # boolean OID，而 boolean → smallint 没有赋值转换，直接传 True 会在
+                # write_or_append 这条热路径上硬报错（MySQL 会静默强转）。
+                val = int(bool(val))
             args.append(val)
         placeholders = ", ".join(["%s"] * len(_RECORD_COLUMNS))
         cols = ", ".join(_RECORD_COLUMNS)
-        # JSON_MERGE_PRESERVE 把新 evidence 数组按元素拼接到已有 evidence
-        args.append(_as_json(record.evidence))
         sql = (
-            f"INSERT INTO problem_record ({cols}) VALUES ({placeholders}) AS new "
-            "ON DUPLICATE KEY UPDATE "
-            "evidence = JSON_MERGE_PRESERVE(IFNULL(problem_record.evidence, JSON_ARRAY()), CAST(%s AS JSON)), "
+            f"INSERT INTO problem_record ({cols}) VALUES ({placeholders}) "
+            "ON CONFLICT (tenant_id, open_group_key) DO UPDATE SET "
+            # jsonb 的 || 按元素拼接数组，等价于 MySQL 的
+            # JSON_MERGE_PRESERVE(IFNULL(evidence, JSON_ARRAY()), new_evidence)。
+            # 这里直接取 EXCLUDED.evidence（即上面 VALUES 里绑定的那份），无需再传一个参数。
+            "evidence = COALESCE(problem_record.evidence, '[]'::jsonb) || EXCLUDED.evidence, "
             "occurrence_count = problem_record.occurrence_count + 1, "
-            "last_seen_at = new.last_seen_at, "
-            "severity = IF(FIELD(new.severity,'warning','high','critical') > "
-            "FIELD(problem_record.severity,'warning','high','critical'), new.severity, problem_record.severity), "
+            "last_seen_at = EXCLUDED.last_seen_at, "
+            # FIELD() 在 PG 无对应物。注意 array_position 未命中返回 NULL 而 FIELD 返回 0，
+            # 必须 COALESCE 成 0：当「新严重度在词表内、旧值不在」时（例如旧值被运维写成
+            # 'medium'），MySQL 会升级到新值，而 NULL 参与 > 比较得 NULL → 走 ELSE → 保留
+            # 旧值，判定就悄悄变了。
+            "severity = CASE WHEN "
+            "COALESCE(array_position(ARRAY['warning','high','critical'], EXCLUDED.severity), 0) > "
+            "COALESCE(array_position(ARRAY['warning','high','critical'], problem_record.severity), 0) "
+            "THEN EXCLUDED.severity ELSE problem_record.severity END, "
             "updated_at = CURRENT_TIMESTAMP(3)"
         )
         await self._pool.execute(sql, tuple(args))
@@ -350,7 +354,7 @@ class MySQLRecordStore(RecordStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         await self._pool.execute(
-            "UPDATE problem_record SET state='resolved', resolved_at=NOW(3), resolve_reason=%s "
+            "UPDATE problem_record SET state='resolved', resolved_at=CURRENT_TIMESTAMP(3), resolve_reason=%s "
             "WHERE tenant_id=%s AND record_id=%s AND state <> 'resolved'",
             (reason, tenant_id, record_id),
         )
@@ -359,7 +363,7 @@ class MySQLRecordStore(RecordStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         await self._pool.execute(
-            "UPDATE problem_record SET state='closed', resolved_at=NOW(3), resolve_reason=%s "
+            "UPDATE problem_record SET state='closed', resolved_at=CURRENT_TIMESTAMP(3), resolve_reason=%s "
             "WHERE tenant_id=%s AND record_id=%s AND state <> 'closed'",
             (reason, tenant_id, record_id),
         )
@@ -378,7 +382,7 @@ class MySQLRecordStore(RecordStore):
         # WHERE state='pending' + execute_affected(rowcount)：原子单翻，并发双提交只有一方成功。
         affected = await self._pool.execute_affected(
             "UPDATE problem_record SET state='in_progress', "
-            "evidence = JSON_ARRAY_APPEND(IFNULL(evidence, JSON_ARRAY()), '$', CAST(%s AS JSON)) "
+            "evidence = COALESCE(evidence, '[]'::jsonb) || jsonb_build_array(%s::jsonb) "
             "WHERE tenant_id=%s AND record_id=%s AND state='pending'",
             (_as_json(entry), tenant_id, record_id),
         )
@@ -389,7 +393,7 @@ class MySQLRecordStore(RecordStore):
             raise ValueError("tenant_id is required")
         affected = await self._pool.execute_affected(
             "UPDATE problem_record SET "
-            "evidence = JSON_ARRAY_APPEND(IFNULL(evidence, JSON_ARRAY()), '$', CAST(%s AS JSON)) "
+            "evidence = COALESCE(evidence, '[]'::jsonb) || jsonb_build_array(%s::jsonb) "
             "WHERE tenant_id=%s AND record_id=%s",
             (_as_json(entry), tenant_id, record_id),
         )

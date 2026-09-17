@@ -2,8 +2,7 @@
 
 - ``SequenceStore``（ABC）：M5 emit 生成 ``record_id`` 用。
 - ``InMemorySequenceStore``：单测/demo 真源（``now`` 可注入以测跨日期）。
-- ``MySQLSequenceStore``：``INSERT ... ON DUPLICATE KEY UPDATE next_seq=LAST_INSERT_ID(next_seq+1)``
-  原子取号（best-effort；M5 以 InMemory 真源为准，真库验证待 DB 可用补跑）。
+- ``PGSequenceStore``：``INSERT ... ON CONFLICT DO UPDATE ... RETURNING next_seq`` 原子取号。
 """
 
 from __future__ import annotations
@@ -39,22 +38,19 @@ class InMemorySequenceStore(SequenceStore):
         return f"PR-{seq_date}-{n:04d}"
 
 
-class MySQLSequenceStore(SequenceStore):
+class PGSequenceStore(SequenceStore):
     def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
 
     async def next_id(self, domain: str) -> str:
         seq_date = _date_key(datetime.now(timezone.utc))
-        handle = await self._pool.acquire()
-        try:
-            await handle.execute(
-                "INSERT INTO record_seq (seq_date, next_seq) VALUES (%s, 1) "
-                "ON DUPLICATE KEY UPDATE next_seq = LAST_INSERT_ID(next_seq + 1)",
-                (seq_date,),
-            )
-            row = await handle.fetchone("SELECT LAST_INSERT_ID()")
-            await handle.commit()
-        finally:
-            await self._pool.release(handle)
-        n = int(row[0]) if row else 1
-        return f"PR-{seq_date}-{n:04d}"
+        # RETURNING 直接拿到自增后的值，少一次往返。顺带修掉 MySQL 版的隐患：
+        # LAST_INSERT_ID() 在「当天首次插入」时返回的是**连接的上一个** LAST_INSERT_ID
+        # （池化连接下非 0），会产出 PR-YYYYMMDD-0000 或重号；这里恒为 1。
+        n = await self._pool.execute_returning(
+            "INSERT INTO record_seq (seq_date, next_seq) VALUES (%s, 1) "
+            "ON CONFLICT (seq_date) DO UPDATE SET next_seq = record_seq.next_seq + 1 "
+            "RETURNING next_seq",
+            (seq_date,),
+        )
+        return f"PR-{seq_date}-{int(n or 1):04d}"

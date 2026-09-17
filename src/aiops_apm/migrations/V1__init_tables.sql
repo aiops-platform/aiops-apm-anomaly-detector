@@ -1,182 +1,286 @@
--- V1 初始化：建齐单一 schema aiops_apm_runtime 的 12 张表。
+-- V1 初始化：建齐 aiops_apm_runtime schema 的 12 张表。
 -- 镜像设计文档 §7.2/7.3 DDL + M2 计划补充的 P0 列（problem_record severity/生命周期列）
 -- 与 record_seq / scheduler_lease 两张运行时表。
+--
+-- M8：由 MySQL 方言改写为 PostgreSQL。四处与 MySQL 版的关键差异：
+--   1. 索引名在 PG 里是 **schema 级** 的（MySQL 是表级），原 V1 的
+--      idx_tenant_service_time 在 change_record 与 maintenance_window 上重名，
+--      直接建会报 42P07。maintenance_window 上的改名为 idx_tenant_service_window。
+--   2. ON UPDATE CURRENT_TIMESTAMP(3) 在 PG 无对应物 → 见文件末尾的 set_updated_at 触发器。
+--   3. 时间列是 TIMESTAMP(3)（无时区），库内约定存 naive UTC；连接串固定 TimeZone=UTC。
+--   4. **脚本里不出现 CREATE SCHEMA / SET search_path** —— schema 名由 MigrationRunner
+--      按 settings.db_schema 注入。MySQL 版靠 `USE aiops_apm_runtime` 选库，而库名恒等于
+--      schema 名所以能写死；PG 的 schema 是可配置的，写死会让 db_schema 失效：脚本一执行
+--      就把 search_path 切回硬编码值，建表落到别的 schema，schema_versions 还会撞主键。
 
-CREATE DATABASE IF NOT EXISTS aiops_apm_runtime
-  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE aiops_apm_runtime;
 
 -- problem_record：M5 emit 的最终产出，P0 列含 severity 与 open_group_key 原子去重机制。
--- 并发 write_or_append 同 group_key 只产生一条记录：open_group_key 生成列 + UNIQUE + ON DUPLICATE KEY UPDATE。
+-- 并发 write_or_append 同 group_key 只产生一条记录：open_group_key 生成列 + UNIQUE + ON CONFLICT DO UPDATE。
 CREATE TABLE IF NOT EXISTS problem_record (
-    record_id        VARCHAR(32)   NOT NULL PRIMARY KEY COMMENT 'PR-YYYYMMDD-NNNN',
-    group_key        VARCHAR(255)  NOT NULL COMMENT 'tenant_id:domain:service:<hash> 去重键',
-    source           VARCHAR(64)   NOT NULL DEFAULT 'apm-alert' COMMENT '记录来源模块',
-    tenant_id        VARCHAR(64)   NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
+    record_id        VARCHAR(32)   NOT NULL PRIMARY KEY,
+    group_key        VARCHAR(255)  NOT NULL,
+    source           VARCHAR(64)   NOT NULL DEFAULT 'apm-alert',
+    tenant_id        VARCHAR(64)   NOT NULL DEFAULT 'default',
     domain           VARCHAR(32)   NOT NULL,
-    state            VARCHAR(16)   NOT NULL DEFAULT 'pending' COMMENT 'pending/in_progress/resolved/closed/archived',
+    state            VARCHAR(16)   NOT NULL DEFAULT 'pending',
     service          VARCHAR(64)   NOT NULL,
     instance         VARCHAR(128)  DEFAULT NULL,
-    severity         VARCHAR(16)   NOT NULL DEFAULT 'warning' COMMENT 'warning/high/critical',
-    detected_at      DATETIME(3)   NOT NULL,
-    first_seen_at    DATETIME(3)   DEFAULT NULL,
-    last_seen_at     DATETIME(3)   DEFAULT NULL,
+    severity         VARCHAR(16)   NOT NULL DEFAULT 'warning',
+    detected_at      TIMESTAMP(3)  NOT NULL,
+    first_seen_at    TIMESTAMP(3)  DEFAULT NULL,
+    last_seen_at     TIMESTAMP(3)  DEFAULT NULL,
     occurrence_count INT           NOT NULL DEFAULT 1,
-    resolved_at      DATETIME(3)   DEFAULT NULL,
+    resolved_at      TIMESTAMP(3)  DEFAULT NULL,
     resolve_reason   VARCHAR(255)  DEFAULT NULL,
-    symptom          JSON,
-    metric_anomalies JSON,
-    log_anomalies    JSON,
-    correlation      JSON,
-    change_related   TINYINT(1)    NOT NULL DEFAULT 0,
-    recent_change    JSON,
-    verification     JSON,
-    evidence         JSON          COMMENT '去重时追加的证据',
+    symptom          JSONB,
+    metric_anomalies JSONB,
+    log_anomalies    JSONB,
+    correlation      JSONB,
+    change_related   SMALLINT      NOT NULL DEFAULT 0,
+    recent_change    JSONB,
+    verification     JSONB,
+    evidence         JSONB,
     trace_id         VARCHAR(64)   DEFAULT NULL,
-    created_at       DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    updated_at       DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    created_at       TIMESTAMP(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at       TIMESTAMP(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     -- 原子去重：state 为 open 时 group_key 参与 UNIQUE，resolved 后自动变 NULL 允许复发开新单
     open_group_key   VARCHAR(255) GENERATED ALWAYS AS (
         CASE WHEN state IN ('pending', 'in_progress') THEN group_key ELSE NULL END
     ) STORED,
-    UNIQUE KEY uk_open_group_key (tenant_id, open_group_key),
-    INDEX idx_group_key (group_key),
-    INDEX idx_tenant_state (tenant_id, state),
-    INDEX idx_detected_at (detected_at)
-) ENGINE=InnoDB;
+    CONSTRAINT uk_open_group_key UNIQUE (tenant_id, open_group_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_key ON problem_record (group_key);
+CREATE INDEX IF NOT EXISTS idx_tenant_state ON problem_record (tenant_id, state);
+CREATE INDEX IF NOT EXISTS idx_detected_at ON problem_record (detected_at);
+
+COMMENT ON COLUMN problem_record.record_id IS 'PR-YYYYMMDD-NNNN';
+COMMENT ON COLUMN problem_record.group_key IS 'tenant_id:domain:service:<hash> 去重键';
+COMMENT ON COLUMN problem_record.source IS '记录来源模块';
+COMMENT ON COLUMN problem_record.tenant_id IS '多租户隔离';
+COMMENT ON COLUMN problem_record.state IS 'pending/in_progress/resolved/closed/archived';
+COMMENT ON COLUMN problem_record.severity IS 'warning/high/critical';
+COMMENT ON COLUMN problem_record.change_related IS '是否由变更引起（0/1）';
+COMMENT ON COLUMN problem_record.evidence IS '去重时追加的证据';
 
 CREATE TABLE IF NOT EXISTS change_record (
     change_id     VARCHAR(32)  NOT NULL PRIMARY KEY,
-    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
+    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default',
     service       VARCHAR(64)  NOT NULL,
-    type          VARCHAR(16)  NOT NULL COMMENT 'deployment/ddl/config',
+    type          VARCHAR(16)  NOT NULL,
     summary       VARCHAR(500) DEFAULT NULL,
-    changed_at    DATETIME(3)  NOT NULL,
-    metadata      JSON,
-    created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_tenant_service_time (tenant_id, service, changed_at)
-) ENGINE=InnoDB;
+    changed_at    TIMESTAMP(3) NOT NULL,
+    metadata      JSONB,
+    created_at    TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_service_time ON change_record (tenant_id, service, changed_at);
+
+COMMENT ON COLUMN change_record.tenant_id IS '多租户隔离';
+COMMENT ON COLUMN change_record.type IS 'deployment/ddl/config';
 
 CREATE TABLE IF NOT EXISTS domain_config (
-    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id  VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    domain     VARCHAR(32)  NOT NULL COMMENT '域 id，如 application',
-    config     JSON         NOT NULL COMMENT '域检测规则(detectors/suppressors/correlation/verify)',
-    enabled    TINYINT(1)   NOT NULL DEFAULT 1,
+    id         BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    tenant_id  VARCHAR(64)  NOT NULL DEFAULT 'default',
+    domain     VARCHAR(32)  NOT NULL,
+    config     JSONB        NOT NULL,
+    enabled    SMALLINT     NOT NULL DEFAULT 1,
     version    INT          NOT NULL DEFAULT 1,
-    updated_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-    UNIQUE KEY uk_tenant_domain (tenant_id, domain)
-) ENGINE=InnoDB;
+    updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    CONSTRAINT uk_tenant_domain UNIQUE (tenant_id, domain)
+);
+
+COMMENT ON COLUMN domain_config.tenant_id IS '多租户隔离';
+COMMENT ON COLUMN domain_config.domain IS '域 id，如 application';
+COMMENT ON COLUMN domain_config.config IS '域检测规则(detectors/suppressors/correlation/verify)';
 
 CREATE TABLE IF NOT EXISTS monitor_target (
-    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    target_id     VARCHAR(32)  NOT NULL COMMENT '对外唯一 id，如 MT-0001',
-    service       VARCHAR(64)  NOT NULL COMMENT '被监控服务',
-    signal_type   VARCHAR(16)  NOT NULL COMMENT 'log / metric',
-    source_type   VARCHAR(16)  NOT NULL COMMENT 'http / prometheus / elk',
-    domain        VARCHAR(32)  NOT NULL DEFAULT 'application' COMMENT '归属域',
-    source_config JSON         NOT NULL COMMENT '采集端点配置',
-    schedule      JSON         NOT NULL COMMENT '定时任务(interval_sec 或 cron)',
-    enabled       TINYINT(1)   NOT NULL DEFAULT 1,
-    created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-    UNIQUE KEY uk_tenant_target_id (tenant_id, target_id),
-    INDEX idx_tenant_service (tenant_id, service),
-    INDEX idx_tenant_enabled (tenant_id, enabled)
-) ENGINE=InnoDB;
+    id            BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default',
+    target_id     VARCHAR(32)  NOT NULL,
+    service       VARCHAR(64)  NOT NULL,
+    signal_type   VARCHAR(16)  NOT NULL,
+    source_type   VARCHAR(16)  NOT NULL,
+    domain        VARCHAR(32)  NOT NULL DEFAULT 'application',
+    source_config JSONB        NOT NULL,
+    schedule      JSONB        NOT NULL,
+    enabled       SMALLINT     NOT NULL DEFAULT 1,
+    created_at    TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at    TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    CONSTRAINT uk_tenant_target_id UNIQUE (tenant_id, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_service ON monitor_target (tenant_id, service);
+CREATE INDEX IF NOT EXISTS idx_tenant_enabled ON monitor_target (tenant_id, enabled);
+
+COMMENT ON COLUMN monitor_target.tenant_id IS '多租户隔离';
+COMMENT ON COLUMN monitor_target.target_id IS '对外唯一 id，如 MT-0001';
+COMMENT ON COLUMN monitor_target.service IS '被监控服务';
+COMMENT ON COLUMN monitor_target.signal_type IS 'log / metric';
+COMMENT ON COLUMN monitor_target.source_type IS 'http / prometheus / elk';
+COMMENT ON COLUMN monitor_target.domain IS '归属域';
+COMMENT ON COLUMN monitor_target.source_config IS '采集端点配置';
+COMMENT ON COLUMN monitor_target.schedule IS '定时任务(interval_sec 或 cron)';
 
 CREATE TABLE IF NOT EXISTS maintenance_window (
-    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id  VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
+    id         BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    tenant_id  VARCHAR(64)  NOT NULL DEFAULT 'default',
     service    VARCHAR(64)  NOT NULL,
-    start_at   DATETIME(3)  NOT NULL,
-    end_at     DATETIME(3)  NOT NULL,
+    start_at   TIMESTAMP(3) NOT NULL,
+    end_at     TIMESTAMP(3) NOT NULL,
     reason     VARCHAR(255) DEFAULT NULL,
-    created_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_tenant_service_time (tenant_id, service, start_at, end_at)
-) ENGINE=InnoDB;
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+);
+
+-- 注意：索引名不能叫 idx_tenant_service_time —— change_record 上已占用（PG 索引名是 schema 级）。
+CREATE INDEX IF NOT EXISTS idx_tenant_service_window ON maintenance_window (tenant_id, service, start_at, end_at);
+
+COMMENT ON COLUMN maintenance_window.tenant_id IS '多租户隔离';
 
 CREATE TABLE IF NOT EXISTS suppress_blacklist (
-    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id  VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
+    id         BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    tenant_id  VARCHAR(64)  NOT NULL DEFAULT 'default',
     domain     VARCHAR(32)  NOT NULL,
     service    VARCHAR(64)  NOT NULL,
-    `signal`   VARCHAR(64)  NOT NULL COMMENT 'metric/log pattern',
+    "signal"   VARCHAR(64)  NOT NULL,
     reason     VARCHAR(255) DEFAULT NULL,
-    enabled    TINYINT(1)   NOT NULL DEFAULT 1,
-    created_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_tenant_domain_service (tenant_id, domain, service)
-) ENGINE=InnoDB;
+    enabled    SMALLINT     NOT NULL DEFAULT 1,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_domain_service ON suppress_blacklist (tenant_id, domain, service);
+
+COMMENT ON COLUMN suppress_blacklist.tenant_id IS '多租户隔离';
+COMMENT ON COLUMN suppress_blacklist."signal" IS 'metric/log pattern';
 
 CREATE TABLE IF NOT EXISTS fpr_table (
-    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id           VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
+    id                  BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    tenant_id           VARCHAR(64)  NOT NULL DEFAULT 'default',
     group_key           VARCHAR(255) NOT NULL,
     false_positive_cnt  BIGINT NOT NULL DEFAULT 0,
     total_cnt           BIGINT NOT NULL DEFAULT 0,
     fpr                 DECIMAL(5,4) NOT NULL DEFAULT 0,
-    updated_at          DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-    UNIQUE KEY uk_tenant_group_key (tenant_id, group_key)
-) ENGINE=InnoDB;
+    updated_at          TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    CONSTRAINT uk_tenant_group_key UNIQUE (tenant_id, group_key)
+);
+
+COMMENT ON COLUMN fpr_table.tenant_id IS '多租户隔离';
 
 -- record_seq：record_id 原子取号（PR-YYYYMMDD-NNNN），按日期维护自增序列
 CREATE TABLE IF NOT EXISTS record_seq (
-    seq_date  VARCHAR(8)  NOT NULL PRIMARY KEY COMMENT 'YYYYMMDD',
+    seq_date  VARCHAR(8)  NOT NULL PRIMARY KEY,
     next_seq  BIGINT      NOT NULL DEFAULT 1
-) ENGINE=InnoDB;
+);
+
+COMMENT ON COLUMN record_seq.seq_date IS 'YYYYMMDD';
 
 -- scheduler_lease：多副本选主（行锁 + TTL 续约 + 崩溃自动接管）
 CREATE TABLE IF NOT EXISTS scheduler_lease (
     lease_name VARCHAR(64)  NOT NULL PRIMARY KEY,
     holder     VARCHAR(128) DEFAULT NULL,
-    acquired_at DATETIME(3) DEFAULT NULL,
-    expires_at DATETIME(3)  DEFAULT NULL,
-    updated_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
-) ENGINE=InnoDB;
+    acquired_at TIMESTAMP(3) DEFAULT NULL,
+    expires_at TIMESTAMP(3)  DEFAULT NULL,
+    updated_at TIMESTAMP(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+);
 
 CREATE TABLE IF NOT EXISTS signal_snapshot (
-    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-    snapshot_ts   DATETIME(3)  NOT NULL COMMENT '采集轮次时间',
-    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    target_id     VARCHAR(32)  NOT NULL COMMENT '来源监控端点',
-    service       VARCHAR(64)  NOT NULL,
-    domain        VARCHAR(32)  NOT NULL,
-    signal_type   VARCHAR(16)  NOT NULL COMMENT 'metric / log',
-    metric        VARCHAR(64)  DEFAULT NULL,
-    value         DOUBLE       DEFAULT NULL,
-    level         VARCHAR(16)  DEFAULT NULL,
-    message       TEXT         DEFAULT NULL,
-    signature     VARCHAR(255) DEFAULT NULL COMMENT '日志堆栈签名',
-    labels        JSON         DEFAULT NULL,
-    created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_tenant_target_time (tenant_id, target_id, snapshot_ts),
-    INDEX idx_tenant_service_metric (tenant_id, service, metric, snapshot_ts),
-    INDEX idx_tenant_service_level (tenant_id, service, level, snapshot_ts)
-) ENGINE=InnoDB COMMENT='原始信号快照，量大，建议按 snapshot_ts 分区/定期归档';
+    id            BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    snapshot_ts   TIMESTAMP(3)  NOT NULL,
+    tenant_id     VARCHAR(64)   NOT NULL DEFAULT 'default',
+    target_id     VARCHAR(32)   NOT NULL,
+    service       VARCHAR(64)   NOT NULL,
+    domain        VARCHAR(32)   NOT NULL,
+    signal_type   VARCHAR(16)   NOT NULL,
+    metric        VARCHAR(64)   DEFAULT NULL,
+    value         DOUBLE PRECISION DEFAULT NULL,
+    level         VARCHAR(16)   DEFAULT NULL,
+    message       TEXT          DEFAULT NULL,
+    signature     VARCHAR(255)  DEFAULT NULL,
+    labels        JSONB         DEFAULT NULL,
+    created_at    TIMESTAMP(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_target_time ON signal_snapshot (tenant_id, target_id, snapshot_ts);
+CREATE INDEX IF NOT EXISTS idx_tenant_service_metric ON signal_snapshot (tenant_id, service, metric, snapshot_ts);
+CREATE INDEX IF NOT EXISTS idx_tenant_service_level ON signal_snapshot (tenant_id, service, level, snapshot_ts);
+
+COMMENT ON TABLE signal_snapshot IS '原始信号快照，量大，建议按 snapshot_ts 分区/定期归档';
+COMMENT ON COLUMN signal_snapshot.snapshot_ts IS '采集轮次时间';
+COMMENT ON COLUMN signal_snapshot.tenant_id IS '多租户隔离';
+COMMENT ON COLUMN signal_snapshot.target_id IS '来源监控端点';
+COMMENT ON COLUMN signal_snapshot.signal_type IS 'metric / log';
+COMMENT ON COLUMN signal_snapshot.signature IS '日志堆栈签名';
 
 CREATE TABLE IF NOT EXISTS detection_state (
-    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
+    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default',
     domain        VARCHAR(32)  NOT NULL,
-    state_key     VARCHAR(64)  NOT NULL COMMENT '如 previous_keys',
-    state_value   JSON         NOT NULL,
-    updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    state_key     VARCHAR(64)  NOT NULL,
+    state_value   JSONB        NOT NULL,
+    updated_at    TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     PRIMARY KEY (tenant_id, domain, state_key)
-) ENGINE=InnoDB;
+);
+
+COMMENT ON COLUMN detection_state.tenant_id IS '多租户隔离';
+COMMENT ON COLUMN detection_state.state_key IS '如 previous_keys';
 
 CREATE TABLE IF NOT EXISTS detection_round (
-    round_id          VARCHAR(64)  NOT NULL PRIMARY KEY COMMENT '即 trace_id',
-    tenant_id         VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    started_at        DATETIME(3)  NOT NULL,
-    finished_at       DATETIME(3)  DEFAULT NULL,
-    status            VARCHAR(16)  NOT NULL DEFAULT 'running' COMMENT 'running/success/partial/failed',
-    target_ids        JSON,
+    round_id          VARCHAR(64)  NOT NULL PRIMARY KEY,
+    tenant_id         VARCHAR(64)  NOT NULL DEFAULT 'default',
+    started_at        TIMESTAMP(3) NOT NULL,
+    finished_at       TIMESTAMP(3) DEFAULT NULL,
+    status            VARCHAR(16)  NOT NULL DEFAULT 'running',
+    target_ids        JSONB,
     signals_count     INT          NOT NULL DEFAULT 0,
     anomaly_count     INT          NOT NULL DEFAULT 0,
     record_count      INT          NOT NULL DEFAULT 0,
     suppressed_count  INT          NOT NULL DEFAULT 0,
-    degraded_sources  JSON,
-    timeline          JSON,
-    created_at        DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_tenant_started_at (tenant_id, started_at)
-) ENGINE=InnoDB;
+    degraded_sources  JSONB,
+    timeline          JSONB,
+    created_at        TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_started_at ON detection_round (tenant_id, started_at);
+
+COMMENT ON COLUMN detection_round.round_id IS '即 trace_id';
+COMMENT ON COLUMN detection_round.tenant_id IS '多租户隔离';
+COMMENT ON COLUMN detection_round.status IS 'running/success/partial/failed';
+
+-- ---------------------------------------------------------------------------
+-- updated_at 自动维护：取代 MySQL 的 ON UPDATE CURRENT_TIMESTAMP(3)。
+-- 用 BEFORE UPDATE 触发器覆盖**所有** UPDATE 路径（含未来新增的表），语义与 MySQL 一致。
+-- CREATE TRIGGER 在 PG 17 没有 IF NOT EXISTS，故先 DROP 保证脚本可重入。
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
+BEGIN
+    -- 仅当本次 UPDATE 没有显式改写 updated_at 时才赋值，避免覆盖应用侧的显式写入
+    -- （如 records.write_or_append 里的 updated_at = CURRENT_TIMESTAMP(3)）。
+    IF NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN
+        NEW.updated_at = CURRENT_TIMESTAMP(3);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_problem_record_updated_at ON problem_record;
+CREATE TRIGGER trg_problem_record_updated_at BEFORE UPDATE ON problem_record
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_domain_config_updated_at ON domain_config;
+CREATE TRIGGER trg_domain_config_updated_at BEFORE UPDATE ON domain_config
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_monitor_target_updated_at ON monitor_target;
+CREATE TRIGGER trg_monitor_target_updated_at BEFORE UPDATE ON monitor_target
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_fpr_table_updated_at ON fpr_table;
+CREATE TRIGGER trg_fpr_table_updated_at BEFORE UPDATE ON fpr_table
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_scheduler_lease_updated_at ON scheduler_lease;
+CREATE TRIGGER trg_scheduler_lease_updated_at BEFORE UPDATE ON scheduler_lease
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_detection_state_updated_at ON detection_state;
+CREATE TRIGGER trg_detection_state_updated_at BEFORE UPDATE ON detection_state
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

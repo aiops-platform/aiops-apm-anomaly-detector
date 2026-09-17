@@ -537,7 +537,7 @@ _MAX_SNAPSHOT_BYTES = 128 * 1024
 
 
 def _bounded_snapshot(snap: dict) -> dict:
-    """给快照上体积护栏，保证单次病态长输出撑不爆 MySQL JSON 行。
+    """给快照上体积护栏，保证单次病态长输出撑不爆 JSONB 行。
 
     - 恒做：``conclusion.evidence[].supporting_text`` 每项截到 4000 字符（唯一无界字段）；
     - 若序列化后仍 > 128KB：丢掉 ``tool_calls``（保 conclusion/tasks 等），

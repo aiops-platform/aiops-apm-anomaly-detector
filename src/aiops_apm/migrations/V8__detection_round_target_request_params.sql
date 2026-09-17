@@ -4,6 +4,4 @@
 -- （Spring 等源按本地墙钟解析，时区配错会漂移 8 小时导致重复采集）。
 -- params 只含 URL 查询参数，不含 headers（resolved 后可能带明文凭据，落库有泄密风险）。
 
-USE aiops_apm_runtime;
-
-ALTER TABLE detection_round_target ADD COLUMN request_params JSON DEFAULT NULL AFTER error;
+ALTER TABLE detection_round_target ADD COLUMN IF NOT EXISTS request_params JSONB DEFAULT NULL;

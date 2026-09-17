@@ -26,12 +26,16 @@ def test_dockerfile_mock_source_exists() -> None:
 
 def test_docker_compose_has_core_services() -> None:
     text = (DOCKER / "docker-compose.yml").read_text()
-    for svc in ("mysql", "mock-source", "apm-alert", "prometheus"):
+    for svc in ("postgres", "mock-source", "apm-alert", "prometheus"):
         assert f"  {svc}:" in text
-    assert "APM_STORAGE_BACKEND: mysql" in text
+    assert "APM_STORAGE_BACKEND: pg" in text
     assert "aiops_apm.migrations.runner" in text
     assert "seed.py" in text
-    assert "condition: service_healthy" in text  # mysql 健康检查门控
+    assert "condition: service_healthy" in text  # postgres 健康检查门控
+    # M8：MySQL 已下线，compose 里不应再有 mysql 服务或连接配置。
+    # 断言前先剥掉 `#` 注释——文件头的迁移说明里会出现 "mysql" 字样。
+    yaml_only = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+    assert "mysql" not in yaml_only.lower()
 
 
 def test_prometheus_config_scrapes_apm_alert() -> None:

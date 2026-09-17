@@ -3,7 +3,7 @@
 - ``RoundStore``（ABC）：``poller.run_round`` 每轮 create（running）→ ``run_domain`` →
   update_status（success/partial/failed）；``router/audit`` 查询（按 domain/status 过滤）。
 - ``InMemoryRoundStore``：单测/demo 真源。
-- ``MySQLRoundStore``：``timeline``/``target_ids``/``degraded_sources`` 存 JSON。
+- ``PGRoundStore``：``timeline``/``target_ids``/``degraded_sources`` 存 JSON。
 - **round → target 一对多明细**（``detection_round_target``，V5 迁移）：每轮下每个 target
   一行独立采集状态（running/ok/failed/interrupted）与信号量 ——
   ``create_target`` / ``update_target_status`` / ``latest_target`` 三方法。
@@ -317,8 +317,8 @@ def _iso(value: datetime) -> str:
     return value.isoformat()
 
 
-class MySQLRoundStore(RoundStore):
-    """MySQL 实现：JSON 列用 ``_as_json``/``_decode_json``，单 handle 原则。"""
+class PGRoundStore(RoundStore):
+    """PostgreSQL 实现：JSONB 列用 ``_as_json``/``_decode_json``，单 handle 原则。"""
 
     _COLUMNS = (
         "round_id", "tenant_id", "domain", "started_at", "finished_at", "status",

@@ -8,7 +8,7 @@
 
 ## 1. `domain_config.config` 是什么
 
-一个 **domain（域）** 的完整检测规则，存 MySQL `domain_config` 表的 `config` JSON 列，由 `build_context`（`pipeline/context.py:96` `DomainConfig.model_validate(r["config"])`）解析进 `DetectionContext.domain_config`，然后 `run_domain`（`pipeline/runner.py:28`）串行调用 L0→L1→L2→L3 时各自读取。
+一个 **domain（域）** 的完整检测规则，存 PG `domain_config` 表的 `config` JSONB 列，由 `build_context`（`pipeline/context.py:96` `DomainConfig.model_validate(r["config"])`）解析进 `DetectionContext.domain_config`，然后 `run_domain`（`pipeline/runner.py:28`）串行调用 L0→L1→L2→L3 时各自读取。
 
 结构共 4 块，恰好对应漏斗的 4 个步骤：
 

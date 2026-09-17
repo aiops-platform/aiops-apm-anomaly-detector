@@ -1,10 +1,11 @@
-"""UC-7.2 RoundStore：InMemory 真源 CRUD/过滤/排序/租户隔离 + MySQL SQL 断言。"""
+"""UC-7.2 RoundStore：InMemory 真源 CRUD/过滤/排序/租户隔离 + PG SQL 断言。"""
 
 from datetime import datetime, timezone
 
 import pytest
+from psycopg.types.json import Jsonb
 
-from aiops_apm.storage.rounds import InMemoryRoundStore, MySQLRoundStore
+from aiops_apm.storage.rounds import InMemoryRoundStore, PGRoundStore
 
 TS1 = datetime(2026, 8, 26, 12, 0, 0, tzinfo=timezone.utc)
 TS2 = datetime(2026, 8, 26, 12, 1, 0, tzinfo=timezone.utc)
@@ -199,8 +200,8 @@ async def test_tenant_id_required(store: InMemoryRoundStore, method: str, args: 
         await getattr(store, method)(*args, **kwargs)
 
 
-# ---- MySQL SQL 断言 ----
-# MySQLRoundStore 直接调 ConnectionPool 的便捷方法（execute/fetchone/fetchall 自动 acquire→commit→release），
+# ---- PostgreSQL SQL 断言 ----
+# PGRoundStore 直接调 ConnectionPool 的便捷方法（execute/fetchone/fetchall 自动 acquire→commit→release），
 # FakePool 同样提供这些便捷方法并把 SQL/args 记入 logs。
 
 class FakePool:
@@ -219,11 +220,11 @@ class FakePool:
         return []
 
 
-def _store(logs: list) -> MySQLRoundStore:
-    return MySQLRoundStore(FakePool(logs))
+def _store(logs: list) -> PGRoundStore:
+    return PGRoundStore(FakePool(logs))
 
 
-async def test_mysql_create_round_sql() -> None:
+async def test_pg_create_round_sql() -> None:
     logs: list = []
     await _store(logs).create_round("t1", "R-0001", "application", started_at=TS1, target_ids=["MT-0001"])
     sql = next(s for (kind, s, _) in logs if kind == "execute")
@@ -232,7 +233,7 @@ async def test_mysql_create_round_sql() -> None:
     assert "timeline" in sql
 
 
-async def test_mysql_update_status_sql() -> None:
+async def test_pg_update_status_sql() -> None:
     logs: list = []
     await _store(logs).update_status("t1", "R-0001", "success", ended_at=TS2, timeline=[{"step": "x"}], record_count=1)
     sql = next(s for (kind, s, _) in logs if kind == "execute")
@@ -240,7 +241,7 @@ async def test_mysql_update_status_sql() -> None:
     assert "WHERE tenant_id=%s AND round_id=%s" in sql
 
 
-async def test_mysql_list_rounds_sql_with_filters() -> None:
+async def test_pg_list_rounds_sql_with_filters() -> None:
     logs: list = []
     await _store(logs).list_rounds("t1", domain="application", status="success", limit=10, offset=5)
     sql = next(s for (kind, s, _) in logs if kind == "fetchall")
@@ -250,7 +251,7 @@ async def test_mysql_list_rounds_sql_with_filters() -> None:
     assert "ORDER BY started_at DESC LIMIT %s OFFSET %s" in sql
 
 
-async def test_mysql_create_target_sql() -> None:
+async def test_pg_create_target_sql() -> None:
     logs: list = []
     await _store(logs).create_target("t1", "R-0001", "MT-0001", started_at=TS1)
     sql = next(s for (kind, s, _) in logs if kind == "execute")
@@ -259,7 +260,7 @@ async def test_mysql_create_target_sql() -> None:
     assert "started_at" in sql
 
 
-async def test_mysql_update_target_status_sql() -> None:
+async def test_pg_update_target_status_sql() -> None:
     logs: list = []
     await _store(logs).update_target_status(
         "t1", "R-0001", "MT-0001", "failed", finished_at=TS2, signals_count=3, error="boom"
@@ -269,8 +270,8 @@ async def test_mysql_update_target_status_sql() -> None:
     assert "WHERE round_id=%s AND tenant_id=%s AND target_id=%s" in sql
 
 
-async def test_mysql_update_target_status_request_params_sql() -> None:
-    # V8：request_params JSON 列，args 为 _as_json 序列化后的字符串
+async def test_pg_update_target_status_request_params_sql() -> None:
+    # V8：request_params JSON 列，args 为 _as_json 包出的 psycopg Jsonb
     logs: list = []
     await _store(logs).update_target_status(
         "t1", "R-0001", "MT-0001", "ok", finished_at=TS2, signals_count=3,
@@ -280,11 +281,13 @@ async def test_mysql_update_target_status_request_params_sql() -> None:
     assert kind == "execute"
     assert "SET status=%s, finished_at=%s, signals_count=%s, request_params=%s" in sql
     assert "WHERE round_id=%s AND tenant_id=%s AND target_id=%s" in sql
-    assert isinstance(args[3], str)
-    assert '"start": "2024-03-09T15:30:00.000Z"' in args[3]
+    # _as_json 返回 Jsonb（psycopg 的 JSONB 参数包装器）而非 str——裸 dict 没有 dumper，
+    # 必须包一层；Jsonb 构造时不序列化，dumps 钩子在真正绑定参数那一刻才跑。
+    assert isinstance(args[3], Jsonb)
+    assert args[3].obj["params"]["start"] == "2024-03-09T15:30:00.000Z"
 
 
-async def test_mysql_update_target_status_counts_only_sql() -> None:
+async def test_pg_update_target_status_counts_only_sql() -> None:
     # V6 漏斗后回填：只有计数字段 → SET 只含这三个列，status/finished_at 不出现
     logs: list = []
     await _store(logs).update_target_status(
@@ -300,7 +303,7 @@ async def test_mysql_update_target_status_counts_only_sql() -> None:
     assert "WHERE round_id=%s AND tenant_id=%s AND target_id=%s" in sql
 
 
-async def test_mysql_latest_target_sql() -> None:
+async def test_pg_latest_target_sql() -> None:
     logs: list = []
     await _store(logs).latest_target("t1", "MT-0001", status="running")
     sql = next(s for (kind, s, _) in logs if kind == "fetchone")
@@ -309,7 +312,7 @@ async def test_mysql_latest_target_sql() -> None:
     assert "ORDER BY started_at DESC LIMIT 1" in sql
 
 
-async def test_mysql_list_targets_sql() -> None:
+async def test_pg_list_targets_sql() -> None:
     logs: list = []
     await _store(logs).list_targets("t1", "R-0001")
     sql = next(s for (kind, s, _) in logs if kind == "fetchall")

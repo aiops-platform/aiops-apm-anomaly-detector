@@ -17,7 +17,7 @@
 **四个核心设计原则**（不可回退）：
 
 1. **确定性优先**：检测是「确定性 pipeline + 少量 LLM」。LLM 只做现象摘要（L2 可选项），**绝不参与检测决策**；L1/L2/L3 全是确定性纯函数。
-2. **可插拔规则**：规则（检测方法 / 采集源 / 抑制规则）通过 **entry_points 插件系统**动态加载，域配置在 **MySQL** 里用「插件名 + 参数」引用，**改配置即插拔**。
+2. **可插拔规则**：规则（检测方法 / 采集源 / 抑制规则）通过 **entry_points 插件系统**动态加载，域配置在 **PostgreSQL** 里用「插件名 + 参数」引用，**改配置即插拔**。
 3. **单一 trace_id**：每轮检测一个 `trace_id` 贯穿采集→漏斗→落库，写入 `problem_record`，下游沿用做全链路追踪。
 4. **多租户隔离**：全链路携带 `tenant_id`（请求头 `X-Tenant-Id`，默认 `default`），配置、调度、采集、落库、查询均按租户隔离，使本模块可复用于多套服务/业务线。
 
@@ -28,9 +28,9 @@
 | # | 决策点 | 选择 | 理由 |
 |---|--------|------|------|
 | 1 | 编排骨架 | **简单确定性 asyncio pipeline** | 不用 LangGraph（StateGraph/checkpointer），用纯 `asyncio` 串起 collect→L0→L1→L2→L3→emit。轻量、易单测，后续要复杂编排再迁 |
-| 2 | 持久化 | **MySQL 直连**（aiomysql） | 生产直接落库；不引入存储抽象层之外的过度封装 |
+| 2 | 持久化 | **PostgreSQL 直连**（psycopg3） | 生产直接落库；不引入存储抽象层之外的过度封装 |
 | 3 | 规则机制 | **真正 plugin 系统（entry_points 动态加载）** | 检测器/采集器/抑制器做成独立可分发插件，`pip install` 后自动被发现；改配置即插拔 |
-| 4 | 配置承载 | **MySQL 承载（YAML 仅作 seed）** | 检测规则与监控端点均入库，运行时改库即生效，支持自服务新增监控端点 |
+| 4 | 配置承载 | **PostgreSQL 承载（YAML 仅作 seed）** | 检测规则与监控端点均入库，运行时改库即生效，支持自服务新增监控端点 |
 | 5 | 多租户 | **全链路 `tenant_id` 隔离** | 所有表、配置、调度、API 均带 `tenant_id`（请求头 `X-Tenant-Id`，默认 `default`），一套实例服务多个租户/业务线，互不可见 |
 
 ---
@@ -65,10 +65,10 @@
 │   │  Collector 插件 / Detector 插件 / Suppressor 插件      │     │
 │   └──────────────────────────────────────────────────────┘     │
 └───────────────────────────────────────────────────────────────┘
-        │ HTTP (Collector 插件适配)          │ aiomysql 直连
+        │ HTTP (Collector 插件适配)          │ psycopg3 直连
         ▼                                   ▼
 ┌──────────────────────────┐      ┌─────────────────────────────┐
-│ 第三方 API               │      │ MySQL (aiops_apm_runtime 库)     │
+│ 第三方 API               │      │ PostgreSQL (schema aiops_apm_runtime) │
 │ Prometheus / ELK / 任意  │      │  ├ problem_record            │
 │ 指标 HTTP / 日志 HTTP     │      │  ├ change_record             │
 └──────────────────────────┘      │  ├ monitor_target            │
@@ -106,7 +106,7 @@ scheduler(按端点 schedule) → 载入 monitor_target(端点) + domain_config(
 │                                                                              │
 └──────┬──────────────────────────────────┬───────────────────────────┬────────┘
        │                                  │                           │
-       │        写入 MySQL（改库即生效，无需重启）                    │
+       │        写入 PostgreSQL（改库即生效，无需重启）               │
        ▼                                  ▼                           ▼
 ┌────────────────────── Adapter 自动适配（Automated）───────────────────────────┐
 │                                                                              │
@@ -137,7 +137,7 @@ scheduler(按端点 schedule) → 载入 monitor_target(端点) + domain_config(
 apm-alert/
 ├── pyproject.toml                 # 依赖 + entry_points 声明（插件注册）
 ├── requirements.txt
-├── .env.example                   # 环境变量样例（MySQL 连接、端口等）
+├── .env.example                   # 环境变量样例（PostgreSQL 连接、端口等）
 ├── README.md
 │
 ├── migrations/
@@ -145,12 +145,12 @@ apm-alert/
 │
 ├── src/aiops_apm/
 │   ├── __init__.py
-│   ├── settings.py                # pydantic-settings（端口、MySQL、调度参数）
+│   ├── settings.py                # pydantic-settings（端口、PostgreSQL、调度参数）
 │   ├── exceptions.py              # ErrorCode + AppException
 │   ├── _app.py                    # FastAPI 工厂 + lifespan（启动插件/scheduler）
 │   │
 │   ├── config/                    # ★ 配置加载
-│   │   ├── loader.py              # DomainConfigLoader：域配置从 MySQL 加载（YAML 作 seed）
+│   │   ├── loader.py              # DomainConfigLoader：域配置从 PG 加载（YAML 作 seed）
 │   │   ├── domains.yaml           # 域配置 seed（首次初始化 / 无 DB 兜底）
 │   │   └── harness.yaml           # 调度/超时/降级（静态）
 │   │
@@ -192,9 +192,9 @@ apm-alert/
 │   │   ├── l3_verify.py           # L3 验证（持续性/误报率/严重度）
 │   │   └── emit.py                # 组装 ProblemRecord + 去重落库
 │   │
-│   ├── storage/                   # ★ MySQL 直连
+│   ├── storage/                   # ★ PostgreSQL 直连
 │   │   ├── __init__.py
-│   │   ├── connection.py          # aiomysql 连接池
+│   │   ├── connection.py          # psycopg3 连接池
 │   │   ├── records.py             # RecordStore（problem_record 读写/去重）
 │   │   ├── monitor_target.py      # MonitorTargetStore（监控端点读写）
 │   │   ├── domain_config.py       # DomainConfigStore（检测规则读写/seed）
@@ -370,7 +370,7 @@ class DetectionContext:
     trace_id: str
     tenant_id: str = "default"       # 多租户隔离（请求头 X-Tenant-Id，默认 default）
     domain: str
-    domain_config: dict              # 来自 MySQL domain_config 的检测规则
+    domain_config: dict              # 来自 PG domain_config 的检测规则
     registry: PluginRegistry
     storage: RecordStore
     now: datetime
@@ -743,172 +743,50 @@ class ProblemRecord(BaseModel):
 
 - `round_id` 即该轮 `trace_id`（poller 建轮次时二者同一值），命中已 open 记录 append evidence 时，每条证据仍能定位到产生它的那一轮；该轮 `detection_round.target_ids` 亦内联写入，审计可直接查 `/v1/audit/rounds/{round_id}/targets`。
 
-### 7.2 DDL（aiops_apm_runtime 库，Python 直连）
+### 7.2 DDL（PostgreSQL，`APM_DB_SCHEMA` 指定的独立 schema）
 
-```sql
-CREATE DATABASE IF NOT EXISTS aiops_apm_runtime
-  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE aiops_apm_runtime;
+> **权威定义**：[`src/aiops_apm/migrations/V1..V8__*.sql`](../../src/aiops_apm/migrations/)。
+> 本节只记录**表与列的语义**以及 PG 化的取舍；具体 DDL 以迁移脚本为准，避免此处副本漂移。
+> MySQL 版的原始 DDL 已归档到 [`docs/archive/M8-postgres-migration.md`](../archive/M8-postgres-migration.md)。
 
-CREATE TABLE IF NOT EXISTS problem_record (
-    record_id        VARCHAR(32)   NOT NULL PRIMARY KEY COMMENT 'PR-YYYYMMDD-NNNN',
-    group_key        VARCHAR(255)  NOT NULL COMMENT 'tenant_id:domain:service:anomaly_type 去重键',
-    source           VARCHAR(64)   NOT NULL COMMENT '记录来源模块（固定 apm-alert）',
-    tenant_id        VARCHAR(64)   NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    domain           VARCHAR(32)   NOT NULL,
-    state            VARCHAR(16)   NOT NULL DEFAULT 'pending',
-    service          VARCHAR(64)   NOT NULL,
-    instance         VARCHAR(128)  DEFAULT NULL,
-    detected_at      DATETIME(3)   NOT NULL,
-    symptom          JSON,
-    metric_anomalies JSON,
-    log_anomalies    JSON,
-    correlation      JSON,
-    change_related   TINYINT(1)    NOT NULL DEFAULT 0,
-    recent_change    JSON,
-    verification     JSON,
-    evidence         JSON          COMMENT '去重时追加的证据',
-    trace_id         VARCHAR(64)   DEFAULT NULL,
-    created_at       DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    updated_at       DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-    INDEX idx_group_key (group_key),
-    INDEX idx_tenant_state (tenant_id, state),
-    INDEX idx_tenant_domain_service (tenant_id, domain, service),
-    INDEX idx_detected_at (detected_at)
-) ENGINE=InnoDB;
+**库与 schema**：表建在 `APM_DB_NAME` 库（默认 `agentflow`，复用 multi-agent-workflow 的 PG 实例）内的
+**独立 schema** `APM_DB_SCHEMA`（默认 `aiops_apm_runtime`）下。这是 MySQL「单 schema」语义在 PG 下的
+对应物：与同库其它服务（agentflow 自己在 `public` 里的表）零冲突，且不需要动对方的 compose/init。
+schema 由 `MigrationRunner` 按配置创建——**迁移脚本里不出现 `CREATE SCHEMA` / `SET search_path`**，
+否则 `APM_DB_SCHEMA` 会失效。
 
-CREATE TABLE IF NOT EXISTS change_record (
-    change_id     VARCHAR(32)  NOT NULL PRIMARY KEY,
-    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    service       VARCHAR(64)  NOT NULL,
-    type          VARCHAR(16)  NOT NULL COMMENT 'deployment/ddl/config',
-    summary       VARCHAR(500) DEFAULT NULL,
-    changed_at    DATETIME(3)  NOT NULL,
-    metadata      JSON,
-    created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_tenant_service_time (tenant_id, service, changed_at)
-) ENGINE=InnoDB;
+**V1 建齐 12 张表**（业务表均带 `tenant_id`）：
 
-CREATE TABLE IF NOT EXISTS domain_config (
-    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id  VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    domain     VARCHAR(32)  NOT NULL COMMENT '域 id，如 application',
-    config     JSON         NOT NULL COMMENT '域检测规则(detectors/suppressors/correlation/verify)',
-    enabled    TINYINT(1)   NOT NULL DEFAULT 1,
-    version    INT          NOT NULL DEFAULT 1,
-    updated_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-    UNIQUE KEY uk_tenant_domain (tenant_id, domain)
-) ENGINE=InnoDB;
+| 表 | 用途 | PG 化要点 |
+|---|---|---|
+| `problem_record` | M5 emit 的最终产出 | `open_group_key` 生成列 + `uk_open_group_key` UNIQUE 做并发去重；`evidence` 等 7 个 JSON 列 → `JSONB`；`change_related` → `SMALLINT`（非 `BOOLEAN`，因为代码里有 `WHERE ...=0` 形态的比较） |
+| `change_record` | 变更记录，L2 变更关联用 | |
+| `domain_config` | 域检测规则（detectors/suppressors/correlation/verify），`UNIQUE (tenant_id, domain)` | 写入用 `ON CONFLICT ... RETURNING version` 一步拿到版本号 |
+| `monitor_target` | 监控端点配置（监控谁/从哪采/多快采） | `target_id` 取号用 `pg_advisory_xact_lock` 护住「读最大号 + 插入」 |
+| `maintenance_window` | L0 维护窗口 | 索引名 `idx_tenant_service_window`（PG 索引名是 **schema 级**，不能与 `change_record` 上的 `idx_tenant_service_time` 重名） |
+| `suppress_blacklist` | L0 黑名单，按 `(domain, service, signal)` 匹配 | `signal` 用双引号标识符 `"signal"` |
+| `fpr_table` | 误报率统计，L3 误报率闸门 + fpr 回写 | `fpr` 重算必须 `::numeric`——PG 的 `bigint/bigint` 是整数除法，漏掉会让 fpr 恒为 0/1 |
+| `record_seq` | `record_id` 原子取号（`PR-YYYYMMDD-NNNN`） | `ON CONFLICT ... RETURNING next_seq`，比 MySQL 的 `LAST_INSERT_ID` 少一次往返 |
+| `scheduler_lease` | 多副本选主（TTL 续约 + 崩溃接管） | `ON CONFLICT ... RETURNING holder`；`DO UPDATE` 里的 `CASE WHEN expires_at < ...` 接管守卫是互斥核心，不可简化 |
+| `signal_snapshot` | 原始信号快照（量大，建议按 `snapshot_ts` 分区/归档） | `signature` 由 V7 加宽至 `VARCHAR(1024)`（长堆栈签名可超 255） |
+| `detection_state` | 检测状态（环比基线 / L3 持续性计数），`state_value` 为 JSONB | sweep 用 `jsonb_set`，路径必须是 PG 数组形态 `'{miss_rounds}'` |
+| `detection_round` | 轮次审计主表（`round_id` 即 `trace_id`） | V3 补 `domain` 列 |
 
-CREATE TABLE IF NOT EXISTS monitor_target (
-    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    target_id     VARCHAR(32)  NOT NULL COMMENT '对外唯一 id，如 MT-0001',
-    service       VARCHAR(64)  NOT NULL COMMENT '被监控服务，如 order-management',
-    signal_type   VARCHAR(16)  NOT NULL COMMENT 'log / metric',
-    source_type   VARCHAR(16)  NOT NULL COMMENT 'http / prometheus / elk',
-    domain        VARCHAR(32)  NOT NULL DEFAULT 'application' COMMENT '归属域（决定应用哪套检测规则）',
-    source_config JSON         NOT NULL COMMENT '采集端点配置(url/method/headers/params/field_mapping)',
-    schedule      JSON         NOT NULL COMMENT '定时任务(interval_sec 或 cron)',
-    enabled       TINYINT(1)   NOT NULL DEFAULT 1,
-    created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-    UNIQUE KEY uk_tenant_target_id (tenant_id, target_id),
-    INDEX idx_tenant_service (tenant_id, service),
-    INDEX idx_tenant_enabled (tenant_id, enabled)
-) ENGINE=InnoDB;
+**时间列**：全部是 `TIMESTAMP(3)`（**无时区**），库内约定存 **naive UTC**。
+两个会话参数在连接串里钉死、不能省：`search_path`（PG 没有 MySQL 的 `USE`）与 `TimeZone=UTC`
+（`CURRENT_TIMESTAMP` 返回 `timestamptz`，写进 naive 列时按会话时区折算；会话时区非 UTC 会让
+DB 生成的时间与应用写入的 UTC 值相差若干小时，且不报错）。
 
-CREATE TABLE IF NOT EXISTS maintenance_window (
-    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id  VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    service    VARCHAR(64)  NOT NULL,
-    start_at   DATETIME(3)  NOT NULL,
-    end_at     DATETIME(3)  NOT NULL,
-    reason     VARCHAR(255) DEFAULT NULL,
-    created_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_tenant_service_time (tenant_id, service, start_at, end_at)
-) ENGINE=InnoDB;
+**`updated_at`**：PG 没有 `ON UPDATE CURRENT_TIMESTAMP`，改用 `set_updated_at()` 的
+`BEFORE UPDATE` 触发器（带 `IS NOT DISTINCT FROM` 守卫，避免覆盖应用侧的显式赋值）。
 
-CREATE TABLE IF NOT EXISTS suppress_blacklist (
-    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id  VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    domain     VARCHAR(32)  NOT NULL,
-    service    VARCHAR(64)  NOT NULL,
-    signal     VARCHAR(64)  NOT NULL COMMENT 'metric/log pattern',
-    reason     VARCHAR(255) DEFAULT NULL,
-    enabled    TINYINT(1)   NOT NULL DEFAULT 1,
-    created_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_tenant_domain_service (tenant_id, domain, service)
-) ENGINE=InnoDB;
+### 7.3 DDL（v2 运行时/历史表，同一 schema）
 
-CREATE TABLE IF NOT EXISTS fpr_table (
-    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id           VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    group_key           VARCHAR(255) NOT NULL COMMENT 'tenant_id:domain:service:anomaly_type',
-    false_positive_cnt  BIGINT NOT NULL DEFAULT 0,
-    total_cnt           BIGINT NOT NULL DEFAULT 0,
-    fpr                 DECIMAL(5,4) NOT NULL DEFAULT 0,
-    updated_at          DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-    UNIQUE KEY uk_tenant_group_key (tenant_id, group_key)
-) ENGINE=InnoDB;
-```
+`signal_snapshot`、`detection_state`、`detection_round` 三张表与 V1 同批建于同一 schema，见上表与迁移脚本。
+V5 另建 `detection_round_target`（轮次 → 多 target 的一对多明细，V6 补 per-target 漏斗计数、
+V8 补 `request_params` 出站请求参数快照）。
 
-### 7.3 DDL（v2 运行时/历史表，同一 `aiops_apm_runtime` 库）
-
-以下 3 张 v2 表与 §7.2 同属单一 `aiops_apm_runtime` 库（不再独立 schema）。信号快照量大，建议按 `snapshot_ts` 分区/定期归档；状态/审计生命周期短可独立清理。
-
-```sql
--- 信号历史快照：采集到的原始指标/日志，支撑基线/环比/ML（量大，建议分区/归档）
-CREATE TABLE IF NOT EXISTS signal_snapshot (
-    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-    snapshot_ts   DATETIME(3)  NOT NULL COMMENT '采集轮次时间',
-    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    target_id     VARCHAR(32)  NOT NULL COMMENT '来源监控端点',
-    service       VARCHAR(64)  NOT NULL,
-    domain        VARCHAR(32)  NOT NULL,
-    signal_type   VARCHAR(16)  NOT NULL COMMENT 'metric / log',
-    metric        VARCHAR(64)  DEFAULT NULL COMMENT 'signal_type=metric',
-    value         DOUBLE       DEFAULT NULL COMMENT 'signal_type=metric',
-    level         VARCHAR(16)  DEFAULT NULL COMMENT 'signal_type=log',
-    message       TEXT         DEFAULT NULL COMMENT 'signal_type=log',
-    signature     VARCHAR(255) DEFAULT NULL COMMENT '日志堆栈签名',
-    labels        JSON         DEFAULT NULL COMMENT 'metric labels / log 附加字段',
-    created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_tenant_target_time (tenant_id, target_id, snapshot_ts),
-    INDEX idx_tenant_service_metric (tenant_id, service, metric, snapshot_ts),
-    INDEX idx_tenant_service_level (tenant_id, service, level, snapshot_ts)
-) ENGINE=InnoDB COMMENT='原始信号快照，量大，建议按 snapshot_ts 分区/定期归档';
-
--- 跨轮检测状态：L3 持续性的「上一轮 anomaly keys」等
-CREATE TABLE IF NOT EXISTS detection_state (
-    tenant_id     VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    domain        VARCHAR(32)  NOT NULL,
-    state_key     VARCHAR(64)  NOT NULL COMMENT '如 previous_keys',
-    state_value   JSON         NOT NULL,
-    updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-    PRIMARY KEY (tenant_id, domain, state_key)
-) ENGINE=InnoDB;
-
--- 轮次审计：每轮 trace_id + 阶段统计 + timeline
-CREATE TABLE IF NOT EXISTS detection_round (
-    round_id          VARCHAR(64)  NOT NULL PRIMARY KEY COMMENT '即 trace_id',
-    tenant_id         VARCHAR(64)  NOT NULL DEFAULT 'default' COMMENT '多租户隔离',
-    started_at        DATETIME(3)  NOT NULL,
-    finished_at       DATETIME(3)  DEFAULT NULL,
-    status            VARCHAR(16)  NOT NULL DEFAULT 'running' COMMENT 'running/success/partial/failed',
-    target_ids        JSON         COMMENT '本轮涉及的监控端点',
-    signals_count     INT          NOT NULL DEFAULT 0,
-    anomaly_count     INT          NOT NULL DEFAULT 0,
-    record_count      INT          NOT NULL DEFAULT 0,
-    suppressed_count  INT          NOT NULL DEFAULT 0,
-    degraded_sources  JSON         COMMENT '降级的采集源',
-    timeline          JSON         COMMENT '各阶段耗时/时间戳',
-    created_at        DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_tenant_started_at (tenant_id, started_at)
-) ENGINE=InnoDB;
-```
-
----
+`schema_versions` 由 `MigrationRunner` 自动创建，用于 `make migrate` 的幂等版本追踪，不计入版本化迁移。
 
 ## 8. 配置 Schema（手动可编辑）
 
@@ -916,7 +794,7 @@ CREATE TABLE IF NOT EXISTS detection_round (
 
 > 二者职责分离：`monitor_target` 回答「监控谁、从哪采、多快采」，`domain_config` 回答「采到后怎么判、怎么抑制、怎么验证」。新增监控服务只需加一行 `monitor_target`，无需改检测规则。
 
-### 8.1 监控端点（MySQL `monitor_target` 表，自服务）
+### 8.1 监控端点（PG `monitor_target` 表，自服务）
 
 **核心用例**：运维在界面输入 `service=order-management`、`类型=日志`、`http 端点`、`定时任务`，提交即开始对该服务的日志监控。
 
@@ -975,9 +853,9 @@ CREATE TABLE IF NOT EXISTS detection_round (
 - **`source_config`**：完全由 collector 插件解释。`http_logs`/`http_metrics` 识别 `url/method/headers/params/field_mapping`；`field_mapping` 把第三方响应字段映射到 `LogSignal`/`MetricSignal`。
 - **自服务入口**：`POST /v1/monitors` 新增、`PUT/DELETE /v1/monitors/{target_id}` 修改/删除、`POST /v1/monitors/{target_id}/run` 立即执行（见 §10）。提交后 `scheduler` 按 `schedule` 自动调度，无需重启进程。
 
-### 8.2 检测规则（MySQL `domain_config` 表，运行时加载）
+### 8.2 检测规则（PG `domain_config` 表，运行时加载）
 
-检测规则以 **MySQL `domain_config` 表为主源**，YAML 仅作**首次初始化的 seed**（及无 DB 时的兜底）。
+检测规则以 **PG `domain_config` 表为主源**，YAML 仅作**首次初始化的 seed**（及无 DB 时的兜底）。
 
 **存储结构**：每个「租户 + 域」一行，`config` 列存该域的检测规则 JSON（detectors/suppressors/correlation/verify），唯一键 `(tenant_id, domain)`。
 
@@ -1059,26 +937,26 @@ harness:
 
 ---
 
-## 9. 存储层设计（MySQL 直连）
+## 9. 存储层设计（PostgreSQL 直连）
 
 ```python
 # storage/connection.py
 class ConnectionPool:
     def __init__(self, settings): ...
-    async def connect(self):            # aiomysql.create_pool(...)
+    async def connect(self):            # psycopg_pool.AsyncConnectionPool(...)
     async def close(self): ...
     async def execute(self, sql, args): ...
     async def fetchone(self, sql, args): ...
     async def fetchall(self, sql, args): ...
 
-# storage/records.py —— 抽象出最小接口，MySQL 为主实现，InMemory 用于 demo/单测
+# storage/records.py —— 抽象出最小接口，PG 为主实现，InMemory 用于 demo/单测
 class RecordStore(ABC):
     async def write(self, record: ProblemRecord) -> None: ...
     async def update(self, record_id, evidence, reason) -> None: ...
     async def find_open(self, group_key) -> dict | None: ...   # 租户内 state ∉ {closed,archived}
     async def list(self, tenant_id, state=None, limit=100) -> list[dict]: ...
 
-class MySQLRecordStore(RecordStore): ...     # JSON 字段 json.dumps 序列化
+class PGRecordStore(RecordStore): ...        # JSONB 字段经 _as_json 包成 psycopg Jsonb
 class InMemoryRecordStore(RecordStore): ...  # demo/单测兜底
 ```
 
@@ -1105,7 +983,7 @@ class DynamicConfigStore(ABC):
     async def load_fpr(self, tenant_id, group_key) -> float: ...
 ```
 
-> `settings.storage_backend` 决定用 `mysql` 还是 `memory`（默认 `mysql`；`memory` 仅用于本地 demo/单测，避免无 MySQL 时无法跑通）。生产目标仍是 MySQL 直连，不引入 SQLite。
+> `settings.storage_backend` 决定用 `pg` 还是 `memory`（默认 `pg`；`memory` 仅用于本地 demo/单测，避免无 PG 时无法跑通）。生产目标仍是 PostgreSQL 直连，不引入 SQLite。
 
 ---
 
@@ -1124,7 +1002,7 @@ class DynamicConfigStore(ABC):
 | POST | `/v1/monitors/{target_id}/run` | 立即对该端点执行一轮检测 |
 | GET | `/v1/plugins` | 列出已加载插件（kind/name） |
 | POST | `/v1/plugins/reload` | 重新发现插件（pick up 新安装的第三方包） |
-| POST | `/v1/config/reload` | 重新加载检测规则（从 MySQL `domain_config`） |
+| POST | `/v1/config/reload` | 重新加载检测规则（从 PG `domain_config`） |
 
 > **多租户**：所有 `/v1/*` 接口通过请求头 `X-Tenant-Id` 携带租户（缺省 `default`）。配置写入（`/v1/monitors`）、规则加载、查询（`/v1/problems`）、执行（`/v1/alerts/run`、`/v1/monitors/{id}/run`）均按该头隔离；`tenant_id` 由服务端从请求头注入，不信任客户端 body 中的值。
 
@@ -1161,7 +1039,7 @@ def create_app(settings) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
     app.state.settings = settings
     app.state.registry = PluginRegistry().load()
-    app.state.storage = build_storage(settings)     # MySQLRecordStore / InMemory
+    app.state.storage = build_storage(settings)     # PGRecordStore / InMemory
     app.include_router(api_router)
     return app
 

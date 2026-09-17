@@ -5,7 +5,7 @@
 - ``miss_rounds``：连续未出现轮数，仅用于 Reconciler 自动关单（读 miss 不清零字段）。
 - ``DetectionStateStore``（ABC）：M5 ``l3_verify`` 读写持续性、``run_domain`` sweep miss。
 - ``InMemoryDetectionStateStore``：单测/demo 真源。
-- ``MySQLDetectionStateStore``：``state_value`` 存 JSON，sweep 用 ``JSON_SET`` 增量。
+- ``PGDetectionStateStore``：``state_value`` 存 JSONB，sweep 用 ``jsonb_set`` 增量。
 
 每方法入口校验 ``tenant_id`` 非空（多租户隔离硬约束）。
 """
@@ -100,7 +100,7 @@ def _iso(value: datetime) -> str:
     return value.isoformat()
 
 
-class MySQLDetectionStateStore(DetectionStateStore):
+class PGDetectionStateStore(DetectionStateStore):
     def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
 
@@ -140,8 +140,8 @@ class MySQLDetectionStateStore(DetectionStateStore):
             }
         )
         await self._pool.execute(
-            "INSERT INTO detection_state (tenant_id, domain, state_key, state_value) VALUES (%s, %s, %s, %s) AS new "
-            "ON DUPLICATE KEY UPDATE state_value=new.state_value",
+            "INSERT INTO detection_state (tenant_id, domain, state_key, state_value) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (tenant_id, domain, state_key) DO UPDATE SET state_value = EXCLUDED.state_value",
             (tenant_id, domain, key, state_value),
         )
 
@@ -155,9 +155,15 @@ class MySQLDetectionStateStore(DetectionStateStore):
             if key in seen_keys:
                 continue
             # miss 只累计 miss_rounds；consecutive_rounds 不清零（累计出现语义）
+            # 路径必须是 PG 的数组形态 '{miss_rounds}'。写成 MySQL 的 '$.miss_rounds' 不会
+            # 报错——它会创建一个**名为 "$.miss_rounds" 的新键**，于是 miss 计数永远停在
+            # 原值、reconcile 的自动关单静默失效。
+            # COALESCE(...,0) 也是必需的：键缺失时 (NULL)::int + 1 得 NULL，to_jsonb(NULL)
+            # 与 jsonb_set(..., NULL) 都是 strict 返回 NULL，会把 NOT NULL 的 state_value
+            # 写成 NULL → 23502。
             await self._pool.execute(
-                "UPDATE detection_state SET state_value=JSON_SET(state_value, "
-                "'$.miss_rounds', JSON_EXTRACT(state_value, '$.miss_rounds') + 1) "
+                "UPDATE detection_state SET state_value = jsonb_set(state_value, '{miss_rounds}', "
+                "to_jsonb(COALESCE((state_value->>'miss_rounds')::int, 0) + 1)) "
                 "WHERE tenant_id=%s AND domain=%s AND state_key=%s",
                 (tenant_id, domain, key),
             )

@@ -2,7 +2,7 @@
 
 - ``DomainConfigStore``（ABC）：M5 每轮加载规则、M6 写入校验。
 - ``InMemoryDomainConfigStore``：单测/demo 真源。
-- ``MySQLDomainConfigStore``：生产实现。
+- ``PGDomainConfigStore``：生产实现。
 
 行结构：``{"domain", "config"(JSON→dict), "enabled", "version"}``。
 """
@@ -13,15 +13,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from ..models.config import DomainConfig
-from .connection import ConnectionPool, _as_json
-
-
-def _decode_json(value: Any) -> Any:
-    import json
-
-    if isinstance(value, (dict, list)):
-        return value
-    return json.loads(value)
+from .connection import ConnectionPool, _as_json, _decode_json
 
 
 def _dump(config: DomainConfig | dict) -> dict:
@@ -95,7 +87,7 @@ class InMemoryDomainConfigStore(DomainConfigStore):
         ]
 
 
-class MySQLDomainConfigStore(DomainConfigStore):
+class PGDomainConfigStore(DomainConfigStore):
     def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
 
@@ -115,23 +107,27 @@ class MySQLDomainConfigStore(DomainConfigStore):
     async def upsert(self, tenant_id: str, domain: str, config: DomainConfig) -> int:
         if not tenant_id:
             raise ValueError("tenant_id is required")
-        await self._pool.execute(
-            "INSERT INTO domain_config (tenant_id, domain, config, enabled) VALUES (%s, %s, %s, 1) AS new "
-            "ON DUPLICATE KEY UPDATE config=new.config, enabled=new.enabled, version=version+1",
+        # RETURNING 一步拿到 version，省掉 MySQL 版随后的那条 SELECT。
+        # 注意 version 的递增用的是**表名限定**的旧值（PG 的 DO UPDATE 里右侧引用表名即更新前的
+        # 行），不能写成 EXCLUDED.version + 1 —— 那会变成「每次都是 2」。
+        version = await self._pool.execute_returning(
+            "INSERT INTO domain_config (tenant_id, domain, config, enabled) VALUES (%s, %s, %s, 1) "
+            "ON CONFLICT (tenant_id, domain) DO UPDATE SET "
+            "config = EXCLUDED.config, enabled = EXCLUDED.enabled, "
+            "version = domain_config.version + 1 "
+            "RETURNING version",
             (tenant_id, domain, _as_json(_dump(config))),
         )
-        row = await self._pool.fetchone(
-            "SELECT version FROM domain_config WHERE tenant_id=%s AND domain=%s", (tenant_id, domain)
-        )
-        return int(row[0]) if row is not None else 1
+        return int(version) if version is not None else 1
 
     async def seed(self, tenant_id: str, seed: list[dict]) -> None:
         if not tenant_id:
             raise ValueError("tenant_id is required")
         for item in seed:
             await self._pool.execute(
-                "INSERT INTO domain_config (tenant_id, domain, config, enabled) VALUES (%s, %s, %s, %s) AS new "
-                "ON DUPLICATE KEY UPDATE config=new.config, enabled=new.enabled",
+                "INSERT INTO domain_config (tenant_id, domain, config, enabled) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (tenant_id, domain) DO UPDATE SET "
+                "config = EXCLUDED.config, enabled = EXCLUDED.enabled",
                 (tenant_id, item["id"], _as_json(item["config"]), 1 if item.get("enabled", True) else 0),
             )
 

@@ -1,6 +1,6 @@
 """UC-2.2/2.3/2.4 problem_record 落库：新开 / 追加去重 / 已解决复发开新单。
 
-以 InMemoryRecordStore 为单测真源（MySQL 实现语义一致，生产用原子去重）。
+以 InMemoryRecordStore 为单测真源（PG 实现语义一致，生产用原子去重）。
 """
 
 from datetime import datetime, timezone

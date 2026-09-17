@@ -2,7 +2,7 @@
 
 - ``DynamicConfigStore``（ABC）：M5 ``build_context`` 每轮从表载入四类动态配置。
 - ``InMemoryDynamicConfigStore``：单测/demo 真源（``seed_*`` 预置行）。
-- ``MySQLDynamicConfigStore``：生产实现，按租户过滤、只取 enabled 黑名单。
+- ``PGDynamicConfigStore``：生产实现，按租户过滤、只取 enabled 黑名单。
 
 每方法入口校验 ``tenant_id`` 非空（多租户隔离硬约束）。
 """
@@ -219,7 +219,7 @@ class InMemoryDynamicConfigStore(DynamicConfigStore):
         table[group_key] = {"fpr": round(new_fpr, 4), "total": new_total}
 
 
-class MySQLDynamicConfigStore(DynamicConfigStore):
+class PGDynamicConfigStore(DynamicConfigStore):
     def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
 
@@ -235,7 +235,7 @@ class MySQLDynamicConfigStore(DynamicConfigStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         rows = await self._pool.fetchall(
-            "SELECT domain, service, `signal`, reason FROM suppress_blacklist "
+            "SELECT domain, service, \"signal\", reason FROM suppress_blacklist "
             "WHERE tenant_id=%s AND enabled=1",
             (tenant_id,),
         )
@@ -263,9 +263,9 @@ class MySQLDynamicConfigStore(DynamicConfigStore):
     async def create_maintenance_window(self, tenant_id: str, window: dict) -> dict:
         if not tenant_id:
             raise ValueError("tenant_id is required")
-        window_id = await self._pool.execute_lastid(
+        window_id = await self._pool.execute_returning(
             "INSERT INTO maintenance_window (tenant_id, service, start_at, end_at, reason) "
-            "VALUES (%s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             (tenant_id, window["service"], window["start_at"], window["end_at"], window.get("reason")),
         )
         return {
@@ -322,9 +322,9 @@ class MySQLDynamicConfigStore(DynamicConfigStore):
     async def create_blacklist(self, tenant_id: str, entry: dict) -> dict:
         if not tenant_id:
             raise ValueError("tenant_id is required")
-        entry_id = await self._pool.execute_lastid(
-            "INSERT INTO suppress_blacklist (tenant_id, domain, service, `signal`, reason, enabled) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+        entry_id = await self._pool.execute_returning(
+            "INSERT INTO suppress_blacklist (tenant_id, domain, service, \"signal\", reason, enabled) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
             (
                 tenant_id,
                 entry.get("domain", "application"),
@@ -348,7 +348,7 @@ class MySQLDynamicConfigStore(DynamicConfigStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         rows = await self._pool.fetchall(
-            "SELECT id, domain, service, `signal`, reason, enabled FROM suppress_blacklist WHERE tenant_id=%s",
+            "SELECT id, domain, service, \"signal\", reason, enabled FROM suppress_blacklist WHERE tenant_id=%s",
             (tenant_id,),
         )
         return [
@@ -373,7 +373,7 @@ class MySQLDynamicConfigStore(DynamicConfigStore):
                 f"UPDATE suppress_blacklist SET {sets_sql} WHERE tenant_id=%s AND id=%s", tuple(args)
             )
         row = await self._pool.fetchone(
-            "SELECT id, domain, service, `signal`, reason, enabled FROM suppress_blacklist "
+            "SELECT id, domain, service, \"signal\", reason, enabled FROM suppress_blacklist "
             "WHERE tenant_id=%s AND id=%s",
             (tenant_id, entry_id),
         )
@@ -395,13 +395,22 @@ class MySQLDynamicConfigStore(DynamicConfigStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         fp_inc = 1 if false_positive else 0
-        # 单语句原子回写：total+1、false_positive 按判定 +1、fpr 重算（fpr = 累计误报 / 累计判定）
+        # 单语句原子回写：total+1、false_positive 按判定 +1、fpr 重算（fpr = 累计误报 / 累计判定）。
+        # 与 InMemoryDynamicConfigStore.write_fpr 的公式一致。
+        #
+        # 两个 PG 专属陷阱：
+        #   1. `::numeric` 不能省。PG 的 `/` 在 bigint/bigint 上是**整数除法**（MySQL 的 `/`
+        #      恒返回 DECIMAL），不加会让 fpr 恒为 0 或 1 —— 不报错，但 L3 的误报率闸门
+        #      会静默失效。
+        #   2. 右侧的 fpr_table.x 限定不能改成 EXCLUDED.x。PG 的 DO UPDATE 里表名限定取
+        #      **更新前的行**（正是这里需要的），EXCLUDED 是本次插入值 —— 写成
+        #      `EXCLUDED.false_positive_cnt + %s` 会变成 fp_inc + fp_inc，累计值就错了。
         await self._pool.execute(
             "INSERT INTO fpr_table (tenant_id, group_key, false_positive_cnt, total_cnt, fpr) "
             "VALUES (%s, %s, %s, 1, %s) "
-            "ON DUPLICATE KEY UPDATE "
-            "total_cnt = total_cnt + 1, "
-            "false_positive_cnt = false_positive_cnt + %s, "
-            "fpr = (false_positive_cnt + %s) / (total_cnt + 1)",
+            "ON CONFLICT (tenant_id, group_key) DO UPDATE SET "
+            "total_cnt = fpr_table.total_cnt + 1, "
+            "false_positive_cnt = fpr_table.false_positive_cnt + %s, "
+            "fpr = (fpr_table.false_positive_cnt + %s)::numeric / (fpr_table.total_cnt + 1)",
             (tenant_id, group_key, fp_inc, 1.0 if false_positive else 0.0, fp_inc, fp_inc),
         )

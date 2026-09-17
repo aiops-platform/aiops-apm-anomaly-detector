@@ -1,17 +1,22 @@
 # UC-7.4 一键演示环境（本机无 docker → 写出待补跑）。
-#   docker compose up --build -d mysql mock-source apm-alert
+#   docker compose up --build -d postgres mock-source apm-alert
 #   docker compose run --rm apm-alert python seed.py
 #   docker compose up -d prometheus
+#
+# M8：原 mysql:8.0 服务换成 postgres:17 —— 本模块已迁到 PostgreSQL（见 docs/logs/M8.md）。
+# 若要接入 multi-agent-workflow 已有的 PG 实例，删掉本文件的 postgres 服务、把 apm-alert 的
+# APM_DB_HOST 指向那个实例即可；表建在 APM_DB_SCHEMA 指定的独立 schema 下，不会与之互相干扰。
 services:
-  mysql:
-    image: mysql:8.0
+  postgres:
+    image: postgres:17
     environment:
-      MYSQL_ROOT_PASSWORD: root123
-      MYSQL_DATABASE: aiops_apm_runtime
+      POSTGRES_DB: agentflow
+      POSTGRES_USER: agentflow
+      POSTGRES_PASSWORD: agentflow
     ports:
-      - "3306:3306"
+      - "5432:5432"
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot123"]
+      test: ["CMD-SHELL", "pg_isready -U agentflow -d agentflow"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -28,17 +33,24 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     environment:
-      APM_STORAGE_BACKEND: mysql
-      APM_DB_HOST: mysql
-      APM_DB_PORT: "3306"
-      APM_DB_USER: root
-      APM_DB_PASSWORD: root123
-      APM_DB_NAME: aiops_apm_runtime
+      APM_STORAGE_BACKEND: pg
+      APM_DB_HOST: postgres
+      APM_DB_PORT: "5432"
+      APM_DB_USER: agentflow
+      APM_DB_PASSWORD: agentflow
+      APM_DB_NAME: agentflow
+      APM_DB_SCHEMA: aiops_apm_runtime
+      # V9 迁移会种入三个测试床日志端点，其 ES 地址取自这里。
+      # 容器里 localhost 指向容器自己 —— 要连宿主机的 kubectl port-forward，
+      # 需用 host.containers.internal，且 port-forward 要加 --address 0.0.0.0
+      # （kubectl 默认只绑 127.0.0.1，容器访问不到）。没有测试床时留默认即可，
+      # 那三个端点会采不到数据并计入 degraded_sources，不影响其它功能。
+      APM_TESTBED_ES_URL: http://host.containers.internal:19200/app-logs/_search
       APM_ENABLE_SCHEDULER: "true"
     ports:
       - "8000:8000"
     depends_on:
-      mysql:
+      postgres:
         condition: service_healthy
     command: >
       sh -c "python -m aiops_apm.migrations.runner &&

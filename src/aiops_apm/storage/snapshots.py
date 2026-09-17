@@ -2,7 +2,7 @@
 
 - ``SnapshotStore``（ABC）：采集器把一轮信号写入原始快照。
 - ``InMemorySnapshotStore``：单测/demo 真源。
-- ``MySQLSnapshotStore``：生产实现。
+- ``PGSnapshotStore``：生产实现。
 
 ``write`` 接受 ``MetricSignal`` / ``LogSignal``（Pydantic 模型），
 按 ``kind`` 分派到不同的列（metric 行：metric/value/labels；log 行：level/message/signature）。
@@ -42,7 +42,7 @@ class InMemorySnapshotStore(SnapshotStore):
         return len(signals)
 
 
-class MySQLSnapshotStore(SnapshotStore):
+class PGSnapshotStore(SnapshotStore):
     def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
 

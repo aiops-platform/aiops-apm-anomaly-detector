@@ -34,7 +34,7 @@ async def ready(request: Request) -> JSONResponse:
     """就绪探针：检查 DB 连接与插件加载状态。
 
     M2 起在 lifespan 构建 app.state.storage（fail-fast，连不上 DB 直接启动失败）；
-    db 反映运行时真实连接状态（memory 恒可用，mysql 走连接池探活，DB 挂了为 False）。
+    db 反映运行时真实连接状态（memory 恒可用，pg 走连接池探活，DB 挂了为 False）。
     M4 起在 lifespan 构建 app.state.registry（插件 registry），plugins 反映其加载状态。
     """
     state = request.app.state

@@ -13,12 +13,16 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # ---- 数据库（M2 起生效，M0 仅为占位）----
+    # ---- 数据库（PostgreSQL）----
+    # 默认值对齐 multi-agent-workflow 的 docker compose（postgres:17，db/user 均为 agentflow）。
+    # 本模块的表建在 db_name 库内的 **独立 schema** db_schema 下，与 agentflow 自己在 public
+    # 里的表隔离——这是 MySQL「单 schema aiops_apm_runtime」在 PG 下的对应物。
     db_host: str = "127.0.0.1"
-    db_port: int = 3306
-    db_user: str = "root"
+    db_port: int = 5432
+    db_user: str = "agentflow"
     db_password: str = ""
-    db_name: str = "aiops_apm_runtime"
+    db_name: str = "agentflow"
+    db_schema: str = "aiops_apm_runtime"
 
     # ---- 调度器 ----
     scheduler_tick_sec: float = 1.0
@@ -69,10 +73,17 @@ class Settings(BaseSettings):
     # 缺省用本项；仍为空则回退 record.service。APM_DIAGNOSE_REPO 可覆盖。
     diagnose_repo: str = ""
 
+    # ---- 测试床（V9 迁移 seed 的日志监控端点用）----
+    # 三个服务（order/warranty/gateway）的日志都经 filebeat 进 Elasticsearch，
+    # 本机是 kubectl port-forward 出来的 19200。**容器里 localhost 指向容器自己**，
+    # 所以从 compose 里跑要改成 host.containers.internal:19200。
+    # 迁移是静态 SQL 读不到环境变量，由 MigrationRunner 以 GUC 注入（见 runner.py）。
+    testbed_es_url: str = "http://localhost:19200/app-logs/_search"
+
     # ---- 开关 ----
     enable_llm_summary: bool = False
     enable_scheduler: bool = True
-    # mysql（生产）/ memory（本地 demo/单测，不引入 SQLite）
-    storage_backend: str = "mysql"
+    # pg（生产，PostgreSQL）/ memory（本地 demo/单测，不引入 SQLite）
+    storage_backend: str = "pg"
 
     model_config = SettingsConfigDict(env_prefix="APM_", extra="ignore", env_file=".env")

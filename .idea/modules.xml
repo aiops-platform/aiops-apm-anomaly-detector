@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/aiops-apm-anomaly-detector.iml" filepath="$PROJECT_DIR$/.idea/aiops-apm-anomaly-detector.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/p95-latency-detector.iml" filepath="$PROJECT_DIR$/.idea/p95-latency-detector.iml" />
     </modules>
   </component>
 </project>

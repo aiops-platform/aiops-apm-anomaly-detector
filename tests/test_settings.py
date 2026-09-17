@@ -7,9 +7,12 @@ def test_defaults() -> None:
     # _env_file=None：隔离本地 .env（如 APM_PORT=7070），断言纯默认值
     s = Settings(_env_file=None)
     assert s.port == 8000
-    assert s.db_name == "aiops_apm_runtime"
+    # 默认值对齐 multi-agent-workflow 的 PG（库 agentflow，表建在独立 schema 下）
+    assert s.db_name == "agentflow"
+    assert s.db_schema == "aiops_apm_runtime"
+    assert s.db_port == 5432
     assert s.enable_llm_summary is False
-    assert s.storage_backend == "mysql"
+    assert s.storage_backend == "pg"
 
 
 def test_env_override(monkeypatch) -> None:

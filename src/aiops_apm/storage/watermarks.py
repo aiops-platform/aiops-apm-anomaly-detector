@@ -2,7 +2,7 @@
 
 - ``WatermarkStore``（ABC）：采集器读/推最近采集到的事件时间戳。
 - ``InMemoryWatermarkStore``：单测/demo 真源。
-- ``MySQLWatermarkStore``：生产实现。
+- ``PGWatermarkStore``：生产实现。
 
 行结构：``{"last_ts": datetime}``（按 ``(tenant_id, target_id)`` 唯一）。
 """
@@ -43,7 +43,7 @@ class InMemoryWatermarkStore(WatermarkStore):
         self._rows[(tenant_id, target_id)] = last_ts
 
 
-class MySQLWatermarkStore(WatermarkStore):
+class PGWatermarkStore(WatermarkStore):
     def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
 
@@ -59,7 +59,7 @@ class MySQLWatermarkStore(WatermarkStore):
         if not tenant_id:
             raise ValueError("tenant_id is required")
         await self._pool.execute(
-            "INSERT INTO collect_watermark (tenant_id, target_id, last_ts) VALUES (%s, %s, %s) AS new "
-            "ON DUPLICATE KEY UPDATE last_ts=new.last_ts",
+            "INSERT INTO collect_watermark (tenant_id, target_id, last_ts) VALUES (%s, %s, %s) "
+            "ON CONFLICT (tenant_id, target_id) DO UPDATE SET last_ts = EXCLUDED.last_ts",
             (tenant_id, target_id, last_ts),
         )

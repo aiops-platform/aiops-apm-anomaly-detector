@@ -2,7 +2,7 @@
 
 APM（应用性能监控）告警模块：从第三方 API 采集指标/日志，经确定性的 L0–L3 漏斗，产出 `problem_record` 落库，供下游诊断/修复使用。
 
-> 当前状态：**M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）+ M6 调度/多租户/API/恢复闭环 + M7 可观测性/安全加固/交付已完成**（`make lint test dev` 全绿，351 个用例通过）。设计与实现计划见 [`docs/`](docs/)，实现规则见 [`CLAUDE.md`](CLAUDE.md)，实现日志见 [`docs/logs/`](docs/logs/)，归档见 [`docs/archive/`](docs/archive/)。
+> 当前状态：**M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）+ M6 调度/多租户/API/恢复闭环 + M7 可观测性/安全加固/交付 + M8 存储层 PostgreSQL 化已完成**（`make lint test dev` 全绿，493 个常跑用例 + 24 条真库集成用例通过）。设计与实现计划见 [`docs/`](docs/)，实现规则见 [`CLAUDE.md`](CLAUDE.md)，实现日志见 [`docs/logs/`](docs/logs/)，归档见 [`docs/archive/`](docs/archive/)。
 
 ## 实现进度
 
@@ -16,10 +16,11 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
 | M5 | 漏斗 L0–L3 + emit（确定性核心） | ✅ 已完成 | [`docs/logs/M5.md`](docs/logs/M5.md) |
 | M6 | 调度、多租户、API、恢复闭环 | ✅ 已完成 | [`docs/logs/M6.md`](docs/logs/M6.md) |
 | M7 | 可观测性、安全加固、交付 | ✅ 已完成 | [`docs/logs/M7.md`](docs/logs/M7.md) |
+| M8 | 存储层 PostgreSQL 化（MySQL/`aiomysql` → PG/`psycopg3` + 真库集成道） | ✅ 已完成 | [`docs/logs/M8.md`](docs/logs/M8.md) |
 
 > 每完成一个里程碑：在 `docs/logs/<M阶段>.md` 记录实现日志，把已实现章节归档到 `docs/archive/`，并更新本表。
 
-## 已实现（M0–M7）
+## 已实现（M0–M8）
 
 - **M0 工程基座**：
   - 工程骨架：`pyproject.toml`（依赖 + 三个 entry_points 占位）、`Makefile`、`.env.example`、ruff/mypy/pytest/pre-commit
@@ -28,12 +29,12 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
   - `src/aiops_apm/models/`：`signal.py`（Metric/Log/ChangeSignal + `Signal` 判别联合）、`anomaly.py`（Metric/LogAnomaly + `Anomaly`）、`record.py`（`Correlation`/`Verification`/`ProblemRecord` + `group_key`）、`config.py`（检测规则模型，M6 写入校验用）、`fingerprint.py`（`anomaly_key`/`group_key`/`is_same_group` 去重与 L3 持续性真源）
   - `src/aiops_apm/plugins/base.py`：`Plugin`/`Collector`/`Detector`/`Suppressor` 抽象基类 + `build()` 工厂（M3/M4 实现具体插件）
 - **M2 持久化与迁移**（结果侧地基，M5 开单即可落库）：
-  - `src/aiops_apm/migrations/`：`runner.py`（`MigrationRunner` 幂等迁移：schema_versions 追踪、按版本顺序执行）+ `V1__init_tables.sql`（单 schema `aiops_apm_runtime` 12 张表，problem_record 含 `severity`/`open_group_key` 生成列 + UNIQUE 原子去重）
-  - `src/aiops_apm/storage/`：`connection.py`（`ConnectionPool` aiomysql）、`records.py`（`RecordStore` + InMemory/MySQL，`write_or_append` 同 `group_key` 去重追加）、`domain_config.py`（`DomainConfigStore` + InMemory/MySQL）、`__init__.py`（`Storage` 聚合 + `build_storage(settings)` 按 `storage_backend` 分派）
+  - `src/aiops_apm/migrations/`：`runner.py`（`MigrationRunner` 幂等迁移：schema_versions 追踪、按版本顺序执行）+ `V1__init_tables.sql`（独立 schema `aiops_apm_runtime` 12 张表，problem_record 含 `severity`/`open_group_key` 生成列 + UNIQUE 原子去重）
+  - `src/aiops_apm/storage/`：`connection.py`（`ConnectionPool` psycopg3，连接串固定 `search_path` + `TimeZone=UTC`）、`records.py`（`RecordStore` + InMemory/PG，`write_or_append` 同 `group_key` 去重追加）、`domain_config.py`（`DomainConfigStore` + InMemory/PG）、`__init__.py`（`Storage` 聚合 + `build_storage(settings)` 按 `storage_backend` 分派）
   - `src/aiops_apm/config/`：`loader.py`（`DomainConfigLoader`：DB 主源 → 空表 seed → last-known-good 回退）+ `domains.yaml`（application 域 seed）
-  - `make migrate` 建库建表；storage 挂进 lifespan，`/ready` 真实反映 DB 连接状态
+  - `make migrate` 建 schema 建表；storage 挂进 lifespan，`/ready` 真实反映 DB 就绪状态（schema 缺失时 fail-fast，见 §2.5）
 - **M3 采集层与出站网关**（数据供给上游）：
-  - `src/aiops_apm/collectors/`：`_gateway.py`（`OutboundGateway` 出站安全网关：SSRF IP 字面量拦截 + scheme 白名单 + secret 引用校验/解析 `${env:X}`/`${vault:...}`）、`_http_client.py`（`SharedHttpClient` httpx 共享客户端：超时/连接池/禁跳转/响应体大小限制）、`_field_mapping.py`（`FieldMapper`：点路径 + `value[1]` 数组索引抽取、ISO/unix 时间戳解析）、`http_metrics.py`/`http_logs.py`/`mock.py`（内置采集器：水位线下推 `params["start"]` → 请求 → 映射 → 幂等去重 → 水位线推进 → 写 `signal_snapshot`）、`__init__.py`（`collector_for` 按 signal_type+source_type 分派）
+  - `src/aiops_apm/collectors/`：`_gateway.py`（`OutboundGateway` 出站安全网关：SSRF IP 字面量拦截 + scheme 白名单 + secret 引用校验/解析 `${env:X}`/`${vault:...}`）、`_http_client.py`（`SharedHttpClient` httpx 共享客户端：超时/连接池/禁跳转/响应体大小限制）、`_field_mapping.py`（`FieldMapper`：点路径 + `value[1]` 数组索引抽取、ISO/unix 时间戳解析）、`http_metrics.py`/`http_logs.py`/`mock.py`（内置采集器：水位线下推 `params["start"]` → 请求 → 映射 → 幂等去重 → 水位线推进 → 写 `signal_snapshot`；`http_logs` 对 ELK 源另支持 `time_field`/`service_field` 两个开关——设了就把时间窗与服务过滤放进 **POST body** 的 ES 查询 DSL，因为 ES 的日期 range 只认 body，写进 URL 参数会 400）、`__init__.py`（`collector_for` 按 signal_type+source_type 分派）
   - `src/aiops_apm/storage/`：`monitor_targets.py`（`MonitorTargetStore` CRUD + 软删 + `load_all_targets`）、`snapshots.py`（`SnapshotStore` 写 `signal_snapshot`）、`watermarks.py`（`WatermarkStore` 增量采集水位线）
   - `src/aiops_apm/signature.py`：`signature(log, n_frames=3)` 堆栈签名纯函数（L1 聚合共享）；`LogSignal` 增可选字段 `signature`
   - `src/aiops_apm/router/`：`deps.py`（`get_tenant_id` 从 `X-Tenant-Id` 头解析）、`monitors.py`（`/v1/monitors` CRUD + `POST /{id}/test` 连通性测试）
@@ -54,23 +55,30 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
   - `src/aiops_apm/poller.py` — `run_round`：按 `(tenant, domain)` 组并行 collect（单 target 异常 → `degraded_sources` 不崩溃）→ `run_domain`
   - `src/aiops_apm/reconcile.py` — `Reconciler`：周期性扫描 pending 单，全部 anomaly_key miss 达标 → `resolve(reason="auto")` 自动关单
   - `src/aiops_apm/auth/` — `AuthMiddleware` + `Principal`：**配置了才强制**（`APM_API_KEYS` 非空才挂），无 key→401、跨租户→403、master key admin；未配置 = 放行
-  - `src/aiops_apm/storage/lease.py` — `LeaseStore` ABC + InMemory + MySQL（原子接管 SQL）
+  - `src/aiops_apm/storage/lease.py` — `LeaseStore` ABC + InMemory + PG（`ON CONFLICT ... RETURNING` 原子接管 SQL）
   - `src/aiops_apm/summary.py` — `SummaryProvider` 钩子（模板默认，`enable_llm_summary` 开关，不接真实 LLM）
   - `src/aiops_apm/router/` — `alerts.py`（`POST /v1/alerts/run` 全量/域过滤）、`problems.py`（`/v1/problems` 查询 + resolve）、`config.py`（reload + 域配置读写）、`maintenance.py`（维护窗口 CRUD）、`blacklist.py`（黑名单 CRUD）；`monitors.py` 加 `POST /{id}/run` 手动单跑
   - §13 用例 2 端到端：related + high metric + high log → critical（`test_uc62_combo_critical.py`）；reconcile 自动关单、跨租户 403、多副本 lease 全部测试覆盖（原 225 不回归，新增 62 → 287）
 - **M7 可观测性、安全加固、交付**（Prometheus 指标 + 轮次审计 + 安全审计日志 + 配置校验 + fpr 回写 + Docker/压测，原 287 不回归，新增 64 → 351）：
   - `src/aiops_apm/metrics.py` — Prometheus 7 类指标（round_total/success、records_created、degraded_sources、suppressed_total、false_positive_rate Gauge、round_duration Histogram）；`/metrics` 端点暴露；`poller.run_round` 每轮打点（`test_metrics.py`）
-  - `src/aiops_apm/storage/rounds.py` + `migrations/V3__detection_round_domain.sql` — `RoundStore`（InMemory/MySQL）读写 `detection_round`，`poller` 每轮 create running → success/partial/failed
+  - `src/aiops_apm/storage/rounds.py` + `migrations/V3__detection_round_domain.sql` — `RoundStore`（InMemory/PG）读写 `detection_round`，`poller` 每轮 create running → success/partial/failed
   - `src/aiops_apm/router/audit.py` — `GET /v1/audit/rounds`（domain/status/limit 过滤）+ `GET /v1/audit/suppressed`（从轮次 timeline details 摊平）
   - `src/aiops_apm/audit.py` — `SecurityAudit` 五类结构化审计日志（auth/gateway/plugin/config/round），`APM_AUDIT_ENABLED` 开关，不记明文凭据（key 只留 sha256 前缀、URI 只留 host:port）
   - `src/aiops_apm/collectors/_gateway.py` — SSRF **DNS 二次校验**（`_resolve_ips`，解析 IP 命中私网拒绝，`gaierror` fail-closed 拒绝，防 DNS rebinding）
   - `src/aiops_apm/config/validator.py` — `validate_domain_config` detector/suppressor 参数表驱动校验；`PUT /v1/config/{domain}` 非法 → 400 `CONFIG_ERROR`
   - `src/aiops_apm/storage/dynamic_config.py` `write_fpr` + `POST /v1/problems/{id}/resolve` 支持 `{"false_positive": true}` 误报回写 → `fpr_table` + FPR Gauge 重算
-  - `docker/` — Dockerfile（多阶段 uvicorn）+ docker-compose（mysql + mock-source + apm-alert + prometheus）+ seed.py + custom_detector(p95_latency 第三方插件示例) + demo.py + locustfile.py + prometheus.yml；`Makefile` `docker-up`/`docker-down`/`loadtest`（本机无 docker/locust → 写出待补跑）
+  - `docker/` — Dockerfile（多阶段 uvicorn）+ docker-compose（postgres + mock-source + apm-alert + prometheus）+ seed.py + custom_detector(p95_latency 第三方插件示例) + demo.py + locustfile.py + prometheus.yml；`Makefile` `docker-up`/`docker-down`/`loadtest`（本机无 docker/locust → 写出待补跑）
+- **M8 存储层 PostgreSQL 化**（把 MySQL/`aiomysql` 整体换成 PostgreSQL/`psycopg3`，复用 `multi-agent-workflow` 已有的 PG 实例；踩坑与方言映射见 [`docs/logs/M8.md`](docs/logs/M8.md)，改存储层前务必先读）：
+  - `src/aiops_apm/storage/connection.py` — `ConnectionPool` 重写为 psycopg3 异步池；`execute_lastid` → `execute_returning`（psycopg3 无 `cursor.lastrowid`）；`_as_json` 返回 `Jsonb`；`release()` 显式 rollback（PG 事务出错后进 aborted 态，不清理会级联失败）
+  - `src/aiops_apm/migrations/V1..V8__*.sql` — 就地改写为 PG 方言（`IDENTITY` 取代 `AUTO_INCREMENT`、`JSONB`、`TIMESTAMP(3)`、`COMMENT ON`、独立 `CREATE INDEX IF NOT EXISTS`）；`runner.py` 的语句切分器新增 `$$` 美元引用支持（触发器函数体里的 `;` 与撇号会切碎语句）
+  - 10 个 `MySQL*Store` 改名 `PG*Store`；`storage_backend` 由 `mysql` 改为 `pg`（`mysql` 已下线，传它会抛 `ValueError`）
+  - **两个会话参数在连接串里钉死**：`search_path`（PG 没有 `USE`）与 `TimeZone=UTC`（时间列是 naive `TIMESTAMP(3)`，会话时区非 UTC 会让 DB 生成的时间与应用写入的 UTC 值差若干小时且不报错）
+  - `tests/test_pg_integration.py` — **新增真库集成道**，`APM_TEST_PG_DSN` 门控（未设则 skip，`make test` 不需要 PG）。覆盖字符串断言抓不到的东西：fpr 整数除法、jsonb 路径、时区一致性、租约守卫、`search_path` 是否覆盖每条连接
+  - `make test-pg APM_TEST_PG_DSN=postgresql://agentflow:agentflow@127.0.0.1:5432/agentflow` 跑真库；493 常跑 + 24 集成 = 517
 
 ## 启动与快速上手
 
-> 本节适用于所有里程碑（M0–M7 都这样启动与调用）。每完成一个里程碑会补充该阶段的启动附加步骤（如 M2 的 `make migrate` 建表、M6 的调度器开关 `APM_ENABLE_SCHEDULER`）与接口调用示例。
+> 本节适用于所有里程碑（M0–M8 都这样启动与调用）。每完成一个里程碑会补充该阶段的启动附加步骤（如 M2 的 `make migrate` 建表、M6 的调度器开关 `APM_ENABLE_SCHEDULER`）与接口调用示例。
 
 ### 1. 配置环境变量
 
@@ -84,26 +92,67 @@ cp .env.dev .env
 
 ### 2. 安装依赖（首次）
 
+> **前置：Python >= 3.10**（见 `pyproject.toml` 的 `requires-python`）。macOS 自带的 `python3` 是 3.9，
+> 既低于该要求，其内置 pip（< 21.3）也不支持 PEP 660 可编辑安装，`pip install -e` 会误报
+> `editable mode currently requires a setuptools-based build`——不要用它建 venv。
+
 ```bash
 cd <仓库根目录>
-python3 -m venv .venv
+make install          # 推荐：自动挑选 >=3.10 的解释器、建 .venv、升级 pip 后安装 -e ".[dev]"
+# 需指定解释器时：make install PYTHON=/path/to/python3.12
+
+# 等价的手动方式（注意解释器必须是 3.10+）：
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
 .venv/bin/pip install -e ".[dev]"
-# 或直接 make install
 ```
 
-### 2.5 M2/M3 建库建表（可选，需可用 MySQL）
+### 2.5 初始化数据库（可选；用 `pg` backend 时**必做**）
+
+初始化脚本就是 `src/aiops_apm/migrations/V1..V8__*.sql`（M8 起为 PostgreSQL 方言），由迁移执行器按版本号幂等应用，**不需要手工执行任何 SQL**。
 
 ```bash
-# 在 .env 配置 APM_DB_HOST / APM_DB_PORT / APM_DB_USER / APM_DB_PASSWORD / APM_DB_NAME
+# ① 先有一个可用的 PostgreSQL，且 APM_DB_NAME 指向的「库」已经存在。
+#    复用 multi-agent-workflow 的实例最省事（它的 compose 会自动建 agentflow 库）：
+#      cd ../multi-agent-workflow && docker-compose up -d postgres
+#    若指向别处的全新 PG，需要先建库（PG 不能在事务里 CREATE DATABASE，所以这步不归迁移器管）：
+#      createdb -h 127.0.0.1 -U agentflow agentflow
+
+# ② 建 schema + 建表（幂等：重复执行不报错、不重复建）
 make migrate
-# → 幂等建齐 aiops_apm_runtime 库的 12 张表（V1）+ collect_watermark（V2，M3 增量采集水位线）
-#   二次执行不报错、不重复建
-# 若未配置凭据/未连 MySQL，会报连接错误；不影响 memory backend 的 make dev
+# → CREATE SCHEMA aiops_apm_runtime（若不存在）
+# → 按版本号依次应用 V1..V9，版本记录写进 aiops_apm_runtime.schema_versions
+# → 15 张表：V1 建 12 张；V2 collect_watermark；V5 detection_round_target；V3/V4/V6/V7/V8 补列
+# → V9 种入三个测试床日志监控端点（order/warranty/gateway-service），随迁移一并就位
 ```
 
-### 2.6 数据库表说明（`aiops_apm_runtime` 单 schema，共 15 张表）
+**连接参数**（`.env`，默认值已对齐 multi-agent-workflow 的 compose，通常无需改）：
 
-> 所有业务表均带 `tenant_id` 列做多租户隔离。V1 建齐 12 张表；V2–V7 增量补表/加列；
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `APM_DB_HOST` / `APM_DB_PORT` | `127.0.0.1` / `5432` | |
+| `APM_DB_USER` / `APM_DB_PASSWORD` | `agentflow` / 空 | |
+| `APM_DB_NAME` | `agentflow` | **库**，必须已存在 |
+| `APM_DB_SCHEMA` | `aiops_apm_runtime` | **schema**，由迁移器自建；与同库其它服务的表隔离 |
+
+**跳过这步会怎样**：服务会**启动失败并明确告诉你**（fail-fast）：
+
+```
+RuntimeError: PostgreSQL 连上了，但在 search_path（'aiops_apm_runtime'）上看不到
+aiops_apm_runtime.problem_record —— 多半是还没跑迁移。请先执行 `make migrate`。
+```
+
+> 注意 PG 与 MySQL 的一个关键差别：MySQL 时代「库不存在」会让连接本身失败，所以天然 fail-fast；
+> PG 下库是共享的，**schema 缺失时连接照样成功**。因此 `build_storage` 会额外探一次核心表，
+> 避免出现「服务起来了、`/ready` 报 ready、但每个查询都 500」——那在 k8s 下会把流量打到坏 Pod 上。
+
+> 本模块的建表**不在** `multi-agent-workflow/docker/init/` 里——那个目录只管 agentflow 自己的表。
+> APM 的表由本模块自己的迁移器创建；`docker/docker-compose.yml` 里 `apm-alert` 的启动命令
+> 也是先跑 `python -m aiops_apm.migrations.runner` 再起 uvicorn。
+
+### 2.6 数据库表说明（`APM_DB_NAME` 库内的独立 schema `aiops_apm_runtime`，共 15 张表）
+
+> 所有业务表均带 `tenant_id` 列做多租户隔离。V1 建齐 12 张表；V2–V8 增量补表/加列；V9 是**首个数据类迁移**（种入三个测试床日志端点，`ON CONFLICT DO NOTHING` 幂等）；
 > `schema_versions` 由 `MigrationRunner` 自动创建，用于 `make migrate` 幂等版本追踪，不计入版本化迁移。
 
 | 表名 | 来源版本 | 用途说明 |
@@ -113,16 +162,18 @@ make migrate
 | `domain_config` | V1 | 域检测规则（`config` JSON 存 detectors/suppressors/correlation/verify），`enabled` + `version` 版本号；`UNIQUE (tenant_id, domain)` |
 | `monitor_target` | V1✅ | **监控端点配置**（回答「监控谁、从哪采、多快采」） ✅ |
 | `maintenance_window` | V1 | L0 维护窗口：`(service, start_at, end_at)` 时间窗内的信号被抑制 |
-| `suppress_blacklist` | V1 | L0 黑名单：按 `(domain, service, signal)` 匹配的信号被抑制（`signal` 为 MySQL 保留字，DDL 用反引号） |
+| `suppress_blacklist` | V1 | L0 黑名单：按 `(domain, service, signal)` 匹配的信号被抑制（`signal` 在 PG 下用双引号标识符 `"signal"`） |
 | `fpr_table` | V1 | 误报率统计（`group_key` 维度 `false_positive_cnt`/`total_cnt`/`fpr`），L3 误报率闸门 + `POST /resolve {"false_positive":true}` 误报回写落库 |
 | `record_seq` | V1 | `record_id` 原子取号（按 `seq_date` 维护 `next_seq`，`PR-YYYYMMDD-NNNN` 每日自增） |
-| `scheduler_lease` | V1 | 多副本选主：`scheduler_lease` 行锁 + `expires_at` TTL 续约 + 崩溃自动接管（MySQL 原子 `INSERT...ON DUPLICATE KEY UPDATE`） |
+| `scheduler_lease` | V1 | 多副本选主：`scheduler_lease` 行锁 + `expires_at` TTL 续约 + 崩溃自动接管（PG 原子 `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`） |
 | `signal_snapshot` | V1✅ | 原始信号快照（metric/log 采集落库），`signature` 为日志堆栈签名（V7 由 VARCHAR(255) 加宽至 VARCHAR(1024)）。量大，建议按 `snapshot_ts` 分区/定期归档 |
-| `detection_state` | V1 | 检测状态：`state_key`（如 `previous_keys`）存 `state_value` JSON，L1 环比基线 / L3 持续性（consecutive/miss）计数 |
+| `detection_state` | V1 | 检测状态：`state_key`（如 `previous_keys`）存 `state_value` JSONB，L1 环比基线 / L3 持续性（consecutive/miss）计数 |
 | `detection_round` | V1✅ | 轮次审计主表 ✅ |
 | `collect_watermark` | V2 | **采集水位线**：每个 `monitor_target` 最近采集到的事件时间戳，`PRIMARY KEY (tenant_id, target_id)`，下轮下推 `start=last_ts` 实现增量采集 |
 | `detection_round_target` | V5✅ | 轮次审计字表 - taget ✅ |
 | `schema_versions` | 迁移自建 | 迁移版本追踪（`version` + `applied_at`），`make migrate` 据此幂等跳过已应用版本 |
+
+**V9 种入的三个端点**（`monitor_target`，`log`/`elk`/`application`，60s 间隔）：`MT-0001` order-service、`MT-0002` warranty-service、`MT-0003` gateway-service。它们的日志经 filebeat 进 Elasticsearch（索引 `app-logs`）。ES 地址由 `APM_TESTBED_ES_URL` 经迁移器以 GUC 注入——**容器里 `localhost` 指向容器自己**，从 compose 跑要改成 `host.containers.internal:19200`（且 `kubectl port-forward` 默认只绑 `127.0.0.1`，需加 `--address 0.0.0.0`）。改这三个端点的配置**不要改 V9**（迁移不可变），用 `make seed-testbed` 或管理 API。
 
 ### 3. 启动服务
 
@@ -149,10 +200,10 @@ curl -i http://127.0.0.1:<port>/health
 # → HTTP/1.1 200 OK，body: {"status":"ok"}
 
 # 就绪探针：M2 起 db 反映真实连接状态，M4 起 plugins 反映插件 registry 加载状态。
-#   mysql backend：启动时连不上 DB → fail-fast，进程启动失败退出（不再降级启动）；
+#   pg backend：启动时连不上 DB → fail-fast，进程启动失败退出（不再降级启动）；
 #   运行中 DB 掉线 → db:False；memory backend（demo/单测）db 恒 True。
 curl -i http://127.0.0.1:<port>/ready
-# → 全就绪（memory backend 或 mysql 连上 + registry 已加载）：HTTP/1.1 200 OK
+# → 全就绪（memory backend 或 pg 连上 + registry 已加载）：HTTP/1.1 200 OK
 #   body: {"status":"ready","checks":{"db":true,"plugins":true}}
 # → 运行中 DB 掉线：HTTP/1.1 503 Service Unavailable
 #   body: {"code":"NOT_READY","reason":"{'db': False, 'plugins': True}"}
@@ -278,7 +329,7 @@ curl -i -X POST http://127.0.0.1:<port>/v1/monitors -H "Content-Type: applicatio
 Docker / 压测（本机无 docker/locust 时写出待补跑；环境可用后执行）：
 
 ```bash
-make docker-up      # docker compose up：mysql + mock-source + apm-alert + prometheus
+make docker-up      # docker compose up：postgres + mock-source + apm-alert + prometheus
 make docker-down    # docker compose down
 make loadtest       # locust headless 压测（/v1/problems、POST /v1/alerts/run、/metrics、/v1/audit/rounds）
 ```

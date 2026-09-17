@@ -2,7 +2,7 @@
 
 - ``MonitorTargetStore``（ABC）：M3 端点管理、M6 调度器加载目标。
 - ``InMemoryMonitorTargetStore``：单测/demo 真源。
-- ``MySQLMonitorTargetStore``：生产实现。
+- ``PGMonitorTargetStore``：生产实现。
 
 行结构：``{"target_id", "service", "signal_type", "source_type", "domain",
 "source_config"(dict), "schedule"(dict), "enabled", "created_at", "deleted"}``。
@@ -19,6 +19,10 @@ from typing import Any
 
 from .connection import ConnectionPool, _as_json, _decode_json
 
+# pg_advisory_xact_lock 的命名空间（两参形式的第一参）。PG 的 advisory lock 是**全库共享**
+# 的，而 aiops_apm_runtime 与 agentflow 同库，所以固定一个本项目专属的命名空间避免撞键。
+_TARGET_ID_LOCK_NS = 0x41504D  # "APM"
+
 _PUBLIC_FIELDS = (
     "target_id",
     "service",
@@ -34,7 +38,7 @@ _PUBLIC_FIELDS = (
 
 
 def _public(row: Any) -> dict:
-    """MySQL 行（tuple）转对外 dict；InMemory 已直接存 dict。"""
+    """PG 行（tuple）转对外 dict；InMemory 已直接存 dict。"""
     if isinstance(row, dict):
         return {k: row[k] for k in _PUBLIC_FIELDS}
     return {
@@ -180,36 +184,49 @@ class InMemoryMonitorTargetStore(MonitorTargetStore):
         return tenants
 
 
-class MySQLMonitorTargetStore(MonitorTargetStore):
+class PGMonitorTargetStore(MonitorTargetStore):
     def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
-
-    async def _next_target_id(self, tenant_id: str) -> str:
-        row = await self._pool.fetchone(
-            "SELECT target_id FROM monitor_target WHERE tenant_id=%s ORDER BY id DESC LIMIT 1", (tenant_id,)
-        )
-        return f"MT-{_parse_suffix(row[0]) + 1:04d}" if row else "MT-0001"
 
     async def create(self, tenant_id: str, target: dict) -> dict:
         if not tenant_id:
             raise ValueError("tenant_id is required")
-        target_id = await self._next_target_id(tenant_id)
-        await self._pool.execute(
-            "INSERT INTO monitor_target "
-            "(tenant_id, target_id, service, signal_type, source_type, domain, source_config, schedule, enabled) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (
-                tenant_id,
-                target_id,
-                target["service"],
-                target["signal_type"],
-                target["source_type"],
-                target.get("domain", "application"),
-                _as_json(target["source_config"]),
-                _as_json(target.get("schedule", {"interval_sec": 60})),
-                1 if target.get("enabled", True) else 0,
-            ),
-        )
+        # 「读最大号 → 插入」两步必须原子，否则并发 POST 会各自读到同一个最大号、
+        # 插入同一个 target_id（撞 uk_tenant_target_id 报 23505）。advisory xact lock 是
+        # **事务级**的，随 commit/rollback 自动释放——所以全程用同一个 handle（同一事务），
+        # 不能用 pool 的便捷方法（那会每次拿不同连接，锁不住）。
+        # 用两参形式带命名空间，避免与同库其它服务（agentflow）的 advisory lock 撞键。
+        handle = await self._pool.acquire()
+        try:
+            await handle.execute(
+                "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                (_TARGET_ID_LOCK_NS, tenant_id),
+            )
+            # ORDER BY id DESC 保留软删行占号，维持「MT-NNNN 永不复用」的既有语义
+            row = await handle.fetchone(
+                "SELECT target_id FROM monitor_target WHERE tenant_id=%s ORDER BY id DESC LIMIT 1",
+                (tenant_id,),
+            )
+            target_id = f"MT-{_parse_suffix(row[0]) + 1:04d}" if row else "MT-0001"
+            await handle.execute(
+                "INSERT INTO monitor_target "
+                "(tenant_id, target_id, service, signal_type, source_type, domain, source_config, schedule, enabled) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    tenant_id,
+                    target_id,
+                    target["service"],
+                    target["signal_type"],
+                    target["source_type"],
+                    target.get("domain", "application"),
+                    _as_json(target["source_config"]),
+                    _as_json(target.get("schedule", {"interval_sec": 60})),
+                    1 if target.get("enabled", True) else 0,
+                ),
+            )
+            await handle.commit()
+        finally:
+            await self._pool.release(handle)
         return {**{"target_id": target_id}, **target, "domain": target.get("domain", "application")}
 
     async def list(self, tenant_id: str, *, service: str | None = None, signal_type: str | None = None) -> list[dict]:

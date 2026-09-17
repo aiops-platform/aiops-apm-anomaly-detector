@@ -362,7 +362,7 @@ signals = [
 
 ### 7.1 存在哪
 
-- 生产：MySQL `domain_config.config`（JSON 列）。
+- 生产：PG `domain_config.config`（JSONB 列）。
 - 本地演示 / 单测：内存版存储 `InMemoryDomainConfigStore`（不碰数据库）。
 
 ### 7.2 三种写入方式（任选一种）
@@ -492,7 +492,7 @@ curl -X PUT http://127.0.0.1:7070/v1/config/application \
 
 ---
 
-## 10. 最小代码 demo（同一套逻辑，不依赖 MySQL）
+## 10. 最小代码 demo（同一套逻辑，不依赖数据库）
 
 下面这段和上面 curl 走的是**同一条链路**（store → build_context 自动 load → run_domain）。写法直接取自项目测试 `tests/test_pipeline.py`，是真实可跑的：
 
@@ -510,7 +510,7 @@ from aiops_apm.storage import build_storage
 
 
 async def main():
-    # 内存版存储：不碰 MySQL，最简演示环境
+    # 内存版存储：不碰数据库，最简演示环境
     storage = await build_storage(Settings(_env_file=None, storage_backend="memory"))
     registry = PluginRegistry().load()          # 从 entry_points 加载内置插件
 
