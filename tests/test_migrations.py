@@ -123,7 +123,7 @@ def test_split_statements_handles_named_dollar_tags() -> None:
 def test_load_scripts_parses_version() -> None:
     runner = _runner(FakeConn())
     scripts = runner._load_scripts()
-    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     assert "problem_record" in scripts[0].sql
     assert "collect_watermark" in scripts[1].sql
     assert "detection_round" in scripts[2].sql
@@ -217,6 +217,62 @@ def test_v10_widens_problem_record_service() -> None:
     assert "ALTER TABLE problem_record ALTER COLUMN service TYPE VARCHAR(255)" in sql
 
 
+def test_v11_seeds_live_data() -> None:
+    """V11：把活库快照固化为初始化数据（V9 之后的第二个数据类迁移）。
+
+    本文件由 ``docker/dump_seed_sql.py`` 生成（约 1MB），这里只断言**契约**，不逐行断言数据。
+    真实落库与序列可用性由 ``tests/test_pg_integration.py`` 覆盖（那些断言字符串抓不到）。
+
+    注意：断言用的是 ``_sql_only``（剥掉 ``--`` 之后的）视图，因为**头注释里就解释了**
+    ``scheduler_lease`` 为什么被排除——直接对原文断言 ``not in`` 会被注释带偏。
+    """
+    scripts = _runner(FakeConn())._load_scripts()
+    raw = scripts[10].sql
+    assert scripts[10].version == 11
+    sql = _sql_only(raw)
+
+    # 只种这 9 张表
+    seeded = set(re.findall(r'INSERT INTO "(\w+)"', sql))
+    assert seeded == {
+        "domain_config",
+        "fpr_table",
+        "record_seq",
+        "problem_record",
+        "detection_state",
+        "collect_watermark",
+        "detection_round",
+        "detection_round_target",
+        "signal_snapshot",
+    }
+    # monitor_target 由 V9 拥有（V9 < V11，种了也永远输给它的 DO NOTHING，是死代码）；
+    # scheduler_lease 是锁不是数据；schema_versions 由 runner 自管。
+    for excluded in ("monitor_target", "scheduler_lease", "schema_versions"):
+        assert f'INSERT INTO "{excluded}"' not in sql, f"V11 不该种 {excluded}"
+
+    # 排除项的理由必须留在文件里，否则下一个人会以为是漏了
+    assert "scheduler_lease" in raw and "monitor_target" in raw
+
+    # 幂等用**裸** ON CONFLICT：problem_record 可能撞 record_id 主键**或** uk_open_group_key，
+    # 写死冲突目标会漏掉另一种、直接抛 23505 而不是跳过。
+    assert "ON CONFLICT DO NOTHING" in sql
+    assert "ON CONFLICT (" not in sql, "冲突目标必须留空"
+
+    # 生成列不能出现在列清单里（INSERT 显式写生成列会报 428C9）
+    assert '"open_group_key"' not in sql
+
+    # identity 序列推进。setval 是 STRICT 函数：序列名取不到时它**静默 no-op**，
+    # 表现是迁移"成功"、下一次采集撞主键——所以必须显式 RAISE 兜底。
+    assert sql.count("pg_get_serial_sequence") == 3, "domain_config/fpr_table/signal_snapshot 各需一次"
+    assert "RAISE EXCEPTION" in sql
+    assert "PERFORM setval(seq," in sql
+
+    # signal_snapshot 只种**样本**：该表在 src/ 里只写不读，且装的是原始生产日志正文，
+    # 整表进 git 既无功能收益、又会让日志永久留在历史里。
+    section = raw.split('INSERT INTO "signal_snapshot"')[1]
+    sample_rows = section.split("ON CONFLICT DO NOTHING")[0].count("\n    (")
+    assert 0 < sample_rows <= 50, f"signal_snapshot 应只种样本，实际 {sample_rows} 行"
+
+
 def test_scripts_do_not_hardcode_schema() -> None:
     """迁移脚本里不得出现 ``CREATE SCHEMA`` / ``SET search_path`` —— schema 由 runner 按配置注入。
 
@@ -226,7 +282,7 @@ def test_scripts_do_not_hardcode_schema() -> None:
     只有换一个 db_schema 才会暴露。MySQL 版能写死 ``USE aiops_apm_runtime`` 是因为库名恒等于
     schema 名；PG 的 schema 是可配置的。
     """
-    for version in range(1, 11):
+    for version in range(1, 12):
         sql = _script(version)
         assert "CREATE SCHEMA" not in sql, f"V{version} 不应自己建 schema"
         assert "SET search_path" not in sql, f"V{version} 不应自己设 search_path"
@@ -236,7 +292,7 @@ async def test_migrate_applies_new_scripts_in_order() -> None:
     conn = FakeConn(current_version=0)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 10
+    assert applied == 11
     assert conn.schema_versions_created
     assert any(s.startswith("CREATE SCHEMA IF NOT EXISTS aiops_apm_runtime") for s in conn.statements)
     assert any(s.strip().startswith("CREATE TABLE IF NOT EXISTS problem_record") for s in conn.statements)
@@ -255,7 +311,7 @@ async def test_migrate_idempotent_skips_applied_versions() -> None:
     conn = FakeConn(current_version=1)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 9  # V1 已应用，仅补 V2..V10
+    assert applied == 10  # V1 已应用，仅补 V2..V11
     # 已应用版本不重复执行其建表语句
     assert not any("CREATE TABLE IF NOT EXISTS problem_record" in s for s in conn.statements)
     assert any("CREATE TABLE IF NOT EXISTS collect_watermark" in s for s in conn.statements)

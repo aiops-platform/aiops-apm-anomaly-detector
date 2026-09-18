@@ -118,7 +118,7 @@ python3.12 -m venv .venv
 
 ### 2.5 初始化数据库（可选；用 `pg` backend 时**必做**）
 
-初始化脚本就是 `src/aiops_apm/migrations/V1..V8__*.sql`（M8 起为 PostgreSQL 方言），由迁移执行器按版本号幂等应用，**不需要手工执行任何 SQL**。
+初始化脚本就是 `src/aiops_apm/migrations/V1..V11__*.sql`（M8 起为 PostgreSQL 方言），由迁移执行器按版本号幂等应用，**不需要手工执行任何 SQL**。
 
 ```bash
 # ① 先有一个可用的 PostgreSQL，且 APM_DB_NAME 指向的「库」已经存在。
@@ -130,9 +130,10 @@ python3.12 -m venv .venv
 # ② 建 schema + 建表（幂等：重复执行不报错、不重复建）
 make migrate
 # → CREATE SCHEMA aiops_apm_runtime（若不存在）
-# → 按版本号依次应用 V1..V9，版本记录写进 aiops_apm_runtime.schema_versions
-# → 15 张表：V1 建 12 张；V2 collect_watermark；V5 detection_round_target；V3/V4/V6/V7/V8 补列
+# → 按版本号依次应用 V1..V11，版本记录写进 aiops_apm_runtime.schema_versions
+# → 15 张表：V1 建 12 张；V2 collect_watermark；V5 detection_round_target；V3/V4/V6/V7/V8/V10 补列
 # → V9 种入三个测试床日志监控端点（order/warranty/gateway-service），随迁移一并就位
+# → V11 种入活库快照（域配置/在办单/轮次审计等，见 §2.6），~1MB
 ```
 
 **连接参数**（`.env`，默认值已对齐 multi-agent-workflow 的 compose，通常无需改）：
@@ -161,28 +162,37 @@ aiops_apm_runtime.problem_record —— 多半是还没跑迁移。请先执行 
 
 ### 2.6 数据库表说明（`APM_DB_NAME` 库内的独立 schema `aiops_apm_runtime`，共 15 张表）
 
-> 所有业务表均带 `tenant_id` 列做多租户隔离。V1 建齐 12 张表；V2–V8 增量补表/加列；V9 是**首个数据类迁移**（种入三个测试床日志端点，`ON CONFLICT DO NOTHING` 幂等）；
+> 所有业务表均带 `tenant_id` 列做多租户隔离。V1 建齐 12 张表；V2–V8/V10 增量补表/加列；
 > `schema_versions` 由 `MigrationRunner` 自动创建，用于 `make migrate` 幂等版本追踪，不计入版本化迁移。
+>
+> **两个数据类迁移**（V1–V8 全是 DDL）：
+> - **V9** —— 种入三个测试床日志端点（`ON CONFLICT DO NOTHING` 幂等）。
+> - **V11** —— 把一份**活库快照**固化下来（域配置、在办问题单、轮次审计等），由
+>   `docker/dump_seed_sql.py` 生成，**不要手改**。它是某一时刻的快照：活库后续变化
+>   不会回流，要刷新走新迁移或重跑生成器。刻意**不种** `monitor_target`（V9 拥有）、
+>   `scheduler_lease`（是锁不是数据，种了会让新环境 scheduler 抢不到锁）、
+>   `schema_versions`（迁移器自管）；`signal_snapshot` 只种 20 行样本（该表只写不读，
+>   且装原始生产日志正文，不宜整表进 git）。
 
 | 表名 | 来源版本 | 用途说明 |
 |------|----------|----------|
-| `problem_record` | V1 | **M5 emit 最终产出**：异常告警单。含 `severity` 严重度、`state` 生命周期（pending/in_progress/resolved/closed/archived）、`open_group_key` 生成列 + `uk_open_group_key` UNIQUE 实现同 `group_key` 并发去重追加（resolved 后自动置 NULL 允许复发开新单）。`record_id` 形如 `PR-YYYYMMDD-NNNN` |
+| `problem_record` | V1 +V11 | **M5 emit 最终产出**：异常告警单。含 `severity` 严重度、`state` 生命周期（pending/in_progress/resolved/closed/archived）、`open_group_key` 生成列 + `uk_open_group_key` UNIQUE 实现同 `group_key` 并发去重追加（resolved 后自动置 NULL 允许复发开新单）。`record_id` 形如 `PR-YYYYMMDD-NNNN` |
 | `change_record` | V1 | 变更记录（deployment/ddl/config），L2 变更关联用：命中变更窗口内的异常标记 `change_related` |
-| `domain_config` | V1 | 域检测规则（`config` JSON 存 detectors/suppressors/correlation/verify），`enabled` + `version` 版本号；`UNIQUE (tenant_id, domain)` |
+| `domain_config` | V1 +V11 | 域检测规则（`config` JSON 存 detectors/suppressors/correlation/verify），`enabled` + `version` 版本号；`UNIQUE (tenant_id, domain)` |
 | `monitor_target` | V1✅ | **监控端点配置**（回答「监控谁、从哪采、多快采」） ✅ |
 | `maintenance_window` | V1 | L0 维护窗口：`(service, start_at, end_at)` 时间窗内的信号被抑制 |
 | `suppress_blacklist` | V1 | L0 黑名单：按 `(domain, service, signal)` 匹配的信号被抑制（`signal` 在 PG 下用双引号标识符 `"signal"`） |
-| `fpr_table` | V1 | 误报率统计（`group_key` 维度 `false_positive_cnt`/`total_cnt`/`fpr`），L3 误报率闸门 + `POST /resolve {"false_positive":true}` 误报回写落库 |
-| `record_seq` | V1 | `record_id` 原子取号（按 `seq_date` 维护 `next_seq`，`PR-YYYYMMDD-NNNN` 每日自增） |
+| `fpr_table` | V1 +V11 | 误报率统计（`group_key` 维度 `false_positive_cnt`/`total_cnt`/`fpr`），L3 误报率闸门 + `POST /resolve {"false_positive":true}` 误报回写落库 |
+| `record_seq` | V1 +V11 | `record_id` 原子取号（按 `seq_date` 维护 `next_seq`，`PR-YYYYMMDD-NNNN` 每日自增） |
 | `scheduler_lease` | V1 | 多副本选主：`scheduler_lease` 行锁 + `expires_at` TTL 续约 + 崩溃自动接管（PG 原子 `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`） |
-| `signal_snapshot` | V1✅ | 原始信号快照（metric/log 采集落库），`signature` 为日志堆栈签名（V7 由 VARCHAR(255) 加宽至 VARCHAR(1024)）。量大，建议按 `snapshot_ts` 分区/定期归档 |
-| `detection_state` | V1 | 检测状态：`state_key`（如 `previous_keys`）存 `state_value` JSONB，L1 环比基线 / L3 持续性（consecutive/miss）计数 |
-| `detection_round` | V1✅ | 轮次审计主表 ✅ |
-| `collect_watermark` | V2 | **采集水位线**：每个 `monitor_target` 最近采集到的事件时间戳，`PRIMARY KEY (tenant_id, target_id)`，下轮下推 `start=last_ts` 实现增量采集 |
-| `detection_round_target` | V5✅ | 轮次审计字表 - taget ✅ |
+| `signal_snapshot` | V1✅ +V11 样本 | 原始信号快照（metric/log 采集落库），`signature` 为日志堆栈签名（V7 由 VARCHAR(255) 加宽至 VARCHAR(1024)）。量大，建议按 `snapshot_ts` 分区/定期归档 |
+| `detection_state` | V1 +V11 | 检测状态：`state_key`（如 `previous_keys`）存 `state_value` JSONB，L1 环比基线 / L3 持续性（consecutive/miss）计数 |
+| `detection_round` | V1✅ +V11 | 轮次审计主表 ✅ |
+| `collect_watermark` | V2 +V11 | **采集水位线**：每个 `monitor_target` 最近采集到的事件时间戳，`PRIMARY KEY (tenant_id, target_id)`，下轮下推 `start=last_ts` 实现增量采集 |
+| `detection_round_target` | V5✅ +V11 | 轮次审计字表 - taget ✅ |
 | `schema_versions` | 迁移自建 | 迁移版本追踪（`version` + `applied_at`），`make migrate` 据此幂等跳过已应用版本 |
 
-**V9 种入的三个端点**（`monitor_target`，`log`/`elk`/`application`，60s 间隔）：`MT-0001` order-service、`MT-0002` warranty-service、`MT-0003` gateway-service。它们的日志经 filebeat 进 Elasticsearch（索引 `app-logs`）。ES 地址由 `APM_TESTBED_ES_URL` 经迁移器以 GUC 注入——**容器里 `localhost` 指向容器自己**，从 compose 跑要改成 `host.containers.internal:19200`（且 `kubectl port-forward` 默认只绑 `127.0.0.1`，需加 `--address 0.0.0.0`）。改这三个端点的配置**不要改 V9**（迁移不可变），用 `make seed-testbed` 或管理 API。
+**V9 种入的三个端点**（`monitor_target`，`log`/`elk`/`application`，60s 间隔）：`MT-0001` order-service、`MT-0002` warranty-service、`MT-0003` gateway-service。它们的日志经 filebeat 进 Elasticsearch（索引 `app-logs`）。ES 地址由 `APM_TESTBED_ES_URL` 经迁移器以 GUC 注入——**容器里 `localhost` 指向容器自己**，从 compose 跑要改成 `host.containers.internal:19200`（且 `kubectl port-forward` 默认只绑 `127.0.0.1`，需加 `--address 0.0.0.0`）。改这三个端点的配置**不要改 V9**（迁移不可变），用 `make seed-testbed` 或管理 API。**V11 不接管这三个端点**（`monitor_target` 本就是 V9 的地盘，V11 里重复种也只会输给 V9 的 `ON CONFLICT DO NOTHING`），所以上面这套改动方式在 V11 之后依然有效。
 
 ### 3. 启动服务
 

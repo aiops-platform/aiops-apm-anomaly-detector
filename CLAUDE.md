@@ -54,7 +54,8 @@ M8（存储层 PostgreSQL 化）把 MySQL/`aiomysql` 整体换成 PostgreSQL/`ps
   - v2 运行时/历史：`signal_snapshot`、`detection_state`、`detection_round`。
   - 所有表均带 `tenant_id`。`storage_backend` 设置决定用 `pg` 还是内存实现（仅用于 demo/单测，不引入 SQLite）。
   - 两个会话参数在连接串里钉死，不能省：`search_path`（PG 没有 MySQL 的 `USE`）与 `TimeZone=UTC`（时间列是 naive `TIMESTAMP(3)`，会话时区非 UTC 会让 DB 生成的时间与应用写入的 UTC 值差若干小时且不报错）。
-  - 初始化：`make migrate` 幂等建 schema + 15 张表（`V1..V8__*.sql`）。库需先存在（PG 不能在事务里 `CREATE DATABASE`），schema 由迁移器自建。没跑迁移时 `build_storage` **fail-fast**——PG 下库共享，schema 缺失不会让连接失败，只探连通性会让服务"起来了但每个查询 500"、`/ready` 还报 ready。
+  - 初始化：`make migrate` 幂等建 schema + 15 张表（`V1..V11__*.sql`）。库需先存在（PG 不能在事务里 `CREATE DATABASE`），schema 由迁移器自建。没跑迁移时 `build_storage` **fail-fast**——PG 下库共享，schema 缺失不会让连接失败，只探连通性会让服务"起来了但每个查询 500"、`/ready` 还报 ready。
+  - 数据种子：`V9` 种三个测试床日志端点；`V11` 种一份**活库快照**（域配置/在办单/轮次审计等，由 `docker/dump_seed_sql.py` 生成，~1MB，随 `make migrate` 生效）。V11 刻意不种 `monitor_target`（V9 拥有）、`scheduler_lease`（是锁不是数据：`expires_at` 为 NULL 会让 scheduler **永久**抢不到锁）、`schema_versions`（迁移器自管），`signal_snapshot` 只种 20 行样本（只写不读且装生产日志）。改 V11 前先读它的文件头。
 - **配置** — PostgreSQL 为主源（YAML 仅作首次初始化 seed）。`monitor_target` 回答「监控谁、从哪采、多快采」；`domain_config` 回答「怎么判、怎么抑制、怎么验证」。运行时动态配置（维护窗口、黑名单、误报率）每轮重新读取。
 - **调度器** — `scheduler.py` 按每个 `monitor_target` 的 schedule 触发（默认 60s 间隔）；`poller.py` 执行单轮。`POST /v1/monitors/{id}/run` 复用同一单端点路径做手动触发。
 

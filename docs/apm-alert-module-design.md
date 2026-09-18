@@ -745,7 +745,7 @@ class ProblemRecord(BaseModel):
 
 ### 7.2 DDL（PostgreSQL，`APM_DB_SCHEMA` 指定的独立 schema）
 
-> **权威定义**：[`src/aiops_apm/migrations/V1..V8__*.sql`](../../src/aiops_apm/migrations/)。
+> **权威定义**：[`src/aiops_apm/migrations/V1..V11__*.sql`](../../src/aiops_apm/migrations/)（V1–V8 建表/加列，V9 与 V11 是数据种子）。
 > 本节只记录**表与列的语义**以及 PG 化的取舍；具体 DDL 以迁移脚本为准，避免此处副本漂移。
 > MySQL 版的原始 DDL 已归档到 [`docs/archive/M8-postgres-migration.md`](../archive/M8-postgres-migration.md)。
 

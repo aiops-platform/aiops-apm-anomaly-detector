@@ -2,7 +2,7 @@
 
 > **归档说明**：以下 DDL 摘自 `docs/apm-alert-module-design.md` §7.2/§7.3 的原始设计，
 > 是 M2–M7 期间实际使用的 **MySQL** schema。M8（存储层 PostgreSQL 化）已把它整体改写为
-> PG 方言，权威定义现在在 [`src/aiops_apm/migrations/V1..V8__*.sql`](../../src/aiops_apm/migrations/)。
+> PG 方言，权威定义现在在 [`src/aiops_apm/migrations/V1..V11__*.sql`](../../src/aiops_apm/migrations/)。
 >
 > 保留此文件是为了记录**表结构与列的演进意图**（哪些列为什么存在），这些语义与方言无关、
 > 依然有效；MySQL 专属的语法细节不必再参考。方言映射与 PG 专属陷阱见

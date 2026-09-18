@@ -11,6 +11,11 @@ scheduler 按 ``schedule.interval_sec`` 定时触发采集 → L0–L3 漏斗 �
 改本文件后重跑（会刷新活库），**不要改 V9**。
 （两处内容目前一致；本文件权威，V9 是它的首次初始化快照。）
 
+**V11 不接管这三个端点**：V11（活库快照）刻意不种 ``monitor_target``——V9 < V11，重复种也
+永远输给 V9 的 ``ON CONFLICT DO NOTHING``，是死代码；而且 ``source_config`` 里内嵌 ES 地址，
+V9 刻意走 ``aiops.testbed_es_url`` GUC 注入以保证环境可移植。所以本文件仍是这三个端点配置的
+唯一可改入口。
+
 --- 采集链路的事实（写配置前实测过，别凭猜改）---------------------------------
 
 日志链路：三个服务 → filebeat（DaemonSet）→ Elasticsearch，索引 ``app-logs``。

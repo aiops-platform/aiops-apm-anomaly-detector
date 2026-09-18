@@ -16,6 +16,7 @@ jsonb 拼接路径、时区折算、search_path 是否覆盖每条连接）字�
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlparse
 
@@ -43,6 +44,29 @@ pytestmark = pytest.mark.skipif(not _DSN, reason="需 APM_TEST_PG_DSN 指向一�
 
 SCHEMA = os.getenv("APM_TEST_PG_SCHEMA", "aiops_apm_test")
 
+# V11 会把一份活库快照种进 schema（见 V11__seed_live_data.sql）。
+# 本文件绝大多数用例断言的是「表里只有我刚写的那行」——多处是 `fetchone(... WHERE
+# tenant_id='default')`，或 `assert len(rows) == 1`。种子数据一进来，这些查询就会取到
+# **种子的行**（fetchone 取哪一行是任意的），于是断言随机失败。
+# 所以 fixture 跑完迁移后把这些表清空，恢复用例原本的前提。
+#
+# 三个表**刻意不在**列表里：
+#   - monitor_target：由 V9 种入，且 test_v9_seeds_three_log_targets 与
+#     test_monitor_target_create_assigns_sequential_ids 依赖那三行（清了它们就挂）。
+#   - scheduler_lease：V11 不种它（见 V11 头部注释），用例本就要求它是干净的。
+#   - schema_versions：清了会让下一次 migrate() 重跑全部迁移。
+_V11_SEEDED_TABLES = (
+    "domain_config",
+    "fpr_table",
+    "record_seq",
+    "problem_record",
+    "detection_state",
+    "collect_watermark",
+    "detection_round",
+    "detection_round_target",
+    "signal_snapshot",
+)
+
 
 def _settings_from_dsn(dsn: str) -> Settings:
     u = urlparse(dsn)
@@ -60,7 +84,7 @@ def _settings_from_dsn(dsn: str) -> Settings:
 
 @pytest_asyncio.fixture
 async def pool() -> object:
-    """建 schema + 跑 V1..V8，跑完 drop schema。"""
+    """建 schema + 跑 V1..V11，清掉 V11 种入的数据，跑完 drop schema。"""
     settings = _settings_from_dsn(_DSN or "")
     p = ConnectionPool(settings)
     await p.init()
@@ -72,6 +96,13 @@ async def pool() -> object:
         await p.release(handle)
 
     await MigrationRunner(p, schema=SCHEMA).migrate()
+    handle = await p.acquire()
+    try:
+        # RESTART IDENTITY：把序列也退回到 V1 刚建表时的状态，与用例的原始前提一致。
+        await handle.execute(f"TRUNCATE {', '.join(_V11_SEEDED_TABLES)} RESTART IDENTITY")
+        await handle.commit()
+    finally:
+        await p.release(handle)
     try:
         yield p
     finally:
@@ -161,6 +192,109 @@ async def test_v9_es_url_comes_from_runner_guc() -> None:
         await MigrationRunner(p, schema=schema, testbed_es_url=custom).migrate()
         row = await p.fetchone("SELECT source_config->>'url' FROM monitor_target WHERE target_id=%s", ("MT-0001",))
         assert row is not None and row[0] == custom, f"GUC 未生效，url={row[0] if row else None}"
+    finally:
+        handle = await p.acquire()
+        try:
+            await handle.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            await handle.commit()
+        finally:
+            await p.release(handle)
+        await p.close()
+
+
+# ---- V11 种子迁移 ----
+#
+# V11 由 ``docker/dump_seed_sql.py`` 生成（一份活库快照）。它的字符串契约在
+# tests/test_migrations.py 里断言；这里只覆盖**字符串断言抓不到**的两件事：
+# fixture 的清空清单是否跟得上，以及 identity 序列是否真的被推进了。
+
+
+def _v11_sql() -> str:
+    """读 V11 原文。``_load_scripts`` 不碰连接，pool 传 None 即可。"""
+    scripts = MigrationRunner(None, schema="unused")._load_scripts()  # type: ignore[arg-type]
+    matches = [s for s in scripts if s.version == 11]
+    assert matches, "V11 迁移脚本不存在"
+    return matches[0].sql
+
+
+def test_v11_truncate_list_covers_every_seeded_table() -> None:
+    """fixture 的 TRUNCATE 清单必须覆盖 V11 种入的**每一张**表。
+
+    漏一张，那一类 store 用例就会重新开始随机失败——现象是「fetchone 取到了别的行」，
+    极难定位到 fixture 里那行 TRUNCATE。这条守卫让下一个种子迁移无法悄悄绕过它。
+    """
+    seeded = set(re.findall(r'INSERT INTO "(\w+)"', _v11_sql()))
+    assert seeded, "V11 应当有 INSERT 语句"
+    missing = seeded - set(_V11_SEEDED_TABLES)
+    assert not missing, f"fixture 的 TRUNCATE 清单漏了 {sorted(missing)}，相关用例会被种子数据带偏"
+
+
+async def test_v11_seed_lands_and_identity_sequences_stay_usable() -> None:
+    """V11 的种子要真的落库，且 identity 序列必须仍然可用。
+
+    后者是本次最容易**静默**出错的地方：V11 显式写入了 id，但 identity 序列不会因此前进，
+    而 ``storage/snapshots.py`` 与 ``storage/monitor_targets.py`` 的 INSERT 都**不写 id**、
+    全靠序列。漏掉 setval 的表现是「迁移成功、数据看着没问题」，直到下一次采集才撞主键。
+
+    自建 schema（不走会 TRUNCATE 的 pool fixture）——种子必须在这里还活着。
+    """
+    schema = f"{SCHEMA}_v11"
+    settings = _settings_from_dsn(_DSN or "").model_copy(update={"db_schema": schema})
+    p = ConnectionPool(settings)
+    await p.init()
+    handle = await p.acquire()
+    try:
+        await handle.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        await handle.commit()
+    finally:
+        await p.release(handle)
+    try:
+        await MigrationRunner(p, schema=schema).migrate()
+
+        counts: dict[str, int] = {}
+        for table in _V11_SEEDED_TABLES:
+            row = await p.fetchone(f'SELECT COUNT(*) FROM "{table}"')
+            counts[table] = row[0] if row else 0
+
+        assert counts["domain_config"] == 1, f"域配置应种 1 行，实际 {counts['domain_config']}"
+        assert counts["problem_record"] >= 1, "在办问题单没种进来"
+        assert counts["detection_round"] >= 100, f"轮次审计没种全：{counts['detection_round']}"
+        assert counts["detection_round_target"] >= 100, f"轮次明细没种全：{counts['detection_round_target']}"
+        assert 0 < counts["signal_snapshot"] <= 50, (
+            f"signal_snapshot 应只种样本（该表只写不读、装原始生产日志），实际 {counts['signal_snapshot']} 行"
+        )
+        # 种入的是活库那份域配置（persistence_rounds 被人为改过），不是 domains.yaml 的初始值。
+        # 这也解释了为什么新环境不会触发 YAML 首次 seed——loader 判空才 seed。
+        row = await p.fetchone("SELECT config FROM domain_config WHERE domain=%s", ("application",))
+        assert row is not None and row[0]["verify"]["persistence_rounds"] == 1, row
+
+        # ★ 用真实 store 写入（它不写 id），验证 setval 确实生效
+        written = await PGSnapshotStore(p).write(
+            "default",
+            "MT-0001",
+            [
+                LogSignal(
+                    service="svc-probe",
+                    level="INFO",
+                    message="seq probe",
+                    timestamp=datetime.now(timezone.utc),
+                )
+            ],
+        )
+        assert written == 1, "序列未推进 → 写 signal_snapshot 会撞主键"
+
+        # monitor_target 不由 V11 种（V9 拥有），序列不应被 V11 扰动
+        created = await PGMonitorTargetStore(p).create(
+            "default",
+            {
+                "service": "probe-svc",
+                "signal_type": "metric",
+                "source_type": "http",
+                "source_config": {"url": "http://x/metrics"},
+                "schedule": {"interval_sec": 60},
+            },
+        )
+        assert created["target_id"] == "MT-0004", created["target_id"]
     finally:
         handle = await p.acquire()
         try:
