@@ -196,6 +196,51 @@ async def test_schema_ready_true_after_migration(pool) -> None:
     assert await pool.health_check() is True
 
 
+# ---- M9：跨服务记录（拼接的 service 列） ----
+
+
+async def test_problem_record_service_column_is_wide_enough(pool) -> None:
+    """V10 把 service 加宽到 255 —— M9 跨服务合并后它是逗号拼接的服务名列表。
+
+    原先 VARCHAR(64) 只装得下一个服务名，多服务拼接会报 22001（value too long），
+    **整轮采集失败**。这里真写一条超过 64 字符的拼接串确认不再溢出。
+    """
+    row = await pool.fetchone(
+        "SELECT character_maximum_length FROM information_schema.columns "
+        "WHERE table_schema=%s AND table_name='problem_record' AND column_name='service'",
+        (SCHEMA,),
+    )
+    assert row is not None and row[0] >= 255, f"service 列宽 {row[0] if row else None}，V10 未生效"
+
+    joined = "gateway-service,order-service,warranty-service,billing-service,notification-service"
+    assert len(joined) > 64
+    rec = _record(record_id="PR-20260917-0042")
+    rec.service = joined
+    rec.group_key_service = "billing-service"  # 去重键用代表，不用拼接串
+    await PGRecordStore(pool).write_or_append("default", rec)
+
+    got = await pool.fetchone("SELECT service FROM problem_record WHERE record_id=%s", ("PR-20260917-0042",))
+    assert got is not None and got[0] == joined
+
+
+async def test_service_filter_matches_any_member_of_joined_list(pool) -> None:
+    """按跨服务记录里的**任一**服务都要能查到（成员匹配，不是子串匹配）。
+
+    原先的 ``service=%s`` 精确相等会漏掉这类记录；而换成 LIKE '%x%' 又会把
+    'order' 误匹到 'order-service'。用 ``string_to_array`` 做精确成员判定。
+    """
+    rec = _record(record_id="PR-20260917-0043")
+    rec.service = "gateway-service,order-service"
+    rec.group_key_service = "gateway-service"
+    await PGRecordStore(pool).write_or_append("default", rec)
+
+    records = PGRecordStore(pool)
+    for svc in ("order-service", "gateway-service"):
+        ids = [r["record_id"] for r in await records.list("default", service=svc)]
+        assert "PR-20260917-0043" in ids, f"按 {svc} 查不到跨服务记录"
+    assert await records.list("default", service="order") == [], "子串不该命中"
+
+
 # ---- B1：时区 ----
 
 

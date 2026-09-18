@@ -20,6 +20,10 @@ SIP 前端在 **Observability** 下新增一级菜单，集中展示 APM 后端 
 
 `problem_record` 字段（`models/record.py` + `storage/records.py` 返回 dict）：`record_id / domain / state(pending·in_progress·resolved·closed·archived) / service / severity / detected_at / first_seen_at / last_seen_at / occurrence_count / symptom{summary} / metric_anomalies / log_anomalies / correlation / verification / evidence / trace_id`。
 
+> **`detection_type`（派生字段，接口已返回）**：`log` / `metric` / `combined` / `unknown`，由 `metric_anomalies`/`log_anomalies` 是否为空推出（见 `router/problems.py` 的 `_detection_type`）。**不入库**，列表与详情都带。做「证据类型」筛选芯片直接用这个，不用读 `correlation.reason`。
+>
+> 注意 `problem_record.source` 是模块名（固定 `apm-alert`），**不是**检测来源，别拿它做类型判断。
+
 ## 前端复用点（调研结论）
 
 - 导航：`index.html:96-118` 侧栏 `#observability`；点击处理 `app.js:78-108`（`data-page` → `showPage('page-...')`）。

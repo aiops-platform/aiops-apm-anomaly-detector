@@ -12,8 +12,8 @@
 
 ## 2. 当前状态（2026-09-17）
 
-- **M0–M8 全部完成**：`make lint test dev` 全绿，**490 常跑用例 + 22 条真库集成用例**通过。**M9 待定义**。
-- **M0** 工程基座（Settings/异常/探针）· **M1** 契约层（models+fingerprint+plugins.base，**已冻结**）· **M2** 持久化/迁移（12 表+seed）· **M3** 采集层/出站网关（http_metrics/logs/mock + SSRF）· **M4** 检测层（registry+3 detector+2 suppressor）· **M5** 漏斗 L0–L3+emit（确定性核心）· **M6** 调度/多租户/API/恢复闭环 · **M7** 可观测性/安全加固/交付打包（指标+审计+docker）· **M8** 存储层 PostgreSQL 化（MySQL/`aiomysql` → PG/`psycopg3`，全量测试道）。
+- **M0–M9 全部完成**：`make lint test dev` 全绿，**516 常跑用例 + 26 条真库集成用例**通过。**M10 待定义**。
+- **M0** 工程基座（Settings/异常/探针）· **M1** 契约层（models+fingerprint+plugins.base，**已冻结**）· **M2** 持久化/迁移（12 表+seed）· **M3** 采集层/出站网关（http_metrics/logs/mock + SSRF）· **M4** 检测层（registry+3 detector+2 suppressor）· **M5** 漏斗 L0–L3+emit（确定性核心）· **M6** 调度/多租户/API/恢复闭环 · **M7** 可观测性/安全加固/交付打包（指标+审计+docker）· **M8** 存储层 PostgreSQL 化（MySQL/`aiomysql` → PG/`psycopg3`，全量测试道）· **M9** 日志异常分组（按 signature/traceId 出单，可跨服务合并）。
 - **遗留 backlog（下一个可做项）**：① 真实 LLM L2 摘要（`summary.py` 钩子已备，`APM_ENABLE_LLM_SUMMARY` 开关）② vault 密钥管理（`${vault:...}` 为占位）③ `docker compose up` / `locust` 端到端实测（已写出待补跑；本机 compose 有网络子网冲突待解）。
   - ~~MySQL 真库实测~~：M8 已随 PG 化一并解决——真库集成道 `APM_TEST_PG_DSN` 落地，且端到端实测过。
 
@@ -23,6 +23,7 @@
   `collect → L0 抑制（维护窗口/黑名单）→ L1 检测（static_threshold/simple_compare/signature_aggregate）→ L2 关联（同源+变更+模板摘要）→ L3 验证（持续性/误报率闸门/严重度）→ emit（去重落库）`
 - **插件系统**：三个 `entry_points` 组（`aiops_apm.collectors/detectors/suppressors`），每个 entry 指向 `build() -> Plugin` 工厂；registry 原子快照热替换。
 - **存储**：PostgreSQL，全部表建在独立 schema `aiops_apm_runtime` 下（库由 `APM_DB_NAME` 指定，默认复用 multi-agent-workflow 的 `agentflow`），全部表带 `tenant_id`；`APM_STORAGE_BACKEND`= `pg` / `memory`（demo/单测）。
+- **出单分组（M9）**：按**连通分量**——同 `signature` 或同业务 `trace_id` 的日志异常归一组（**可跨服务**），metric 挂到本服务的日志组。一个事故一条 `problem_record`；跨服务记录用逗号拼接服务名（如 `"gateway-service,order-service"`），去重键另用「排序首个」代表服务。详见 [`docs/logs/M9.md`](logs/M9.md)。
 - **多租户**：`X-Tenant-Id` 请求头（默认 `default`），服务端解析、不信任 body。
 - **技术栈**：Python 3.10+ · FastAPI（uvicorn `:8000`）· psycopg3 · pydantic/pydantic-settings（`APM_` 前缀）· prometheus_client。
 
@@ -75,7 +76,7 @@ make docker-up / docker-down / loadtest   # M7 交付（本机无 docker/locust 
 
 ## 8. 续接指引（enhance / Q&A）
 
-- **当前焦点**：定义 **M9** + 清 backlog（真实 LLM L2、vault、docker compose / locust 端到端）。
+- **当前焦点**：定义 **M10** + 清 backlog（真实 LLM L2、vault、docker compose / locust 端到端）。
 - **每 M 流程（CLAUDE.md 规定）**：先出 `docs/plans/<M>-implementation-plan.md` → 完成后写 `docs/logs/<M>.md` → 归档已实现章节到 `docs/archive/` → 更新 README 进度表 → 更新本文件与 CLAUDE.md「当前里程碑」。
 - **改动纪律**：M1 契约**已冻结**（后续只加可选字段、不改签名）；不违背四条不可回退原则；多租户硬约束（服务端解析 tenant）。
 - **验收场景来源**：设计文档 §13 的 11 个用例（CPU 飙高、组合升 critical、OOM 聚合、同源关联、瞬时抖动、维护窗口、误报率闸门、日志源降级等）。
@@ -86,6 +87,8 @@ make docker-up / docker-down / loadtest   # M7 交付（本机无 docker/locust 
 - **API 建的 mock 端点不产信号**：`_mock_signals` 为测试私有字段，经 store 会被丢弃 → mock 只用于链路验证；产告警需接真实 HTTP 源（`http_metrics`/`http_logs`）。
 - **SSRF 网关拦截本地/私网**：`127.0.0.0/8`、`::1`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16` 全拦，域名解析命中私网或解析失败也拒（fail-closed）。本地/容器演示需临时豁免（详见 operational-guide §4.2）。
 - **`docker compose up` 产不出告警**（M7 待补跑遗留）：`seed.py` 用 `metric_path/log_path` 但采集器期望 `rows_path`+`field_mapping`；`mock_source.py` 每行缺 `timestamp/service`。
+- **跨服务记录的 `service` 是拼接串**（M9）：如 `"gateway-service,order-service"`。`?service=X` 用**成员匹配**（`X = ANY(string_to_array(service, ','))`）所以仍查得到；但直接看库/接口返回值时别期望它是单个服务名。需要单服务名的地方（诊断路由的 `app`/`repo`、ServiceNow `cmdb_ci.name`）取拼接串的**第一个**。
+- **一个 service 一轮可能出多条记录**（M9）：不同类型 error 各自成单。故 `detection_round_target.record_count`（按 service 归因、跨服务组给组内每个服务各记一次）之和**可以大于** `detection_round.record_count`（记录条数）——两者量纲不同。
 - **pg backend 连不上 DB 启动即失败**（fail-fast）；memory backend 无此约束。**没跑 `make migrate` 同样会 fail-fast**（PG 下库共享，schema 缺失不会让连接失败，所以额外探了一次核心表）。
 - **PG 会话时区必须是 UTC**：时间列是 naive `TIMESTAMP(3)`，连接串已固定 `-c TimeZone=UTC`。自建连接（脚本、其它工具）若不带这个参数，写出的时间会偏移若干小时且不报错。
 - **PG 排序规则大小写敏感**（MySQL 的 `utf8mb4_unicode_ci` 不敏感）：租户入口已归一为小写，但**直接查库**时 `tenant_id='Default'` 查不到 `default`。

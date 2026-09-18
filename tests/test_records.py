@@ -151,6 +151,23 @@ async def test_list_filters_by_state_and_service() -> None:
     assert [r["record_id"] for r in resolved] == ["PR-0002"]
 
 
+async def test_list_service_filter_matches_member_of_cross_service_record() -> None:
+    """M9：跨服务记录的 service 是逗号拼接串，按**其中任一**服务都要能查到。
+
+    精确相等（原先的 ``r["service"] == service``）会漏掉这类记录——用户按
+    ``?service=order-service`` 查不到那条同时涉及 order 与 gateway 的事故。
+    """
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001", service="gateway-service,order-service"))
+    await store.write_or_append("default", _record("PR-0002", service="payment-service"))
+
+    assert [r["record_id"] for r in await store.list("default", service="order-service")] == ["PR-0001"]
+    assert [r["record_id"] for r in await store.list("default", service="gateway-service")] == ["PR-0001"]
+    assert [r["record_id"] for r in await store.list("default", service="payment-service")] == ["PR-0002"]
+    # 子串不算命中：'order' 不该匹到 'order-service'
+    assert await store.list("default", service="order") == []
+
+
 # ── mark_in_progress：pending → in_progress（agent 分析发起）──────────────────
 
 async def test_mark_in_progress_flips_and_appends_evidence() -> None:

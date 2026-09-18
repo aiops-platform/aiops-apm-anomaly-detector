@@ -478,3 +478,148 @@ async def test_uc511_single_info_weak_signal() -> None:
         assert result.anomaly_count == 0
     finally:
         await storage.close()
+
+
+# --- M9：按 signature / traceId 分组出单（跨服务合并） ---
+
+LOG_DOMAIN = DomainConfig(
+    detectors=[DetectorSpec(signal="ERROR", plugin="signature_aggregate", params={"min_count": 1}, severity="high")],
+    verify=VerifySpec(persistence_rounds=1),
+)
+
+
+async def _run_logs(storage, signals, *, now=TS, domain_config=None):
+    registry = PluginRegistry().load()
+    ctx = await build_context(
+        tenant_id="default", domain="application", registry=registry, storage=storage, now=now,
+        signals=signals, domain_config=domain_config or LOG_DOMAIN,
+    )
+    return ctx, await run_domain(ctx)
+
+
+async def test_m9_distinct_error_types_open_separate_records() -> None:
+    """3 类不同 error、无共同 traceId → **3 条**记录（不是按 service 合成一条）。"""
+    storage = await make_storage()
+    try:
+        _, result = await _run_logs(storage, [
+            log_signal(signature="ErrA", trace_id="t1"),
+            log_signal(signature="ErrB", trace_id="t2"),
+            log_signal(signature="ErrC", trace_id="t3"),
+        ])
+        assert result.anomaly_count == 3
+        assert len(result.records) == 3
+        assert sorted(r.log_anomalies[0].signature for r in result.records) == ["ErrA", "ErrB", "ErrC"]
+    finally:
+        await storage.close()
+
+
+async def test_m9_shared_trace_id_merges_into_one_record() -> None:
+    """1 个 traceId 报了 3 类不同错误 → **1 条**记录（同一次请求失败），签名全在里面。"""
+    storage = await make_storage()
+    try:
+        _, result = await _run_logs(storage, [
+            log_signal(signature="ErrA", trace_id="t1"),
+            log_signal(signature="ErrB", trace_id="t1"),
+            log_signal(signature="ErrC", trace_id="t1"),
+        ])
+        assert result.anomaly_count == 3
+        assert len(result.records) == 1
+        rec = result.records[0]
+        assert {a.signature for a in rec.log_anomalies} == {"ErrA", "ErrB", "ErrC"}
+        # traceId 透传进 evidence
+        trace_ev = next(e for e in rec.evidence if e["type"] == "log_trace_ids")
+        assert trace_ev["trace_ids"] == ["t1"]
+    finally:
+        await storage.close()
+
+
+async def test_m9_trace_spans_services_joins_service_names() -> None:
+    """traceId 跨服务 → 1 条记录，service 是排序后的拼接串，group_key 用代表服务。"""
+    storage = await make_storage()
+    try:
+        _, result = await _run_logs(storage, [
+            log_signal(service="order-service", signature="ErrA", trace_id="t1"),
+            log_signal(service="gateway-service", signature="ErrB", trace_id="t1"),
+        ])
+        assert len(result.records) == 1
+        rec = result.records[0]
+        assert rec.service == "gateway-service,order-service"
+        # group_key 的 service 段取代表（排序首个），**不是**拼接串——否则会撑爆
+        # group_key/open_group_key/唯一索引的 VARCHAR(255)
+        assert rec.group_key_service == "gateway-service"
+        tenant, domain, svc, _hash = rec.group_key.split(":")
+        assert (tenant, domain, svc) == ("default", "application", "gateway-service")
+    finally:
+        await storage.close()
+
+
+async def test_m9_group_key_stable_across_rounds() -> None:
+    """同签名跨轮复发 → **追加**（occurrence_count++），不是每轮开新单。
+
+    这条守的是 group_key 稳定性：代表服务或分组不稳定都会让去重失效，
+    表现为「同一个问题每轮多一条记录」。
+    """
+    storage = await make_storage()
+    try:
+        for i in range(2):
+            await _run_logs(
+                storage,
+                [log_signal(signature="ErrA", trace_id=f"t{i}"), log_signal(signature="ErrB", trace_id=f"u{i}")],
+                now=TS + timedelta(seconds=60 * i),
+            )
+        rows = await storage.records.list("default")
+        assert len(rows) == 2, f"应稳定为 2 条（两类 error），实际 {len(rows)}"
+        assert all(r["occurrence_count"] == 2 for r in rows), "第二轮应是追加而非新开单"
+    finally:
+        await storage.close()
+
+
+async def test_m9_seen_keys_covers_every_anomaly() -> None:
+    """分组必须是划分：每个异常都恰好进一次 l3_verify。
+
+    漏掉 → sweep 误判 miss → reconciler 自动关掉活着的单；重复 → consecutive_rounds
+    双增 → 持续性闸门被绕过。两种都静默，所以直接断言 seen_keys 的覆盖。
+    """
+    storage = await make_storage()
+    try:
+        ctx, _ = await _run_logs(storage, [
+            log_signal(signature="ErrA", trace_id="t1"),
+            log_signal(service="svc-b", signature="ErrB", trace_id="t1"),
+            log_signal(signature="ErrC", trace_id="t2"),
+        ])
+        expected = {a.anomaly_key() for a in ctx.anomalies}
+        assert ctx.seen_keys == expected, "有异常没进 l3_verify（或重复进了）"
+    finally:
+        await storage.close()
+
+
+async def test_m9_cross_service_metric_log_not_related() -> None:
+    """metric 与 log **不同服务**时不得判为 related —— 否则会误升 critical。
+
+    ``calibrate_severity`` 只看 ``related``，自己从不检查 service；同服务的保证原先靠
+    「按 service 分组」隐式成立。M9 分组可跨服务，若 ``_within_window`` 不显式限定同服务，
+    这个场景会误判：metric@svc-b 与远在窗口外的 log@svc-b 不算相关，却会跟同时刻的
+    log@svc-a（不同服务）配上 → related=True → 误升 critical。
+    """
+    combo = DomainConfig(
+        detectors=[
+            DetectorSpec(signal="cpu_usage", plugin="static_threshold", params={"threshold": 0.9}, severity="high"),
+            DetectorSpec(signal="ERROR", plugin="signature_aggregate", params={"min_count": 1}, severity="high"),
+        ],
+        correlation=CorrelationSpec(metric_log_window_sec=300),
+        verify=VerifySpec(persistence_rounds=1),
+    )
+    storage = await make_storage()
+    try:
+        _, result = await _run_logs(storage, [
+            # 同 traceId 把两个服务的日志连成一组；metric 属于 svc-b
+            log_signal(service="svc-a", signature="ErrA", trace_id="t1", ts=TS),
+            log_signal(service="svc-b", signature="ErrB", trace_id="t1", ts=TS + timedelta(minutes=10)),
+            metric_signal(service="svc-b", value=0.95, ts=TS),
+        ], domain_config=combo)
+        assert len(result.records) == 1
+        rec = result.records[0]
+        assert rec.correlation.related is False, "metric@svc-b 与 log@svc-a 不同服务，不该判同源"
+        assert rec.severity == "high", "related=False 时不应组合升 critical"
+    finally:
+        await storage.close()

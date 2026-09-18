@@ -32,8 +32,19 @@ async def emit(
     change_related: bool,
     recent_change: dict | None,
     verification: Any,
+    *,
+    group_key_service: str | None = None,
 ) -> list:
-    """产出 ``[ProblemRecord]``；verification 未通过返回 ``[]``。"""
+    """产出 ``[ProblemRecord]``；verification 未通过返回 ``[]``。
+
+    ``service`` 是**对外展示**的服务名——M9 跨服务组时是逗号拼接串（如
+    ``"gateway-service,order-service"``）。``group_key_service`` 是去重键专用的**组代表**
+    （排序后第一个服务名），缺省回退 ``service``（单服务组的既有行为）。
+
+    两者必须分开：拼接串直接进 ``group_key`` 会撑爆 ``group_key``/``open_group_key``
+    生成列/唯一索引的 VARCHAR(255)，三处都得加宽。代表值由 ``run_domain`` 算一次，
+    与传给 ``l3_verify`` 的完全一致（fpr 读写的键必须相同）。
+    """
     if not verification.passed:
         return []
     metric_anoms = [a for a in anomalies if a.kind == "metric"]
@@ -81,6 +92,7 @@ async def emit(
         verification=verification,
         evidence=evidence,
         trace_id=ctx.trace_id,
+        group_key_service=group_key_service,
     )
     await ctx.storage.write_or_append(ctx.tenant_id, rec)  # 原子去重（M2 实现，返回 None）
     return [rec]

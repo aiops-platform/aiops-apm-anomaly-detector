@@ -36,12 +36,17 @@ SELECT
         'time_field', '@timestamp',
         'service_field', 'app.service.keyword',
         -- 路径带 _source. 前缀：采集器不剥壳（M3 起的约定，见 tests/test_collectors.py）
+        -- stack_trace 必须映射：signature() 有堆栈时取「异常首行|顶部N帧」，缺了它回退到
+        -- message[:120] —— Spring 的 "Servlet.service() for servlet [dispatcherServlet]..."
+        -- 前缀对**所有**异常都一样，真正的异常类型在 120 字符之外被截掉，于是不同类型的
+        -- error 全塌成同一个签名、归成同一条记录（与「不同类型 error 各自成单」正好相反）。
         'field_mapping', jsonb_build_object(
             'service', '_source.app.service',
             'level', '_source.app.level',
             'message', '_source.app.message',
             'timestamp', '_source.@timestamp',
-            'trace_id', '_source.app.traceId'
+            'trace_id', '_source.app.traceId',
+            'stack_trace', '_source.app.stack_trace'
         )
     ),
     jsonb_build_object('interval_sec', 60),

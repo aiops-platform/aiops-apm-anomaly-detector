@@ -173,7 +173,8 @@ class InMemoryRecordStore(RecordStore):
         if state is not None:
             rows = [r for r in rows if r["state"] == state]
         if service is not None:
-            rows = [r for r in rows if r["service"] == service]
+            # 成员匹配：M9 起跨服务记录的 service 是逗号拼接串，精确相等会漏掉
+            rows = [r for r in rows if service in (r["service"] or "").split(",")]
         if severity is not None:
             rows = [r for r in rows if r["severity"] == severity]
         rows.sort(key=lambda r: r["detected_at"], reverse=True)
@@ -330,7 +331,11 @@ class PGRecordStore(RecordStore):
             sql += " AND state=%s"
             args.append(state)
         if service is not None:
-            sql += " AND service=%s"
+            # 成员匹配而非精确相等：M9 起跨服务记录的 service 是逗号拼接串
+            # （如 "gateway-service,order-service"），`service=%s` 会漏掉这类记录。
+            # 用 string_to_array 做精确成员判定，不用 LIKE —— LIKE '%x%' 会误匹配
+            # 子串（"order" 命中 "order-service"）。
+            sql += " AND %s = ANY(string_to_array(service, ','))"
             args.append(service)
         if severity is not None:
             sql += " AND severity=%s"

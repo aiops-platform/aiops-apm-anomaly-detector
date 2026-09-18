@@ -53,11 +53,22 @@ class ProblemRecord(BaseModel):
     verification: Verification
     evidence: list[dict] = Field(default_factory=list)
     trace_id: str | None = None
+    # M9 新增可选字段：``group_key`` 的 service 段。跨服务合并后 ``service`` 是拼接串
+    # （如 "gateway-service,order-service"），若直接拿它算 group_key，长度会溢出
+    # ``group_key``/``open_group_key`` 生成列/唯一索引的 VARCHAR(255)，三处都得加宽。
+    # 这里存**排序后的第一个服务名**（组代表），group_key 的长度特性完全不变。
+    # 未设置时回退 ``service``（单服务组的既有行为，含历史数据）。
+    group_key_service: str | None = None
 
     @property
     def group_key(self) -> str:
-        """转发到 fingerprint.group_key（去重/持续性真源）。"""
+        """转发到 fingerprint.group_key（去重/持续性真源）。
+
+        service 段优先用 ``group_key_service``（M9 跨服务组），否则用 ``service``。
+        必须是**确定性且跨轮稳定**的值——否则去重键每轮都变，同一问题会重复开单，
+        且 ``fpr_table`` 的条目成孤儿、误报率闸门静默失效。
+        """
         from .fingerprint import group_key
 
         all_anoms = self.metric_anomalies + self.log_anomalies
-        return group_key(self.tenant_id, self.domain, self.service, all_anoms)
+        return group_key(self.tenant_id, self.domain, self.group_key_service or self.service, all_anoms)

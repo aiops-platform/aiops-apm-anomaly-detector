@@ -2,7 +2,7 @@
 
 APM（应用性能监控）告警模块：从第三方 API 采集指标/日志，经确定性的 L0–L3 漏斗，产出 `problem_record` 落库，供下游诊断/修复使用。
 
-> 当前状态：**M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）+ M6 调度/多租户/API/恢复闭环 + M7 可观测性/安全加固/交付 + M8 存储层 PostgreSQL 化已完成**（`make lint test dev` 全绿，493 个常跑用例 + 24 条真库集成用例通过）。设计与实现计划见 [`docs/`](docs/)，实现规则见 [`CLAUDE.md`](CLAUDE.md)，实现日志见 [`docs/logs/`](docs/logs/)，归档见 [`docs/archive/`](docs/archive/)。
+> 当前状态：**M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）+ M6 调度/多租户/API/恢复闭环 + M7 可观测性/安全加固/交付 + M8 存储层 PostgreSQL 化 + M9 日志异常分组（按 signature/traceId，可跨服务合并）已完成**（`make lint test dev` 全绿，516 个常跑用例 + 26 条真库集成用例通过）。设计与实现计划见 [`docs/`](docs/)，实现规则见 [`CLAUDE.md`](CLAUDE.md)，实现日志见 [`docs/logs/`](docs/logs/)，归档见 [`docs/archive/`](docs/archive/)。
 
 ## 实现进度
 
@@ -17,10 +17,11 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
 | M6 | 调度、多租户、API、恢复闭环 | ✅ 已完成 | [`docs/logs/M6.md`](docs/logs/M6.md) |
 | M7 | 可观测性、安全加固、交付 | ✅ 已完成 | [`docs/logs/M7.md`](docs/logs/M7.md) |
 | M8 | 存储层 PostgreSQL 化（MySQL/`aiomysql` → PG/`psycopg3` + 真库集成道） | ✅ 已完成 | [`docs/logs/M8.md`](docs/logs/M8.md) |
+| M9 | 日志异常分组（按 signature/traceId 出单，可跨服务合并） | ✅ 已完成 | [`docs/logs/M9.md`](docs/logs/M9.md) |
 
 > 每完成一个里程碑：在 `docs/logs/<M阶段>.md` 记录实现日志，把已实现章节归档到 `docs/archive/`，并更新本表。
 
-## 已实现（M0–M8）
+## 已实现（M0–M9）
 
 - **M0 工程基座**：
   - 工程骨架：`pyproject.toml`（依赖 + 三个 entry_points 占位）、`Makefile`、`.env.example`、ruff/mypy/pytest/pre-commit
@@ -75,10 +76,18 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
   - **两个会话参数在连接串里钉死**：`search_path`（PG 没有 `USE`）与 `TimeZone=UTC`（时间列是 naive `TIMESTAMP(3)`，会话时区非 UTC 会让 DB 生成的时间与应用写入的 UTC 值差若干小时且不报错）
   - `tests/test_pg_integration.py` — **新增真库集成道**，`APM_TEST_PG_DSN` 门控（未设则 skip，`make test` 不需要 PG）。覆盖字符串断言抓不到的东西：fpr 整数除法、jsonb 路径、时区一致性、租约守卫、`search_path` 是否覆盖每条连接
   - `make test-pg APM_TEST_PG_DSN=postgresql://agentflow:agentflow@127.0.0.1:5432/agentflow` 跑真库；493 常跑 + 24 集成 = 517
+- **M9 日志异常分组（按 signature/traceId 出单，可跨服务合并）**（把「一个 service 一条记录」换成「一个事故一条记录」；五个静默破坏点的对策见 [`docs/logs/M9.md`](docs/logs/M9.md)，改漏斗前务必先读）：
+  - `src/aiops_apm/pipeline/grouping.py` — **新增**：并查集分组（纯函数）。同 `signature` 或 `trace_ids` 相交的日志异常归一组（**可跨服务**），metric 挂到本服务的日志组。`group_anomalies` 是**划分**（两两不交、并集==输入），结尾有断言
+  - `src/aiops_apm/pipeline/runner.py` — `run_domain` 按**组**循环出单；`records_by_service` 改为 credit-all 且用 `+=`（同 service 可有多个组）
+  - `src/aiops_apm/pipeline/l2_correlate.py` / `l3_verify.py` / `emit.py` — 入参从「一个 service」变成「一个组」；`_within_window` 显式限定**同 service** 配对（否则跨服务组会把不相干的 metric/log 误升 critical）
+  - `src/aiops_apm/models/record.py` — 新增可选字段 `group_key_service`：对外 `service` 是拼接串（如 `"gateway-service,order-service"`），去重键只用代表服务，避免撑爆 `group_key`/`open_group_key`/唯一索引
+  - `src/aiops_apm/detectors/signature_aggregate.py` — 顺带修掉既有缺陷：原分组键只有 `signature`，两个服务打出同一签名会塌成一条且 `service` 取到谁看运气，而 `anomaly_key` 把它焙进去重身份 → 持续性与自动关单在服务间漂移
+  - `src/aiops_apm/migrations/V10__widen_problem_record_service.sql` — **新增**：`service` 加宽到 255（原 64 装不下多服务拼接，会 22001 整轮失败）
+  - 配置：`application` 域 `verify.persistence_rounds` `2 → 1`（即时开单）
 
 ## 启动与快速上手
 
-> 本节适用于所有里程碑（M0–M8 都这样启动与调用）。每完成一个里程碑会补充该阶段的启动附加步骤（如 M2 的 `make migrate` 建表、M6 的调度器开关 `APM_ENABLE_SCHEDULER`）与接口调用示例。
+> 本节适用于所有里程碑（M0–M9 都这样启动与调用）。每完成一个里程碑会补充该阶段的启动附加步骤（如 M2 的 `make migrate` 建表、M6 的调度器开关 `APM_ENABLE_SCHEDULER`）与接口调用示例。
 
 ### 1. 配置环境变量
 
@@ -275,6 +284,8 @@ curl -i -X POST "http://127.0.0.1:<port>/v1/alerts/run?domain=application"
 
 # 问题单查询 / 详情 / 手动关闭
 curl -i "http://127.0.0.1:<port>/v1/problems?state=pending&severity=high"
+# 每条都带派生的 detection_type：log / metric / combined（两者都有）/ unknown
+# 前端据此做证据类型筛选（无需后端过滤参数）
 curl -i http://127.0.0.1:<port>/v1/problems/PR-20260826-0001
 curl -i -X POST http://127.0.0.1:<port>/v1/problems/PR-20260826-0001/resolve   # reason=manual
 

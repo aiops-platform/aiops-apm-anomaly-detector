@@ -1,13 +1,13 @@
-"""L2 关联：按 service 关联指标+日志同源、变更信号（纯函数，零 LLM 调用）。
+"""L2 关联：对一个事故组关联指标+日志同源、变更信号（纯函数，零 LLM 调用）。
 
-确定性纯函数：``_within_window``（指标+日志同源）、``_change_within_window``（部署变更关联）、
-``template_summary``（现象摘要模板兜底）。``l2_correlate`` 返回
-``{service: (Correlation, change_related, recent_change)}``。
+确定性纯函数：``_within_window``（**同 service** 指标+日志同源）、``_change_within_window``
+（部署变更关联）、``template_summary``（现象摘要模板兜底）。
+
+M9 起入参是 ``grouping.group_anomalies`` 划分出的**组**（可跨服务），不再是单个 service。
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -22,13 +22,21 @@ def _anom_ts(a: Any) -> datetime:
 
 
 def _within_window(metric_anoms: list, log_anoms: list, window_sec: int) -> bool:
-    """任意 metric 与 log anomaly 的判定时间差 ≤ window → 同源关联。"""
+    """**同 service** 的 metric 与 log 判定时间差 ≤ window → 同源关联。
+
+    必须显式限定同服务：``calibrate_severity`` 的「同源 metric+log 升 critical」只看
+    ``related``，它自己**从不检查 service** —— 同服务的保证原先完全依赖调用方按 service
+    分组（M9 前 ``l2_correlate`` 就是这么切的）。M9 的分组可跨服务，若这里不加限定，
+    一个服务的 metric 会跟另一个服务的 log 配成「同源」，把无关组合误升为 critical。
+    """
     if not metric_anoms or not log_anoms:
         return False
     window = timedelta(seconds=window_sec)
     for m in metric_anoms:
         m_ts = _anom_ts(m)
         for log in log_anoms:
+            if m.service != log.service:
+                continue
             if abs(m_ts - _anom_ts(log)) <= window:
                 return True
     return False
@@ -76,28 +84,24 @@ def template_summary(metric_anoms: list, log_anoms: list) -> str:
     return "；".join(parts)
 
 
-async def l2_correlate(ctx: Any) -> dict:
-    """按 service 分组，返回 ``{service: (Correlation, change_related, recent_change)}``。"""
-    cs = ctx.domain_config.correlation
-    metric_by_service: dict[str, list] = defaultdict(list)
-    log_by_service: dict[str, list] = defaultdict(list)
-    for a in ctx.anomalies:
-        (metric_by_service if a.kind == "metric" else log_by_service)[a.service].append(a)
+async def l2_correlate(ctx: Any, anomalies: list) -> tuple[Correlation, bool, dict | None]:
+    """对一个**事故组**算关联，返回 ``(Correlation, change_related, recent_change)``。
 
-    services = set(metric_by_service) | set(log_by_service)
-    result: dict[str, tuple] = {}
-    for service in services:
-        m = metric_by_service[service]
-        log = log_by_service[service]
-        related = _within_window(m, log, cs.metric_log_window_sec)
-        if related:
-            reason = "metric_log_within_window"
-        elif m and not log:
-            reason = "metric_only"
-        elif log and not m:
-            reason = "log_only"
-        else:
-            reason = "unrelated"
-        change_related, recent_change = _change_within_window(ctx.changes, m + log, cs.change_window_sec)
-        result[service] = (Correlation(related=related, reason=reason), change_related, recent_change)
-    return result
+    M9：入参从「一个 service 的异常」变成「一个组」（``pipeline/grouping.py`` 划分出来的
+    连通分量，可跨服务），返回也从 ``{service: ...}`` 的字典变成单条结果——调用方本来就
+    是逐个处理的，字典只是为了按 service 索引。
+    """
+    cs = ctx.domain_config.correlation
+    metric_anoms = [a for a in anomalies if a.kind == "metric"]
+    log_anoms = [a for a in anomalies if a.kind == "log"]
+    related = _within_window(metric_anoms, log_anoms, cs.metric_log_window_sec)
+    if related:
+        reason = "metric_log_within_window"
+    elif metric_anoms and not log_anoms:
+        reason = "metric_only"
+    elif log_anoms and not metric_anoms:
+        reason = "log_only"
+    else:
+        reason = "unrelated"
+    change_related, recent_change = _change_within_window(ctx.changes, list(anomalies), cs.change_window_sec)
+    return Correlation(related=related, reason=reason), change_related, recent_change

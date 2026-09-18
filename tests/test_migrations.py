@@ -123,7 +123,7 @@ def test_split_statements_handles_named_dollar_tags() -> None:
 def test_load_scripts_parses_version() -> None:
     runner = _runner(FakeConn())
     scripts = runner._load_scripts()
-    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     assert "problem_record" in scripts[0].sql
     assert "collect_watermark" in scripts[1].sql
     assert "detection_round" in scripts[2].sql
@@ -207,6 +207,16 @@ def test_v9_seeds_testbed_log_targets() -> None:
     assert "'hits.hits'" in sql
 
 
+def test_v10_widens_problem_record_service() -> None:
+    """V10：service 加宽到 255 —— M9 跨服务合并后它是拼接的服务名列表。
+
+    group_key / open_group_key 生成列 / 唯一索引**不跟着加宽**：M9 让 group_key 的
+    service 段取自 group_key_service（排序后第一个服务名，仍 ≤64），与展示列解耦。
+    """
+    sql = _script(10)
+    assert "ALTER TABLE problem_record ALTER COLUMN service TYPE VARCHAR(255)" in sql
+
+
 def test_scripts_do_not_hardcode_schema() -> None:
     """迁移脚本里不得出现 ``CREATE SCHEMA`` / ``SET search_path`` —— schema 由 runner 按配置注入。
 
@@ -216,7 +226,7 @@ def test_scripts_do_not_hardcode_schema() -> None:
     只有换一个 db_schema 才会暴露。MySQL 版能写死 ``USE aiops_apm_runtime`` 是因为库名恒等于
     schema 名；PG 的 schema 是可配置的。
     """
-    for version in range(1, 10):
+    for version in range(1, 11):
         sql = _script(version)
         assert "CREATE SCHEMA" not in sql, f"V{version} 不应自己建 schema"
         assert "SET search_path" not in sql, f"V{version} 不应自己设 search_path"
@@ -226,7 +236,7 @@ async def test_migrate_applies_new_scripts_in_order() -> None:
     conn = FakeConn(current_version=0)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 9
+    assert applied == 10
     assert conn.schema_versions_created
     assert any(s.startswith("CREATE SCHEMA IF NOT EXISTS aiops_apm_runtime") for s in conn.statements)
     assert any(s.strip().startswith("CREATE TABLE IF NOT EXISTS problem_record") for s in conn.statements)
@@ -245,7 +255,7 @@ async def test_migrate_idempotent_skips_applied_versions() -> None:
     conn = FakeConn(current_version=1)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 8  # V1 已应用，仅补 V2..V9
+    assert applied == 9  # V1 已应用，仅补 V2..V10
     # 已应用版本不重复执行其建表语句
     assert not any("CREATE TABLE IF NOT EXISTS problem_record" in s for s in conn.statements)
     assert any("CREATE TABLE IF NOT EXISTS collect_watermark" in s for s in conn.statements)

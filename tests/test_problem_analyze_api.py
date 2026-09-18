@@ -42,7 +42,14 @@ class CapturingHttp:
         self._resp = resp
 
     async def request(self, method, url, **kwargs):
-        self.calls.append({"method": method, "url": url, "json": kwargs.get("json")})
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "json": kwargs.get("json"),
+                "headers": kwargs.get("headers"),
+            }
+        )
         return self._resp
 
     async def aclose(self) -> None:
@@ -81,9 +88,24 @@ def test_analyze_happy_path_captures_run_and_flips_state(client):
     assert call["method"] == "POST"
     assert call["url"] == BASE + "/run"
     body = call["json"]
-    assert set(body.keys()) == {"workflow_id", "ticket"}
+    assert set(body.keys()) == {"workflow_id", "ticket", "tenant_id"}
     assert body["workflow_id"] == "wf-1"
-    ticket = body["ticket"]
+    # 租户桥接：未配 agentflow_tenant → 原样转发请求租户（单租户部署行为不变）。
+    # **头与 body 都要给**：agentflow 的 POST /run 在 dev 模式按 body.tenant_id 决定 run 落哪个库，
+    # 头只影响 workflow/配置的查找；只给头会"半程换租户"（run 掉进 local，且那里没有 MCP 绑定）。
+    assert call["headers"]["X-Tenant-ID"] == "default"
+    assert body["tenant_id"] == "default"
+
+    # ⚠️ inputs 必须**包一层 bug_report**：workflow 里各 agent 的入参是
+    # $.inputs.bug_report[.cmdb_ci.name]。早期发平铺 ticket 时该路径恒为 None，
+    # 工作流在 triage.require 处就失败。时间窗同批下发（日志查询用）。
+    inputs = body["ticket"]
+    assert set(inputs.keys()) == {"bug_report", "window_start", "window_end"}
+    # detected_at = 12:00Z，无 first/last_seen → 12:00±10min = 20min，过窄撑到 30min
+    assert inputs["window_end"] == "2026-08-26T12:10:00+00:00"
+    assert inputs["window_start"] == "2026-08-26T11:40:00+00:00"
+
+    ticket = inputs["bug_report"]
     assert ticket["number"] == "PR-0001"
     assert ticket["state"] == "New"
     assert ticket["impact"] == "2"          # high
@@ -134,14 +156,52 @@ def _seed_with_log_traces(client, *, record_id="PR-0002", service="svc-b", sever
 
 
 def test_analyze_ticket_exposes_request_id_from_log_trace_ids(client):
-    """git-search 工作流入参契约：ticket 顶层 requestId = log_trace_ids.trace_ids[0]。"""
+    """工作流入参契约：``bug_report.requestId`` = log_trace_ids.trace_ids[0]（链路 ID）。"""
     _seed_with_log_traces(client)
     capture = CapturingHttp(_ok_resp())
     client.app.state.http_client = capture
     resp = client.post("/v1/problems/PR-0002/analyze", json={"workflow_id": "wf-1"})
     assert resp.status_code == 200
-    ticket = capture.calls[0]["json"]["ticket"]
+    ticket = capture.calls[0]["json"]["ticket"]["bug_report"]
     assert ticket["requestId"] == "2430a48a7e4d4a4f97b2788ed6a8891b"
+
+
+def test_analyze_outbound_tenant_bridged(client):
+    """配了 agentflow_tenant → 出站带它，而不是请求租户（两侧租户不同，必须显式桥接）。"""
+    _seed(client)
+    client.app.state.settings.agentflow_tenant = "otr"
+    capture = CapturingHttp(_ok_resp())
+    client.app.state.http_client = capture
+    assert client.post("/v1/problems/PR-0001/analyze", json={"workflow_id": "wf-1"}).status_code == 200
+    assert capture.calls[0]["headers"]["X-Tenant-ID"] == "otr"
+    assert capture.calls[0]["json"]["tenant_id"] == "otr"
+
+
+def test_analyze_rerun_appends_second_binding_without_state_flip(client):
+    """打回后重跑：in_progress + rerun=true → 起新 run 并**追加**绑定（读取取最后一条）。"""
+    _seed(client)
+    client.app.state.http_client = CapturingHttp(_ok_resp(run_id="run_1"))
+    assert client.post("/v1/problems/PR-0001/analyze", json={"workflow_id": "wf-1"}).status_code == 200
+
+    capture2 = CapturingHttp(_ok_resp(run_id="run_2"))
+    client.app.state.http_client = capture2
+    resp = client.post("/v1/problems/PR-0001/analyze", json={"workflow_id": "wf-1", "rerun": True})
+    assert resp.status_code == 200
+    assert resp.json() == {"record_id": "PR-0001", "state": "in_progress", "run_id": "run_2"}
+
+    detail = client.get("/v1/problems/PR-0001").json()
+    assert detail["state"] == "in_progress"
+    runs = [e for e in detail["evidence"] if e.get("type") == "agent_run"]
+    assert [e["run_id"] for e in runs] == ["run_1", "run_2"]
+
+
+def test_analyze_without_service_400(client):
+    """没有服务名 → 400（取数节点按它过滤，缺了只能靠猜）。"""
+    _seed(client, service="")
+    client.app.state.http_client = CapturingHttp(_ok_resp())
+    resp = client.post("/v1/problems/PR-0001/analyze", json={"workflow_id": "wf-1"})
+    assert resp.status_code == 400
+    assert "service" in resp.json()["reason"]
 
 
 def test_analyze_missing_record_404(client):

@@ -32,7 +32,16 @@ def calibrate_severity(anomalies: list, *, related: bool = False) -> str:
 
 
 async def l3_verify(ctx: Any, service: str, anomalies: list, *, related: bool = False) -> Verification:
-    """对一个 service 的异常做持续性 + fpr 闸门 + 严重度校准。"""
+    """对一个**事故组**的异常做持续性 + fpr 闸门 + 严重度校准。
+
+    ``service`` 是组的**代表服务**（``grouping.representative_service``），只用于拼 fpr 的
+    去重键——持续性本身是按 ``anomaly_key`` 逐条算的，与 service 无关。
+
+    ⚠️ 这个代表值必须与 ``emit`` 写进 ``ProblemRecord.group_key_service`` 的**完全一致**：
+    fpr 读（这里）与写（``router/problems.py`` 的 `_record_fpr`，键取自记录的 ``group_key``）
+    必须是同一个键，否则误报率闸门永远读不到已写入的条目，静默失效。故由 ``run_domain``
+    统一算一次、两处透传。
+    """
     vc = ctx.domain_config.verify
     persisted: list = []
     for a in anomalies:

@@ -20,14 +20,18 @@ class SignatureAggregateDetector(Detector):
     async def detect(self, signals: list[Any], params: dict) -> list[Any]:
         min_count = params.get("min_count", 5)
         n_frames = params.get("n_frames", 3)
-        groups: dict[str, list[LogSignal]] = {}
+        # 分组键含 service：M9 前只用 signature，两个服务打出同一签名时会塌成**一条**
+        # LogAnomaly，service 取到谁取决于 ctx.signals 的插入顺序（count 却是跨服务总数）。
+        # 而 fingerprint.anomaly_key = log|tenant|service|signature 会把这个任意的 service
+        # 焙进去重身份 → detection_state 持续性与 reconcile 的 miss 判定在服务间漂移。
+        groups: dict[tuple[str, str], list[LogSignal]] = {}
         for s in signals:
             if not isinstance(s, LogSignal):
                 continue
             sig = s.signature or signature(s, n_frames)
-            groups.setdefault(sig, []).append(s)
+            groups.setdefault((sig, s.service), []).append(s)
         anomalies: list[Any] = []
-        for sig, logs in groups.items():
+        for (sig, service), logs in groups.items():
             if len(logs) < min_count:
                 continue
             # 业务 trace/request id（可选，去重保留）：采集器带 trace_id 时透传到 problem_record 证据
@@ -36,7 +40,7 @@ class SignatureAggregateDetector(Detector):
                 LogAnomaly(
                     kind="log",
                     tenant_id=logs[0].tenant_id,
-                    service=logs[0].service,
+                    service=service,
                     level=logs[0].level,
                     signature=sig,
                     pattern=logs[0].message[:120],

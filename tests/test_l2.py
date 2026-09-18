@@ -127,32 +127,30 @@ async def test_l2_correlate_metric_log_within_window() -> None:
             detectors=[], correlation=CorrelationSpec(metric_log_window_sec=300, change_window_sec=300)
         ),
     )
-    corr = await l2_correlate(ctx)
-    entry = corr["svc-a"]
-    assert entry[0].related is True
-    assert entry[0].reason == "metric_log_within_window"
-    assert entry[1] is False
-    assert entry[2] is None
+    corr, change_related, recent_change = await l2_correlate(ctx, ctx.anomalies)
+    assert corr.related is True
+    assert corr.reason == "metric_log_within_window"
+    assert change_related is False
+    assert recent_change is None
 
 
 async def test_l2_correlate_metric_only() -> None:
     ctx = make_ctx(anomalies=[ma()])
-    corr = await l2_correlate(ctx)
-    assert corr["svc-a"][0].related is False
-    assert corr["svc-a"][0].reason == "metric_only"
+    corr, _, _ = await l2_correlate(ctx, ctx.anomalies)
+    assert corr.related is False
+    assert corr.reason == "metric_only"
 
 
 async def test_l2_correlate_log_only() -> None:
     ctx = make_ctx(anomalies=[la()])
-    corr = await l2_correlate(ctx)
-    assert corr["svc-a"][0].related is False
-    assert corr["svc-a"][0].reason == "log_only"
+    corr, _, _ = await l2_correlate(ctx, ctx.anomalies)
+    assert corr.related is False
+    assert corr.reason == "log_only"
 
 
 async def test_l2_correlate_change_related() -> None:
     c = ChangeSignal(service="svc-a", change_id="C-9", type="deployment", summary="v3", timestamp=TS)
     ctx = make_ctx(anomalies=[ma()], changes=[c])
-    corr = await l2_correlate(ctx)
-    entry = corr["svc-a"]
-    assert entry[1] is True
-    assert entry[2]["change_id"] == "C-9"
+    _, change_related, recent_change = await l2_correlate(ctx, ctx.anomalies)
+    assert change_related is True
+    assert recent_change["change_id"] == "C-9"

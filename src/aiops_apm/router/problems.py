@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import httpx
@@ -22,6 +22,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from ..collectors._gateway import OutboundGateway
+from ..diagnosis import from_agentflow, from_spike
 from ..exceptions import AppException, ErrorCode
 from ..metrics import update_fpr_gauge
 from .deps import get_tenant_id
@@ -36,8 +37,56 @@ _SEV_MAP = {
 }
 
 
+def _primary_service(rec: dict) -> str:
+    """记录的主服务名（单个）。
+
+    M9 起跨服务记录的 ``service`` 是逗号拼接串（如 ``"gateway-service,order-service"``），
+    而下游有些字段只能放**一个**服务名——诊断服务的 ``app``/``repo`` 路由、
+    ServiceNow 的 ``cmdb_ci.name`` 都是单值。取拼接串的第一个（emit 时按服务名排序，
+    故第一个是确定性的组代表）。
+
+    展示类文案（``_symptom``/``_ticket_description``）**不要**用这个——那里列出全部
+    服务反而更有信息量，直接用原始 ``service``。
+    """
+    return (rec.get("service") or "").split(",")[0]
+
+
+def _detection_type(rec: dict) -> str:
+    """检测来源：``log`` / ``metric`` / ``combined`` / ``unknown``。
+
+    ``problem_record`` **没有**显式的类型列——``source`` 是模块名（固定 ``apm-alert``），
+    与检测来源无关。类型由证据本身决定：
+
+    ==================  ==================  ============
+    metric_anomalies    log_anomalies       结果
+    ==================  ==================  ============
+    空                  非空                ``log``
+    非空                空                  ``metric``
+    非空                非空                ``combined``（L2 同源关联命中，可能已升 critical）
+    空                  空                  ``unknown``（理论上不该出现）
+    ==================  ==================  ============
+
+    刻意**派生而非入库**：存列会与证据漂移（改了 anomaly 忘了同步列），派生不可能不一致，
+    也不需要迁移和历史回填。``correlation.reason`` 携带同样的事实，但它的取值
+    （``log_only`` / ``metric_only`` / ``metric_log_within_window`` / ``unrelated``）语义偏
+    "关联结果"，前端做类型筛选不如这个直白。
+    """
+    has_metric = bool(rec.get("metric_anomalies"))
+    has_log = bool(rec.get("log_anomalies"))
+    if has_metric and has_log:
+        return "combined"
+    if has_log:
+        return "log"
+    if has_metric:
+        return "metric"
+    return "unknown"
+
+
 class AnalyzeProblemBody(BaseModel):
     workflow_id: str
+    # 打回后重跑：state=in_progress 时默认 409（防重复发起），显式 ``rerun=true`` 才再起一轮。
+    # 引擎没有"重跑同一个 run"的语义，重跑 = 起一个新 run 并把绑定追加进 evidence（读取取最后一条）。
+    rerun: bool = False
 
 
 @router.get("")
@@ -58,7 +107,9 @@ async def list_problems(
     items = await request.app.state.storage.records.list(
         tenant, state=state, service=service, severity=severity, limit=limit
     )
-    return {"items": [_strip_decision_snapshots(r) for r in items]}
+    # 注意构造**新 dict**：``_strip_decision_snapshots`` 在无需剥离时返回的是同一个对象，
+    # 而 InMemory store 的 list() 给的就是库内 dict —— 原地改会污染存储。
+    return {"items": [{**_strip_decision_snapshots(r), "detection_type": _detection_type(r)} for r in items]}
 
 
 def _strip_decision_snapshots(rec: dict) -> dict:
@@ -83,7 +134,8 @@ async def get_problem(request: Request, record_id: str) -> dict:
     rec = await request.app.state.storage.records.get(tenant, record_id)
     if rec is None:
         raise AppException(ErrorCode.NOT_FOUND, f"problem record not found: {record_id}")
-    return rec
+    # 新 dict：详情同样不能原地改库内对象（见 list_problems 的说明）
+    return {**rec, "detection_type": _detection_type(rec)}
 
 
 async def _record_fpr(storage, tenant: str, rec: dict, *, false_positive: bool) -> bool:
@@ -196,7 +248,8 @@ def _build_ticket(rec: dict) -> dict:
     impact, urgency, priority = _SEV_MAP.get(
         (rec.get("severity") or "warning").lower(), ("3", "3", "3")
     )
-    cmdb_ci: dict = {"name": rec.get("service") or ""}
+    # cmdb_ci.name 是单值字段：跨服务记录取主服务（拼接串塞进去 CI 匹配不到）
+    cmdb_ci: dict = {"name": _primary_service(rec)}
     if rec.get("domain"):
         cmdb_ci["service"] = rec["domain"]
     if rec.get("instance"):
@@ -221,13 +274,85 @@ def _build_ticket(rec: dict) -> dict:
     return ticket
 
 
+# 时间窗推导参数（见 _analysis_window）。集中成常量是为了让"为什么是这几个数"一眼可见。
+_WINDOW_PAD = timedelta(minutes=10)     # 前后各留一段，避免边界上的日志被切掉
+_WINDOW_MIN = timedelta(minutes=30)     # 过窄的窗口取不到样本 → 撑到 30min
+_WINDOW_MAX = timedelta(hours=24)       # MCP 侧 DATASOURCE_MAX_RANGE_HOURS 硬拒绝 >24h
+
+
+def _as_utc(value) -> datetime | None:
+    """记录里的时间字段 → aware UTC；不可解析返回 None。
+
+    ⚠️ PG 的 ``TIMESTAMP(3)`` 读回来是 **naive**（无时区），这里一律按 UTC 解释 ——
+    与 MCP 侧 ``_parse_window`` 的处理一致，两边才能在同一个窗口上对齐。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _analysis_window(rec: dict, *, now: datetime | None = None) -> tuple[str, str]:
+    """问题单 → 日志查询窗口（UTC ISO8601，落在 MCP 的硬约束内）。
+
+    - 起：``first_seen_at``（缺则 ``detected_at``）− 10min
+    - 止：``last_seen_at``（缺则 ``detected_at``）+ 10min，且**夹到 now**
+      （检测轮的 ``last_seen_at`` 常晚于最新日志，不夹会去查未来）
+    - 跨度：过窄（<30min）撑到 30min，过长（>24h）截到 24h
+    """
+    now = now or datetime.now(timezone.utc)
+    detected = _as_utc(rec.get("detected_at")) or now
+    start = (_as_utc(rec.get("first_seen_at")) or detected) - _WINDOW_PAD
+    end = (_as_utc(rec.get("last_seen_at")) or detected) + _WINDOW_PAD
+    if end > now:
+        end = now
+    if start > end:
+        start = end - _WINDOW_MIN
+    if end - start < _WINDOW_MIN:
+        start = end - _WINDOW_MIN
+    if end - start > _WINDOW_MAX:
+        start = end - _WINDOW_MAX
+    return start.isoformat(), end.isoformat()
+
+
+def _agent_run_evidence(run_id: str, workflow_id: str) -> dict:
+    """``agent_run`` evidence 条目（与 ``records.mark_in_progress`` 写的形状一致）。"""
+    return {
+        "type": "agent_run",
+        "run_id": run_id,
+        "workflow_id": workflow_id,
+        "started_at": datetime.now(timezone.utc),
+    }
+
+
+def _build_analysis_inputs(rec: dict) -> dict:
+    """问题单 → agentflow workflow 的 ``inputs``。
+
+    ⚠️ 必须**包一层** ``bug_report``：``_build_ticket`` 的平铺形状就是"工单/事件"对象本身，
+    而 workflow 里各 agent 的入参是 ``$.inputs.bug_report[.cmdb_ci.name]``。早期直接把平铺
+    ticket 当 inputs 发出去，所有 ``$.inputs.bug_report`` 都解析成 None —— 工作流在
+    ``triage.require: [bug]`` 处就 ``NodeInputError`` 失败，页面上看不出真因。
+    """
+    start, end = _analysis_window(rec)
+    return {"bug_report": _build_ticket(rec), "window_start": start, "window_end": end}
+
+
 @router.post("/{record_id}/analyze")
 async def analyze_problem(request: Request, record_id: str, body: AnalyzeProblemBody) -> dict:
-    """对 pending 问题发起 agent 工作流分析（→ Bug Solve / agentflow run）。
+    """对问题单发起 agentflow 工作流分析（Problem Center「分析new」与「Analyze」共用）。
 
-    顺序：1) 校验 workflow_id → 2) 记录存在性（404）→ 3) state=pending 守卫（否则 409）→
-    4) 组平铺 ticket → 5) POST agentflow ``/run``（失败/非 2xx → 502，绝不翻转状态）→
-    6) 成功才 ``mark_in_progress``（WHERE state='pending' 原子单翻），evidence 记 run_id。
+    顺序：1) 校验 workflow_id → 2) 记录存在性（404）→ 3) 终态守卫（resolved/closed/archived → 409）→
+    4) state=pending 正常开跑；state=in_progress 且 ``rerun=true`` → 起新 run 并追加绑定
+    （打回后重跑），否则 409 → 5) 组 ``inputs``（``bug_report`` 包装 + 时间窗）→
+    6) POST agentflow ``/run``（失败/非 2xx → 502，绝不翻转状态）→ 7) 成功才写绑定/翻状态。
     """
     workflow_id = (body.workflow_id or "").strip()
     if not workflow_id:
@@ -235,23 +360,45 @@ async def analyze_problem(request: Request, record_id: str, body: AnalyzeProblem
 
     tenant = get_tenant_id(request)
     storage = request.app.state.storage
+    settings = request.app.state.settings
     rec = await storage.records.get(tenant, record_id)
     if rec is None:
         raise AppException(ErrorCode.NOT_FOUND, f"problem record not found: {record_id}")
-    if (rec.get("state") or "pending") != "pending":
+    state = rec.get("state") or "pending"
+    if state in ("resolved", "closed", "archived"):
         raise AppException(
             ErrorCode.CONFLICT,
-            f"problem {record_id} is not pending (state={rec.get('state')})",
+            f"problem {record_id} is {state}; analysis not allowed",
         )
+    if state != "pending" and not body.rerun:
+        raise AppException(
+            ErrorCode.CONFLICT,
+            f"problem {record_id} is not pending (state={state})",
+        )
+    if not _primary_service(rec):
+        # 服务名是取数的查询目标（日志/仓库都按它过滤）：没有它下游只能靠猜，宁可在入口拒绝。
+        raise AppException(ErrorCode.VALIDATION, "no service available for analysis")
 
-    ticket = _build_ticket(rec)
-    base = str(request.app.state.settings.bug_solve_base_url).rstrip("/")
+    inputs = _build_analysis_inputs(rec)
+    base = str(settings.bug_solve_base_url).rstrip("/")
     url = base + "/run"
     # 出站安全网关：base 为 operator 配置地址；回环仅当 APM_ALLOW_LOOPBACK=true 放行（本地 .env 已设）。
     OutboundGateway.validate_url(url)
     http = request.app.state.http_client
+    # 两侧租户不同（问题单在本仓租户，workflow/MCP 在 agentflow 租户）→ 显式桥接，见 settings.agentflow_tenant。
+    # ⚠️ **头与 body 都要给**：`POST /run` 的租户在 dev 模式取自 body 的 `tenant_id`
+    #   （`RunRequest.tenant_id` 缺省 "local"），而 workflow 查找走 X-Tenant-ID 头。
+    #   只给头 → 流程从 A 租户读、run 却落在 agentflow 的 local 租户（且那里没有 MCP 绑定，
+    #   agent 没有工具 → 节点失败）。这个"半程换租户"没有任何提示，实测踩过。
+    agentflow_tenant = settings.agentflow_tenant or tenant
+    headers = {"Content-Type": "application/json", "X-Tenant-ID": agentflow_tenant}
     try:
-        resp = await http.request("POST", url, json={"workflow_id": workflow_id, "ticket": ticket})
+        resp = await http.request(
+            "POST",
+            url,
+            json={"workflow_id": workflow_id, "ticket": inputs, "tenant_id": agentflow_tenant},
+            headers=headers,
+        )
     except httpx.HTTPError as exc:  # 连接 / 超时
         raise AppException(ErrorCode.UPSTREAM, f"agent workflow run start failed: {exc}") from exc
 
@@ -274,14 +421,94 @@ async def analyze_problem(request: Request, record_id: str, body: AnalyzeProblem
     if not run_id:
         raise AppException(ErrorCode.UPSTREAM, "agent workflow run start returned no run_id")
 
-    flipped = await storage.records.mark_in_progress(
-        tenant, record_id, run_id=run_id, workflow_id=workflow_id
-    )
-    if not flipped:
-        # 并发场景：run 已启动，但记录已被移出 pending（如他处 resolve）
-        raise AppException(ErrorCode.CONFLICT, f"problem {record_id} was concurrently moved out of pending")
+    if state == "pending":
+        flipped = await storage.records.mark_in_progress(
+            tenant, record_id, run_id=run_id, workflow_id=workflow_id
+        )
+        if not flipped:
+            # 并发场景：run 已启动，但记录已被移出 pending（如他处 resolve）
+            raise AppException(
+                ErrorCode.CONFLICT, f"problem {record_id} was concurrently moved out of pending"
+            )
+    elif not await storage.records.append_evidence(
+        tenant, record_id, _agent_run_evidence(run_id, workflow_id)
+    ):
+        # 重跑路径：记录在被删/租户不符时 append 返回 False
+        raise AppException(ErrorCode.CONFLICT, f"problem {record_id} vanished before binding")
 
+    # 走到这里 state 必为 in_progress：pending 刚被翻转，rerun 路径本来就是 in_progress
     return {"record_id": record_id, "state": "in_progress", "run_id": run_id}
+
+
+# ── 审批结果回写：agentflow run 的人工审批结论落 evidence（**只记录，不执行修复**）──────
+#
+# 审批本身发生在 agentflow 侧（``POST /runs/{id}/approve|reject``），本仓不参与决策；
+# 这里只把结论记一笔，让问题单上有痕迹可查——否则审批完问题单看不出任何变化，
+# 而唯一的关单动作（Ignore）写的是"误报"，语义不对。
+# 按 ``(run_id, node_id)`` 幂等：前端重试/重复点击不会写第二条。
+
+
+class RunDecisionBody(BaseModel):
+    run_id: str
+    node_id: str = "approve-plan"
+    approved: bool
+    by: str = ""
+    comment: str = Field("", max_length=2000)
+
+
+def _run_decisions(rec: dict) -> list[dict]:
+    """记录里所有 ``run_decision`` evidence（审批痕迹）。"""
+    return [
+        e
+        for e in rec.get("evidence") or []
+        if isinstance(e, dict) and e.get("type") == "run_decision"
+    ]
+
+
+@router.post("/{record_id}/run-decision")
+async def record_run_decision(request: Request, record_id: str, body: RunDecisionBody) -> dict:
+    """记录 agentflow run 的审批结论（幂等；不改变问题单状态）。"""
+    tenant = get_tenant_id(request)
+    storage = request.app.state.storage
+    rec = await storage.records.get(tenant, record_id)
+    if rec is None:
+        raise AppException(ErrorCode.NOT_FOUND, f"problem record not found: {record_id}")
+
+    run_id = (body.run_id or "").strip()
+    if not run_id:
+        raise AppException(ErrorCode.VALIDATION, "run_id is required")
+    node_id = (body.node_id or "").strip() or "approve-plan"
+
+    for e in _run_decisions(rec):
+        if e.get("run_id") == run_id and e.get("node_id") == node_id:
+            return {
+                "record_id": record_id,
+                "run_id": run_id,
+                "node_id": node_id,
+                "approved": bool(e.get("approved")),
+                "recorded": False,
+                "duplicate": True,
+            }
+
+    entry = {
+        "type": "run_decision",
+        "run_id": run_id,
+        "node_id": node_id,
+        "approved": bool(body.approved),
+        "by": body.by,
+        "comment": body.comment,
+        "decided_at": datetime.now(timezone.utc),
+    }
+    if not await storage.records.append_evidence(tenant, record_id, entry):
+        raise AppException(ErrorCode.CONFLICT, f"problem {record_id} vanished before recording")
+    return {
+        "record_id": record_id,
+        "run_id": run_id,
+        "node_id": node_id,
+        "approved": entry["approved"],
+        "recorded": True,
+        "duplicate": False,
+    }
 
 
 # ── 分析new：问题单 → 拼装诊断服务 /diagnose/logs，session_id 绑回 evidence ──────
@@ -313,14 +540,15 @@ def _first_log_excerpt(rec: dict) -> str:
 def _build_diagnose_body(rec: dict, body: DiagnoseProblemBody, settings) -> dict:
     """problem_record → ``/diagnose/logs`` 请求体（app/repo/trace_id/log_excerpt）。
 
-    - app：``record.service``（服务身份即日志源）；
-    - repo：请求覆盖 > ``settings.diagnose_repo`` > ``record.service``（spike 侧 repo 即仓库定位）；
+    - app：``record.service`` 的**主服务**（服务身份即日志源）。跨服务记录（M9）的 service
+      是拼接串，直接下发会让诊断服务找不到应用，故取第一个；
+    - repo：请求覆盖 > ``settings.diagnose_repo`` > 主服务（spike 侧 repo 即仓库定位）；
     - trace_id：请求覆盖 > evidence 里首条业务链路 ID（``_first_log_chain_id``）；
     - log_excerpt：请求覆盖 > 首条日志异常签名。
     """
     payload: dict = {
-        "app": body.app or rec.get("service") or "",
-        "repo": body.repo or settings.diagnose_repo or rec.get("service"),
+        "app": body.app or _primary_service(rec),
+        "repo": body.repo or settings.diagnose_repo or _primary_service(rec),
     }
     trace_id = body.trace_id or _first_log_chain_id(rec)
     if trace_id:
@@ -340,6 +568,25 @@ def _latest_diagnose_session(rec: dict) -> dict | None:
         if isinstance(e, dict) and e.get("type") == "diagnose_session" and e.get("session_id"):
             latest = e
     return latest
+
+
+def _agent_run_entries(rec: dict) -> list[dict]:
+    """记录里所有 ``agent_run`` evidence，**按写入顺序**（重跑追加在尾部）。
+
+    这就是「历次执行」的清单：每一轮 ``分析new``/``Analyze`` 都会追加一条，
+    尾部那条即当前轮。与 :func:`_latest_diagnose_session` 同源思路，只是要全量而非最新一条。
+    """
+    return [
+        e
+        for e in rec.get("evidence") or []
+        if isinstance(e, dict) and e.get("type") == "agent_run" and e.get("run_id")
+    ]
+
+
+def _latest_agent_run(rec: dict) -> dict | None:
+    """最新一轮 agentflow run（``agent_run`` evidence 的尾部）。"""
+    entries = _agent_run_entries(rec)
+    return entries[-1] if entries else None
 
 
 @router.post("/{record_id}/diagnose")
@@ -420,9 +667,19 @@ async def diagnose_problem(
 
 @router.get("/{record_id}/diagnose")
 async def get_problem_diagnosis(request: Request, record_id: str) -> dict:
-    """读该问题单绑定的诊断会话（``GET {diagnose_base_url}/status/{session_id}``）原文。
+    """读该问题单当前诊断的**归一视图模型**（见 :mod:`aiops_apm.diagnosis`）。
 
-    未绑定诊断 → 404；上游失败/超时 → 502。
+    按记录 evidence 里的绑定分派引擎：
+
+    - 有 ``agent_run`` → agentflow run 适配（``problem-log-diagnose`` 工作流，新路径）
+    - 有 ``diagnose_session`` → spike ``/status/{session_id}`` 适配（老记录路径）
+    - 两者都无 → 404
+
+    两条路径返回**同一形状**，UI 不需要分辨引擎。响应额外带 ``executions``——
+    该问题单的历次执行（每轮 run 一条，含实时状态），供弹窗底部的执行清单使用。
+
+    读路径不因上游抖动整屏失败：agentflow 拉不到时降级为带 ``error`` 的骨架视图，
+    而不是 502——否则用户连"这一轮还在跑"都看不到。
     """
     tenant = get_tenant_id(request)
     storage = request.app.state.storage
@@ -430,6 +687,21 @@ async def get_problem_diagnosis(request: Request, record_id: str) -> dict:
     rec = await storage.records.get(tenant, record_id)
     if rec is None:
         raise AppException(ErrorCode.NOT_FOUND, f"problem record not found: {record_id}")
+
+    issue_title = _ticket_title(rec)
+    executions = await from_agentflow.fetch_executions(request, _agent_run_entries(rec))
+
+    run_entry = _latest_agent_run(rec)
+    if run_entry is not None:
+        run_id = str(run_entry["run_id"])
+        run = await from_agentflow.fetch_run(request, run_id)
+        if run is None:
+            return from_agentflow.build_unavailable(issue_title=issue_title)
+        traces = await from_agentflow.fetch_traces(request, run_id)
+        return from_agentflow.build(
+            run, traces=traces, executions=executions, issue_title=issue_title
+        )
+
     entry = _latest_diagnose_session(rec)
     if entry is None:
         raise AppException(ErrorCode.NOT_FOUND, f"no diagnosis bound to problem {record_id}")
@@ -447,9 +719,12 @@ async def get_problem_diagnosis(request: Request, record_id: str) -> dict:
             ErrorCode.UPSTREAM, f"diagnosis status fetch failed: HTTP {resp.status_code}"
         )
     try:
-        return resp.json()
+        snap = resp.json()
     except Exception as exc:  # noqa: BLE001
         raise AppException(ErrorCode.UPSTREAM, "diagnosis status returned invalid body") from exc
+    if not isinstance(snap, dict):
+        raise AppException(ErrorCode.UPSTREAM, "diagnosis status returned invalid body")
+    return from_spike.build(snap, executions=executions, issue_title=issue_title)
 
 
 # ── 审批决策：拒绝重跑 / 忽略关单 / 误报关单（history 落本仓 evidence）─────────────
@@ -561,6 +836,152 @@ def _bounded_snapshot(snap: dict) -> dict:
     return snap
 
 
+async def _agentflow_reject_node(
+    request: Request, tenant: str, run_id: str, node_id: str, *, by: str, comment: str
+) -> str:
+    """驳回 agentflow run 上的审批节点；返回节点状态描述（失败不抛，返回错误说明）。
+
+    审批是**终态 CAS、不可逆**，且拒绝会走复盘的 ``recap`` 分支收尾——和 spike 侧的
+    ``/approve{decision:reject}`` 语义对齐。这里对失败宽容：节点可能已被别处驳回
+    （CAS 冲突 409），那不影响"关掉这条问题单"这个更重要的动作。
+    """
+    settings = request.app.state.settings
+    url = str(settings.bug_solve_base_url).rstrip("/") + f"/runs/{run_id}/reject"
+    OutboundGateway.validate_url(url)
+    http = request.app.state.http_client
+    agentflow_tenant = settings.agentflow_tenant or tenant
+    try:
+        resp = await http.request(
+            "POST",
+            url,
+            json={"node_id": node_id, "by": by, "comment": comment},
+            headers={"Content-Type": "application/json", "X-Tenant-ID": agentflow_tenant},
+        )
+    except httpx.HTTPError as exc:
+        return f"unreachable: {exc}"
+    if resp.status_code >= 300:
+        return f"failed: HTTP {resp.status_code} {_resp_detail(resp)}"
+    return "rejected"
+
+
+async def _decide_agentflow(
+    request: Request,
+    storage,
+    tenant: str,
+    rec: dict,
+    record_id: str,
+    run_entry: dict,
+    body: DiagnoseDecisionBody,
+) -> dict:
+    """agentflow 路径的决策：驳回重跑 / 忽略关单 / 误报关单。
+
+    与 spike 路径的差别在于"拒绝"要拆成两步——先把当前 run 的审批节点驳回（让它收尾），
+    再起一轮新的 run（``rerun=true``）。引擎没有"重跑同一个 run"的语义，只能起新的一轮，
+    新 run_id 追加进 ``evidence``，「历次执行」区据此列出每一轮。
+
+    响应形状与 spike 路径**保持一致**（``session_id`` 承接 run_id），UI 不需要分支。
+    """
+    settings = request.app.state.settings
+    run_id = str(run_entry["run_id"])
+    workflow_id = str(run_entry.get("workflow_id") or "")
+
+    if body.decision == "reject" and not (body.feedback or "").strip():
+        raise AppException(ErrorCode.VALIDATION, "拒绝必须带修改建议")
+
+    node_id = str(run_entry.get("approval_node_id") or "approve-plan")
+    by = "problem-center"
+    recorded: dict = {
+        "type": "diagnose_decision",
+        "decision": body.decision,
+        "engine": "agentflow",
+        "session_id": run_id,
+        "option_index": body.option_index,
+        "option_title": None,
+        "steps": None,
+        "feedback": body.feedback or "",
+        "session_status": None,
+        "remediation_status": None,
+        "reanalyze_count": None,
+        "max_reanalyze": None,
+        "snapshot": None,
+        "decided_at": datetime.now(timezone.utc),
+    }
+
+    if body.decision == "reject":
+        node_result = await _agentflow_reject_node(
+            request, tenant, run_id, node_id, by=by, comment=(body.feedback or "").strip()
+        )
+        recorded["remediation_status"] = node_result
+
+        # 起新一轮：与 analyze_problem 同一条链路（起 run + 绑 evidence），
+        # 复用其 inputs 组装与租户桥接约定。
+        if not workflow_id:
+            raise AppException(
+                ErrorCode.CONFLICT,
+                f"run {run_id} has no workflow_id bound; cannot rerun",
+            )
+        inputs = _build_analysis_inputs(rec)
+        url = str(settings.bug_solve_base_url).rstrip("/") + "/run"
+        OutboundGateway.validate_url(url)
+        http = request.app.state.http_client
+        agentflow_tenant = settings.agentflow_tenant or tenant
+        try:
+            resp = await http.request(
+                "POST",
+                url,
+                json={"workflow_id": workflow_id, "ticket": inputs, "tenant_id": agentflow_tenant},
+                headers={"Content-Type": "application/json", "X-Tenant-ID": agentflow_tenant},
+            )
+        except httpx.HTTPError as exc:
+            raise AppException(
+                ErrorCode.UPSTREAM, f"agent workflow rerun failed: {exc}"
+            ) from exc
+        if resp.status_code >= 300:
+            raise AppException(
+                ErrorCode.UPSTREAM,
+                f"agent workflow rerun failed: HTTP {resp.status_code} {_resp_detail(resp)}",
+            )
+        try:
+            new_run_id = str((resp.json() or {}).get("run_id") or "")
+        except Exception as exc:  # noqa: BLE001
+            raise AppException(
+                ErrorCode.UPSTREAM, "agent workflow rerun returned invalid body"
+            ) from exc
+        if not new_run_id:
+            raise AppException(ErrorCode.UPSTREAM, "agent workflow rerun returned no run_id")
+        await storage.records.append_evidence(
+            tenant, record_id, _agent_run_evidence(new_run_id, workflow_id)
+        )
+        # 记录 state 不变（仍在 in_progress，新一轮跑着）
+        recorded["session_status"] = "running"
+    else:
+        # 忽略 / 误报：尽力驳回节点（让 run 收尾），然后关单。
+        recorded["remediation_status"] = await _agentflow_reject_node(
+            request, tenant, run_id, node_id, by=by, comment=body.decision
+        )
+        recorded["session_status"] = "dismissed"
+        if body.decision == "false_positive":
+            await _record_fpr(storage, tenant, rec, false_positive=True)
+            await storage.records.resolve(tenant, record_id, reason="false_positive")
+        else:
+            await storage.records.close(tenant, record_id, reason="ignored")
+
+    if not await storage.records.append_evidence(tenant, record_id, recorded):
+        raise AppException(ErrorCode.CONFLICT, f"problem {record_id} vanished before recording")
+
+    fresh = await storage.records.get(tenant, record_id)
+    return {
+        "record_id": record_id,
+        "decision": body.decision,
+        "session_id": run_id,
+        "session_status": recorded["session_status"],
+        "remediation_status": recorded["remediation_status"],
+        "reanalyze_count": recorded["reanalyze_count"],
+        "max_reanalyze": recorded["max_reanalyze"],
+        "record_state": (fresh or rec).get("state"),
+    }
+
+
 @router.post("/{record_id}/diagnose/decision")
 async def decide_problem_diagnosis(
     request: Request, record_id: str, body: DiagnoseDecisionBody
@@ -587,6 +1008,15 @@ async def decide_problem_diagnosis(
             ErrorCode.CONFLICT,
             f"problem {record_id} is {rec.get('state')}; decision not allowed",
         )
+
+    # 分派引擎：新路径（agentflow run）与老路径（spike 会话）形态不同，各自处理。
+    # 对 UI 而言这是**同一个**决策入口，响应形状也保持一致（见下）。
+    run_entry = _latest_agent_run(rec)
+    if run_entry is not None:
+        return await _decide_agentflow(
+            request, storage, tenant, rec, record_id, run_entry, body
+        )
+
     entry = _latest_diagnose_session(rec)
     if entry is None:
         raise AppException(ErrorCode.CONFLICT, f"no diagnosis bound to problem {record_id}")

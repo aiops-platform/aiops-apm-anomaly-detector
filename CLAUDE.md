@@ -6,7 +6,9 @@
 
 `aiops-apm-anomaly-detector` 是一个 APM（应用性能监控）告警模块。它从第三方 API 采集指标/日志，经过确定性的 L0–L3 漏斗，最终产出 `problem_record` 落库，供下游诊断/修复使用。
 
-**当前里程碑：** M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）+ M6 调度/多租户/API/恢复闭环 + M7 可观测性/安全加固/交付打包 + **M8 存储层 PostgreSQL 化**已完成（`make lint test dev` 全绿；490 常跑用例 + 22 条真库集成用例，后者未设 `APM_TEST_PG_DSN` 时 skip）。已实现：工程骨架、`Settings`、`AppException`/`ErrorCode`、统一异常响应、探针（M0）；`models/`（signal/anomaly/record/config）+ `models/fingerprint.py`（去重真源）+ `plugins/base.py`（插件 ABC，契约冻结）（M1）；`migrations/`（`MigrationRunner` + `V1__init_tables.sql` 12 张表，`make migrate`）+ `storage/`（`ConnectionPool`/`RecordStore`/`DomainConfigStore`/`build_storage`，problem_record 原子去重）+ `config/`（`DomainConfigLoader` + `domains.yaml` seed）（M2）；`collectors/`（`OutboundGateway` 出站安全网关 + `SharedHttpClient` + `FieldMapper` + `http_metrics`/`http_logs`/`mock` 内置采集器，`collector_for` 分派）+ `MonitorTargetStore`/`SnapshotStore`/`WatermarkStore` + `signature.py`（L1 聚合共享）+ `V2__collect_watermark.sql` + `/v1/monitors` CRUD/连通性测试 API（M3）；`plugins/registry.py`（`PluginRegistry` 三组 entry_points 原子快照）+ `detectors/`（static_threshold/simple_compare/signature_aggregate）+ `suppressors/`（maintenance_window/blacklist）+ `pipeline/filter_signals.py`（结构化 matcher）+ `/v1/plugins` 列表/reload API（M4）；`pipeline/`（`DetectionContext`/`DomainResult`/`build_context`/`l0_suppress`/`l1_detect`/`l2_correlate`/`l3_verify`/`emit`/`run_domain`，确定性漏斗主体）+ `storage/`（`SequenceStore`/`DetectionStateStore`/`DynamicConfigStore`）（M5）；`scheduler.py`/`poller.py`/`reconcile.py`（调度 + 采集编排 + 自动关单）+ `auth/`（`AuthMiddleware` + `Principal`，配置了才强制）+ `storage/lease.py`（多副本 lease）+ `summary.py`（L2 摘要钩子）+ `router/`（alerts/problems/config/maintenance/blacklist 五新路由 + monitors run）（M6）；`metrics.py`（Prometheus 7 类指标 + `/metrics` 端点）+ `storage/rounds.py` + `V3__detection_round_domain.sql`（轮次审计读写）+ `router/audit.py`（`/v1/audit/rounds` + `/v1/audit/suppressed`）+ `audit.py`（`SecurityAudit` 五类结构化审计日志）+ `config/validator.py`（detector/suppressor 参数写入侧校验，非法 → 400）+ `_gateway` DNS 二次校验（fail-closed）+ `dynamic_config.write_fpr`（误报回写）+ `docker/`（Dockerfile/compose/seed/custom_detector/demo/locustfile）+ `Makefile` docker/loadtest 目标（M7）。**下一阶段 M9 待定义**；遗留：真实 LLM L2 摘要、vault 密钥管理、`docker compose up` / locust 端到端实测（待环境可用）。
+**当前里程碑：** M0 工程基座 + M1 契约层 + M2 持久化与迁移 + M3 采集层与出站网关 + M4 检测层（插件 registry + 内置 detector/suppressor）+ M5 漏斗 L0–L3 + emit（确定性核心）+ M6 调度/多租户/API/恢复闭环 + M7 可观测性/安全加固/交付打包 + **M8 存储层 PostgreSQL 化 + **M9 日志异常分组（按 signature/traceId 出单，可跨服务合并）**已完成（`make lint test dev` 全绿；516 常跑用例 + 26 条真库集成用例，后者未设 `APM_TEST_PG_DSN` 时 skip）。已实现：工程骨架、`Settings`、`AppException`/`ErrorCode`、统一异常响应、探针（M0）；`models/`（signal/anomaly/record/config）+ `models/fingerprint.py`（去重真源）+ `plugins/base.py`（插件 ABC，契约冻结）（M1）；`migrations/`（`MigrationRunner` + `V1__init_tables.sql` 12 张表，`make migrate`）+ `storage/`（`ConnectionPool`/`RecordStore`/`DomainConfigStore`/`build_storage`，problem_record 原子去重）+ `config/`（`DomainConfigLoader` + `domains.yaml` seed）（M2）；`collectors/`（`OutboundGateway` 出站安全网关 + `SharedHttpClient` + `FieldMapper` + `http_metrics`/`http_logs`/`mock` 内置采集器，`collector_for` 分派）+ `MonitorTargetStore`/`SnapshotStore`/`WatermarkStore` + `signature.py`（L1 聚合共享）+ `V2__collect_watermark.sql` + `/v1/monitors` CRUD/连通性测试 API（M3）；`plugins/registry.py`（`PluginRegistry` 三组 entry_points 原子快照）+ `detectors/`（static_threshold/simple_compare/signature_aggregate）+ `suppressors/`（maintenance_window/blacklist）+ `pipeline/filter_signals.py`（结构化 matcher）+ `/v1/plugins` 列表/reload API（M4）；`pipeline/`（`DetectionContext`/`DomainResult`/`build_context`/`l0_suppress`/`l1_detect`/`l2_correlate`/`l3_verify`/`emit`/`run_domain`，确定性漏斗主体）+ `storage/`（`SequenceStore`/`DetectionStateStore`/`DynamicConfigStore`）（M5）；`scheduler.py`/`poller.py`/`reconcile.py`（调度 + 采集编排 + 自动关单）+ `auth/`（`AuthMiddleware` + `Principal`，配置了才强制）+ `storage/lease.py`（多副本 lease）+ `summary.py`（L2 摘要钩子）+ `router/`（alerts/problems/config/maintenance/blacklist 五新路由 + monitors run）（M6）；`metrics.py`（Prometheus 7 类指标 + `/metrics` 端点）+ `storage/rounds.py` + `V3__detection_round_domain.sql`（轮次审计读写）+ `router/audit.py`（`/v1/audit/rounds` + `/v1/audit/suppressed`）+ `audit.py`（`SecurityAudit` 五类结构化审计日志）+ `config/validator.py`（detector/suppressor 参数写入侧校验，非法 → 400）+ `_gateway` DNS 二次校验（fail-closed）+ `dynamic_config.write_fpr`（误报回写）+ `docker/`（Dockerfile/compose/seed/custom_detector/demo/locustfile）+ `Makefile` docker/loadtest 目标（M7）。**下一阶段 M10 待定义**；遗留：真实 LLM L2 摘要、vault 密钥管理、`docker compose up` / locust 端到端实测（待环境可用）。
+
+M9（日志异常分组）把 `run_domain` 从「按 service 一刀切」改成按**连通分量**出单：同 `signature` 或同 `trace_id` 的日志异常归一组（可跨服务），metric 挂到本服务的日志组。踩坑记录（五个**现有测试抓不到**的静默破坏点）见 [`docs/logs/M9.md`](docs/logs/M9.md)——**改漏斗/分组前务必先读**。
 
 M8（存储层 PostgreSQL 化）把 MySQL/`aiomysql` 整体换成 PostgreSQL/`psycopg3`：8 个迁移脚本改写为 PG 方言、10 个 `MySQL*Store` 改名 `PG*Store`、`storage_backend` 由 `mysql` 改为 `pg`、新增真库集成测试道（`tests/test_pg_integration.py`）。设计与踩坑记录见 [`docs/logs/M8.md`](docs/logs/M8.md)——**改存储层前务必先读它的「方言映射」与「PG 专属陷阱」两节**。
 
@@ -22,9 +24,9 @@ M8（存储层 PostgreSQL 化）把 MySQL/`aiomysql` 整体换成 PostgreSQL/`ps
 
 实现前先读这些文档，并按实现计划中定义的 M0→M8 顺序推进。
 
-## 实现流程规则（M0–M8）
+## 实现流程规则（M0–M9）
 
-每个里程碑（M0–M8）落地实现时，必须遵循以下流程，保证文档随代码同步演进：
+每个里程碑（M0–M9）落地实现时，必须遵循以下流程，保证文档随代码同步演进：
 
 1. **实现计划**：每个 M 阶段动手前，先产出实现计划文档（范围、文件清单、验收标准）存入 `docs/plans/<M阶段>-implementation-plan.md`；并在本文件「当前里程碑」处标注该阶段「进行中」，完成后改为「已完成」。
 2. **实现日志**：每完成一个 M 阶段，在 `docs/logs/` 下新建 `<M阶段>.md`（如 `docs/logs/M0.md`、`docs/logs/M1.md`），记录该阶段的改动点、新增/修改文件清单、完成状态与遗留问题。
@@ -74,7 +76,7 @@ M8（存储层 PostgreSQL 化）把 MySQL/`aiomysql` 整体换成 PostgreSQL/`ps
 - `docker compose up` — 完整环境（postgres、mock-source、apm-alert、prometheus）
 - 用 `uvicorn ...` 启动服务；`GET /health`、`GET /ready` 为探针，`GET /metrics` 暴露 Prometheus 指标
 
-启动/手动调用/配置说明见 [`README.md`](../README.md) 的「启动与快速上手」章节（M0–M8 共用，每完成一个里程碑补充该阶段的启动附加步骤）。
+启动/手动调用/配置说明见 [`README.md`](../README.md) 的「启动与快速上手」章节（M0–M9 共用，每完成一个里程碑补充该阶段的启动附加步骤）。
 
 配置使用 `pydantic-settings`，环境变量前缀为 `APM_`（如 `APM_DB_HOST`、`APM_PORT`、`APM_ENABLE_SCHEDULER`）。
 

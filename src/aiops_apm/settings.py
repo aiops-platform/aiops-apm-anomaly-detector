@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     # agentflow（multi-agent-workflow，Bug Solve 后端）根地址：Problem Center Analyze 联动 POST /run 用。
     # APM_BUG_SOLVE_BASE_URL 可覆盖。
     bug_solve_base_url: str = "http://localhost:8000"
+    # agentflow 侧租户（出站 X-Tenant-ID）。**两侧租户不是同一个**：问题单在 APM 租户下
+    # （本机 default，前端用 X-Tenant-Id 指定该值），而 workflow / MCP server / agent 绑定
+    # 在 agentflow 租户下（本机 otr）。必须显式桥接——否则 run 落到 agentflow 的 dev 缺省
+    # 租户 `local`，页面上表现为 "Failed to load run: HTTP 404"（跨租户 run 一律 404）。
+    # 空 = 原样转发请求租户（单租户部署行为不变）。APM_AGENTFLOW_TENANT 可覆盖。
+    agentflow_tenant: str = ""
     # 诊断服务（HolmesGPT spike：aiops-agent-orchestration-spike）根地址：Problem Center「分析new」
     # 按问题单拼装 POST /diagnose/logs 用（同源读 GET /status/{session_id}）。APM_DIAGNOSE_BASE_URL 可覆盖。
     diagnose_base_url: str = "http://localhost:8017"

@@ -95,6 +95,12 @@ def _target(service: str, es_url: str) -> dict:
                 "message": "_source.app.message",
                 "timestamp": "_source.@timestamp",
                 "trace_id": "_source.app.traceId",
+                # stack_trace 必须映射：signature() 有堆栈时取「异常首行|顶部N帧」，
+                # 缺了它回退到 message[:120] —— 而 Spring 的 "Servlet.service() for servlet
+                # [dispatcherServlet] ... threw exception [Request processing failed: ..."
+                # 前缀对**所有**异常都一样，真正的异常类型在 120 字符之外被截掉，
+                # 于是不同类型的 error 全塌成同一个签名、归成同一条记录（M9 要的正好相反）。
+                "stack_trace": "_source.app.stack_trace",
             },
         },
     }
