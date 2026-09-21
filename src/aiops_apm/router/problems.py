@@ -160,11 +160,14 @@ async def _record_fpr(storage, tenant: str, rec: dict, *, false_positive: bool) 
 
 @router.post("/{record_id}/resolve")
 async def resolve_problem(request: Request, record_id: str, body: dict | None = None) -> dict:
-    """手动关闭问题单（reason=manual）。
+    """手动关闭问题单（reason=manual）→ ``state=resolved``（已修复/已处理）。
 
     M7（UC-7.6）：可选 body ``{"false_positive": true}``——为真时把该单 ``group_key``
     记为一次误报，写回 ``fpr_table``（total+1，fpr 重算）并更新 ``aiops_false_positive_rate`` Gauge。
     body 缺省 / 为假 → 记为一次有效判定（非误报）。
+
+    「忽略」（人判定不做）**不走这里**，走 ``POST /{record_id}/ignore``——两者是并列的终态，
+    混用的后果见该端点的说明。
     """
     false_positive = bool((body or {}).get("false_positive", False))
     tenant = get_tenant_id(request)
@@ -181,6 +184,33 @@ async def resolve_problem(request: Request, record_id: str, body: dict | None = 
         "state": "resolved",
         "false_positive_recorded": recorded,
     }
+
+
+@router.post("/{record_id}/ignore")
+async def ignore_problem(request: Request, record_id: str) -> dict:
+    """手动「忽略」问题单 → ``state=closed``（reason=``ignored``），与 ``resolved`` 并列的终态。
+
+    ``resolved`` = 已修复/已处理，``closed`` = 人判定不做（忽略）；两者复用同一组审计列
+    ``resolved_at``/``resolve_reason``（通用的「关闭时间/原因」，非 resolved 专属）。
+
+    **刻意与 ``/resolve`` 分开，不能合并成「都是关单」**：
+
+    - 忽略**不是**误报——本端点**不**回写 ``fpr_table``。走 ``/resolve {"false_positive": true}``
+      才记误报；否则每点一次「忽略」（= 先搁置不看）都会给该 ``group_key`` 记一次误报，
+      L3 的误报率闸门与 ``aiops_false_positive_rate`` Gauge 被污染。
+    - 语义上也要分开：界面上说「忽略」却在库里写 ``resolved``，等于替用户编造「已修复」的结论。
+
+    **不去动已绑定的诊断会话**（``/dismiss`` 收尾由 ``POST /{id}/diagnose/decision`` 做）：
+    本端点服务的是列表行上的「忽略」，对**没绑过诊断**的单同样可用，故不能依赖会话存在。
+    """
+    tenant = get_tenant_id(request)
+    storage = request.app.state.storage
+    rec = await storage.records.get(tenant, record_id)
+    if rec is None:
+        raise AppException(ErrorCode.NOT_FOUND, f"problem record not found: {record_id}")
+
+    await storage.records.close(tenant, record_id, reason="ignored")
+    return {"record_id": record_id, "state": "closed"}
 
 
 # ── Analyze：把 problem_record 映射成平铺 ServiceNow 风格 ticket ──────────────

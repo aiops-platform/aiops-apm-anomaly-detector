@@ -71,3 +71,19 @@ def test_resolve_false_positive_updates_gauge(client):
 
 def test_resolve_unknown_record_404_no_fpr(client):
     assert client.post("/v1/problems/PR-9999/resolve", json={"false_positive": True}).status_code == 404
+
+
+def test_ignore_writes_no_fpr(client):
+    """忽略 ≠ 误报：``/ignore`` 连一次判定都不记。
+
+    曾是真实缺陷：界面行上的「忽略」打的是 ``/resolve {"false_positive": true}``，
+    于是每点一次忽略就给该 group_key 记一次误报，误报率被「搁置不看」的单污染。
+    """
+    _seed(client)
+    resp = client.post("/v1/problems/PR-0001/ignore")
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "closed"
+
+    rec = client.get("/v1/problems/PR-0001").json()
+    fpr = asyncio.run(client.app.state.storage.dynamic_config.load_fpr("default"))
+    assert rec["group_key"] not in fpr

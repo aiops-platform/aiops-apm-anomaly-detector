@@ -58,7 +58,7 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
   - `src/aiops_apm/auth/` — `AuthMiddleware` + `Principal`：**配置了才强制**（`APM_API_KEYS` 非空才挂），无 key→401、跨租户→403、master key admin；未配置 = 放行
   - `src/aiops_apm/storage/lease.py` — `LeaseStore` ABC + InMemory + PG（`ON CONFLICT ... RETURNING` 原子接管 SQL）
   - `src/aiops_apm/summary.py` — `SummaryProvider` 钩子（模板默认，`enable_llm_summary` 开关，不接真实 LLM）
-  - `src/aiops_apm/router/` — `alerts.py`（`POST /v1/alerts/run` 全量/域过滤）、`problems.py`（`/v1/problems` 查询 + resolve）、`config.py`（reload + 域配置读写）、`maintenance.py`（维护窗口 CRUD）、`blacklist.py`（黑名单 CRUD）；`monitors.py` 加 `POST /{id}/run` 手动单跑
+  - `src/aiops_apm/router/` — `alerts.py`（`POST /v1/alerts/run` 全量/域过滤）、`problems.py`（`/v1/problems` 查询 + resolve/ignore）、`config.py`（reload + 域配置读写）、`maintenance.py`（维护窗口 CRUD）、`blacklist.py`（黑名单 CRUD）；`monitors.py` 加 `POST /{id}/run` 手动单跑
   - §13 用例 2 端到端：related + high metric + high log → critical（`test_uc62_combo_critical.py`）；reconcile 自动关单、跨租户 403、多副本 lease 全部测试覆盖（原 225 不回归，新增 62 → 287）
 - **M7 可观测性、安全加固、交付**（Prometheus 指标 + 轮次审计 + 安全审计日志 + 配置校验 + fpr 回写 + Docker/压测，原 287 不回归，新增 64 → 351）：
   - `src/aiops_apm/metrics.py` — Prometheus 7 类指标（round_total/success、records_created、degraded_sources、suppressed_total、false_positive_rate Gauge、round_duration Histogram）；`/metrics` 端点暴露；`poller.run_round` 每轮打点（`test_metrics.py`）
@@ -182,7 +182,7 @@ aiops_apm_runtime.problem_record —— 多半是还没跑迁移。请先执行 
 | `monitor_target` | V1✅ | **监控端点配置**（回答「监控谁、从哪采、多快采」） ✅ |
 | `maintenance_window` | V1 | L0 维护窗口：`(service, start_at, end_at)` 时间窗内的信号被抑制 |
 | `suppress_blacklist` | V1 | L0 黑名单：按 `(domain, service, signal)` 匹配的信号被抑制（`signal` 在 PG 下用双引号标识符 `"signal"`） |
-| `fpr_table` | V1 +V11 | 误报率统计（`group_key` 维度 `false_positive_cnt`/`total_cnt`/`fpr`），L3 误报率闸门 + `POST /resolve {"false_positive":true}` 误报回写落库 |
+| `fpr_table` | V1 +V11 | 误报率统计（`group_key` 维度 `false_positive_cnt`/`total_cnt`/`fpr`），L3 误报率闸门 + `POST /resolve {"false_positive":true}` 误报回写落库（`POST /ignore` 是「忽略」不是误报，**不写此表**） |
 | `record_seq` | V1 +V11 | `record_id` 原子取号（按 `seq_date` 维护 `next_seq`，`PR-YYYYMMDD-NNNN` 每日自增） |
 | `scheduler_lease` | V1 | 多副本选主：`scheduler_lease` 行锁 + `expires_at` TTL 续约 + 崩溃自动接管（PG 原子 `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`） |
 | `signal_snapshot` | V1✅ +V11 样本 | 原始信号快照（metric/log 采集落库），`signature` 为日志堆栈签名（V7 由 VARCHAR(255) 加宽至 VARCHAR(1024)）。量大，建议按 `snapshot_ts` 分区/定期归档 |
@@ -297,7 +297,8 @@ curl -i "http://127.0.0.1:<port>/v1/problems?state=pending&severity=high"
 # 每条都带派生的 detection_type：log / metric / combined（两者都有）/ unknown
 # 前端据此做证据类型筛选（无需后端过滤参数）
 curl -i http://127.0.0.1:<port>/v1/problems/PR-20260826-0001
-curl -i -X POST http://127.0.0.1:<port>/v1/problems/PR-20260826-0001/resolve   # reason=manual
+curl -i -X POST http://127.0.0.1:<port>/v1/problems/PR-20260826-0001/resolve   # → state=resolved（reason=manual）
+curl -i -X POST http://127.0.0.1:<port>/v1/problems/PR-20260826-0001/ignore    # → state=closed（reason=ignored），不记误报
 
 # 配置热加载（reload 声明在 /config/{domain} 之前避免路径冲突；写配置需 admin）
 curl -i -X POST http://127.0.0.1:<port>/v1/config/reload
@@ -318,7 +319,7 @@ curl -i http://127.0.0.1:<port>/v1/monitors -H "Authorization: Bearer k2"   # "*
 
 #### M7 指标 / 审计 / 配置校验 / 误报回写
 
-Prometheus 指标（`/metrics`）暴露 7 类指标，每轮检测自动打点（无需额外配置）；检测轮次写入 `detection_round`，可审计查询；config PUT 做 detector/suppressor 参数校验（非法 → 400 `CONFIG_ERROR`）；问题单 resolve 可回写误报：
+Prometheus 指标（`/metrics`）暴露 7 类指标，每轮检测自动打点（无需额外配置）；检测轮次写入 `detection_round`，可审计查询；config PUT 做 detector/suppressor 参数校验（非法 → 400 `CONFIG_ERROR`）；问题单 resolve 可回写误报（**忽略走 `/ignore`，不算误报**）：
 
 ```bash
 # Prometheus 指标文本（round_total/success、records_created、degraded_sources、

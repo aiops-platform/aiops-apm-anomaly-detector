@@ -71,6 +71,18 @@ def test_resolve_problem(client):
     assert client.post("/v1/problems/PR-9999/resolve").status_code == 404
 
 
+def test_ignore_problem(client):
+    """忽略 → ``state=closed`` + reason=``ignored``。**不是** resolved——两个终态语义不同。"""
+    _seed(client)
+    resp = client.post("/v1/problems/PR-0001/ignore")
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "closed"
+    detail = client.get("/v1/problems/PR-0001").json()
+    assert detail["state"] == "closed"
+    assert detail["resolve_reason"] == "ignored"
+    assert client.post("/v1/problems/PR-9999/ignore").status_code == 404
+
+
 # ---- detection_type 派生字段（M9 后新增）----
 
 
