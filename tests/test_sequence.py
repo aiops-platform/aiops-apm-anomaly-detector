@@ -1,6 +1,6 @@
-"""``SequenceStore``：record_seq 取号 PR-YYYYMMDD-NNNN。
+"""``SequenceStore`` 取号：``record_seq`` 出 PR-YYYYMMDD-NNNN、``ticket_seq`` 出 INC-YYYYMMDD-NNNN。
 
-覆盖：格式；同日期递增；跨日期归 1；``%04d`` 补零。
+覆盖：格式；同日期递增；跨日期归 1；``%04d`` 补零；两串号计数器互不影响。
 """
 
 from datetime import datetime, timezone
@@ -45,3 +45,32 @@ async def test_next_id_zero_padding() -> None:
     for _ in range(9):
         await s.next_id("application")
     assert await s.next_id("application") == "PR-20260826-0010"
+
+
+# ── 工单号（「升级」派单用）：INC-YYYYMMDD-NNNN，**与 PR 分开计数** ────────────
+
+async def test_next_ticket_number_format() -> None:
+    holder = {"now": _at(2026, 9, 21)}
+    assert await _store(holder).next_ticket_number() == "INC-20260921-0001"
+
+
+async def test_ticket_series_is_separate_from_record_series() -> None:
+    """两串号共用同一套格式与取号机制，但**计数器分开**。
+
+    共用一张 ``record_seq`` 的话（它的 PK 是 ``seq_date``）两种号会互相跳号：
+    ``PR-…-0007`` 与 ``INC-…-0007`` 并存、两边都有空洞，排查时像丢号。
+    """
+    holder = {"now": _at(2026, 9, 21)}
+    s = _store(holder)
+    assert await s.next_id("application") == "PR-20260921-0001"
+    assert await s.next_ticket_number() == "INC-20260921-0001"  # 不跟着 PR 走成 0002
+    assert await s.next_id("application") == "PR-20260921-0002"
+    assert await s.next_ticket_number() == "INC-20260921-0002"
+
+
+async def test_ticket_number_resets_on_new_day() -> None:
+    holder = {"now": _at(2026, 9, 21)}
+    s = _store(holder)
+    await s.next_ticket_number()
+    holder["now"] = _at(2026, 9, 22)
+    assert await s.next_ticket_number() == "INC-20260922-0001"

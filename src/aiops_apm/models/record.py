@@ -34,7 +34,7 @@ class ProblemRecord(BaseModel):
     source: str = "apm-alert"
     tenant_id: str = "default"
     domain: str
-    state: str = "pending"  # pending / in_progress / resolved / closed / archived
+    state: str = "pending"  # pending / in_progress / resolved / closed / archived / escalated
     service: str
     instance: str | None = None
     severity: str = "warning"  # warning / high / critical

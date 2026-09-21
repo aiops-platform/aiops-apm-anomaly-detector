@@ -249,3 +249,59 @@ async def test_close_missing_or_wrong_tenant_is_noop() -> None:
     with pytest.raises(ValueError):
         await store.close("", "PR-0001")
 
+
+
+# ── mark_escalated：state=escalated（第三个终态，升级派单）────────────────────
+
+async def test_mark_escalated_sets_state_and_audit_columns() -> None:
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001"))
+    await store.mark_escalated("default", "PR-0001", reason="escalated:INC-20260921-0001")
+    row = await store.get("default", "PR-0001")
+    assert row is not None
+    assert row["state"] == "escalated"
+    # 与 resolved/closed 复用同一组审计列；工单号带在 reason 里（前端 Detail 的 Resolve Reason 行）
+    assert row["resolve_reason"] == "escalated:INC-20260921-0001"
+    assert isinstance(row["resolved_at"], datetime)
+
+
+async def test_escalated_record_leaves_open_and_reopens_new() -> None:
+    """升级是终态 ⇒ 复发开新单（与 resolved/closed 同待遇）。
+
+    这条**不需要迁移**：PG 的 ``open_group_key`` 是白名单生成列
+    （``state IN ('pending','in_progress')``），escalated 天然被排除。
+    """
+    store = InMemoryRecordStore()
+    r1 = _record("PR-0001")
+    await store.write_or_append("default", r1)
+    await store.mark_escalated("default", "PR-0001")
+    assert await store.find_open("default", r1.group_key) is None
+
+    await store.write_or_append("default", _record("PR-0002"))
+    opened = await store.find_open("default", r1.group_key)
+    assert opened is not None
+    assert opened["record_id"] == "PR-0002"
+
+
+async def test_mark_escalated_missing_or_wrong_tenant_is_noop() -> None:
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001", tenant_id="t1"))
+    await store.mark_escalated("t2", "PR-0001")
+    assert (await store.get("t1", "PR-0001"))["state"] == "pending"
+    with pytest.raises(ValueError):
+        await store.mark_escalated("", "PR-0001")
+
+
+async def test_terminal_states_share_one_write_path() -> None:
+    """三个终态写的是**同一组列**——抽成一个私有方法就是为了防第三份复制漂移。"""
+    store = InMemoryRecordStore()
+    for i, (method, state) in enumerate(
+        [("resolve", "resolved"), ("close", "closed"), ("mark_escalated", "escalated")]
+    ):
+        rid = f"PR-100{i}"
+        await store.write_or_append("default", _record(rid))
+        await getattr(store, method)("default", rid, reason="r")
+        row = await store.get("default", rid)
+        assert row["state"] == state
+        assert row["resolve_reason"] == "r"
+        assert isinstance(row["resolved_at"], datetime)

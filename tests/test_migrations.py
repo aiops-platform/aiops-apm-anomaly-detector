@@ -123,7 +123,7 @@ def test_split_statements_handles_named_dollar_tags() -> None:
 def test_load_scripts_parses_version() -> None:
     runner = _runner(FakeConn())
     scripts = runner._load_scripts()
-    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     assert "problem_record" in scripts[0].sql
     assert "collect_watermark" in scripts[1].sql
     assert "detection_round" in scripts[2].sql
@@ -282,7 +282,7 @@ def test_scripts_do_not_hardcode_schema() -> None:
     只有换一个 db_schema 才会暴露。MySQL 版能写死 ``USE aiops_apm_runtime`` 是因为库名恒等于
     schema 名；PG 的 schema 是可配置的。
     """
-    for version in range(1, 12):
+    for version in range(1, 13):
         sql = _script(version)
         assert "CREATE SCHEMA" not in sql, f"V{version} 不应自己建 schema"
         assert "SET search_path" not in sql, f"V{version} 不应自己设 search_path"
@@ -292,7 +292,7 @@ async def test_migrate_applies_new_scripts_in_order() -> None:
     conn = FakeConn(current_version=0)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 11
+    assert applied == 12
     assert conn.schema_versions_created
     assert any(s.startswith("CREATE SCHEMA IF NOT EXISTS aiops_apm_runtime") for s in conn.statements)
     assert any(s.strip().startswith("CREATE TABLE IF NOT EXISTS problem_record") for s in conn.statements)
@@ -311,7 +311,7 @@ async def test_migrate_idempotent_skips_applied_versions() -> None:
     conn = FakeConn(current_version=1)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 10  # V1 已应用，仅补 V2..V11
+    assert applied == 11  # V1 已应用，仅补 V2..V12
     # 已应用版本不重复执行其建表语句
     assert not any("CREATE TABLE IF NOT EXISTS problem_record" in s for s in conn.statements)
     assert any("CREATE TABLE IF NOT EXISTS collect_watermark" in s for s in conn.statements)

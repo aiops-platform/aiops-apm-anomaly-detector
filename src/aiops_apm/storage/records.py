@@ -99,6 +99,22 @@ class RecordStore(ABC):
         """
 
     @abstractmethod
+    async def mark_escalated(
+        self, tenant_id: str, record_id: str, reason: str = "escalated"
+    ) -> None:
+        """升级终态：state=escalated —— 诊断被人工认可，已派出一张修复工单。
+
+        与 ``resolved``/``closed`` 并列的**第三个终态**，同样复用
+        ``resolved_at``/``resolve_reason`` 这组通用审计列。``open_group_key`` 生成列是
+        白名单 CASE（``state IN ('pending','in_progress')``），会自动把它排除在 open 之外
+        —— 复发照常开新单，与 resolved/closed 一致。
+
+        调用方（``router/problems.py`` 的 escalate 分支）传 ``reason="escalated:<工单号>"``：
+        那个值会显示在前端 Detail 弹窗的「Resolve Reason」行上，是**不查 evidence 就能看到
+        工单号**的唯一位置。
+        """
+
+    @abstractmethod
     async def mark_in_progress(
         self, tenant_id: str, record_id: str, *, run_id: str, workflow_id: str
     ) -> bool:
@@ -189,22 +205,31 @@ class InMemoryRecordStore(RecordStore):
         return dict(row)
 
     async def resolve(self, tenant_id: str, record_id: str, reason: str = "auto") -> None:
-        if not tenant_id:
-            raise ValueError("tenant_id is required")
-        row = self._rows.get(record_id)
-        if row is None or row["tenant_id"] != tenant_id:
-            return
-        row["state"] = "resolved"
-        row["resolved_at"] = datetime.now(timezone.utc)
-        row["resolve_reason"] = reason
+        self._set_terminal_state(tenant_id, record_id, "resolved", reason)
 
     async def close(self, tenant_id: str, record_id: str, reason: str = "manual") -> None:
+        self._set_terminal_state(tenant_id, record_id, "closed", reason)
+
+    async def mark_escalated(
+        self, tenant_id: str, record_id: str, reason: str = "escalated"
+    ) -> None:
+        self._set_terminal_state(tenant_id, record_id, "escalated", reason)
+
+    def _set_terminal_state(
+        self, tenant_id: str, record_id: str, state: str, reason: str
+    ) -> None:
+        """三个终态（resolved/closed/escalated）的**同一份**落库动作。
+
+        抽出来是防第三份复制：resolve 与 close 原本逐行相同、只差一个状态字符串，
+        加 escalate 就是第三份——而"三个终态该写哪几列"是一个**必须保持一致**的决定
+        （审计列复用见 ABC 的 ``mark_escalated`` docstring）。
+        """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         row = self._rows.get(record_id)
         if row is None or row["tenant_id"] != tenant_id:
             return
-        row["state"] = "closed"
+        row["state"] = state
         row["resolved_at"] = datetime.now(timezone.utc)
         row["resolve_reason"] = reason
 
@@ -356,21 +381,34 @@ class PGRecordStore(RecordStore):
         return None if row is None else self._row_to_dict(row)
 
     async def resolve(self, tenant_id: str, record_id: str, reason: str = "auto") -> None:
-        if not tenant_id:
-            raise ValueError("tenant_id is required")
-        await self._pool.execute(
-            "UPDATE problem_record SET state='resolved', resolved_at=CURRENT_TIMESTAMP(3), resolve_reason=%s "
-            "WHERE tenant_id=%s AND record_id=%s AND state <> 'resolved'",
-            (reason, tenant_id, record_id),
-        )
+        await self._set_terminal_state(tenant_id, record_id, "resolved", reason)
 
     async def close(self, tenant_id: str, record_id: str, reason: str = "manual") -> None:
+        await self._set_terminal_state(tenant_id, record_id, "closed", reason)
+
+    async def mark_escalated(
+        self, tenant_id: str, record_id: str, reason: str = "escalated"
+    ) -> None:
+        await self._set_terminal_state(tenant_id, record_id, "escalated", reason)
+
+    async def _set_terminal_state(
+        self, tenant_id: str, record_id: str, state: str, reason: str
+    ) -> None:
+        """三个终态（resolved/closed/escalated）的**同一份**落库动作。
+
+        抽出来是防第三份复制：resolve 与 close 原本只差一个状态字符串，加 escalate 就是
+        第三份——而"三个终态该写哪几列、守卫怎么写"是一个**必须保持一致**的决定。
+
+        守卫 ``state <> %s`` 保持逐字语义：目标状态是自身时不重复写（并发/重试幂等），
+        但**不阻止**从别的终态转过来（resolved → escalated 是允许的，反向也是）——
+        这是改动前就有的形状（`/resolve`、`/ignore` 两个端点不检查当前 state）。
+        """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         await self._pool.execute(
-            "UPDATE problem_record SET state='closed', resolved_at=CURRENT_TIMESTAMP(3), resolve_reason=%s "
-            "WHERE tenant_id=%s AND record_id=%s AND state <> 'closed'",
-            (reason, tenant_id, record_id),
+            "UPDATE problem_record SET state=%s, resolved_at=CURRENT_TIMESTAMP(3), resolve_reason=%s "
+            "WHERE tenant_id=%s AND record_id=%s AND state <> %s",
+            (state, reason, tenant_id, record_id, state),
         )
 
     async def mark_in_progress(
