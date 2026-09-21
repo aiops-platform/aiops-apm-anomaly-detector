@@ -275,9 +275,14 @@ def test_mcp_prefix_survives_so_server_grouping_works():
 
 
 def test_evidence_chain_is_inside_conclusion_and_uses_finding():
-    """dgxChain 读 snap.conclusion.evidence，且结论字段是 ``finding``。"""
+    """dgxChain 读 snap.conclusion.evidence，且结论字段是 ``finding``。
+
+    ``know`` 节点**不进证据链**——那条流程早已没有这个节点（占位工具 ``search_knowledge``
+    恒返回 INC0001），``_EVIDENCE_NODES`` 里的条目也一并删了。fixture 仍刻意留着它：
+    run 里出现流程外的节点是可能的（旧快照），这里锁的是"不进链"，不是"不存在"。
+    """
     evs = from_agentflow.build(_run())["conclusion"]["evidence"]
-    assert [e["source"] for e in evs] == ["日志证据", "历史知识", "代码定位"]
+    assert [e["source"] for e in evs] == ["日志证据", "代码定位"]
     assert evs[0]["finding"].startswith("502 集中在")
 
 

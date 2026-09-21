@@ -2,14 +2,20 @@
 
 数据源是 agentflow 的 ``GET /runs/{run_id}``（workflow ``problem-log-diagnose``）：
 
-    triage → logs → know → locate → rca → plan → approve-plan → recap
+    triage → logs, locate → rca → plan → diagnose-output   ← 审批门，且是终态节点
 
-其中 ``rca`` 给根因、``plan`` 给修复计划、``approve-plan`` 是人工审批门。映射见
+其中 ``rca`` 给根因、``plan`` 给修复计划、``diagnose-output`` 是人工审批门。映射见
 :func:`build`。工具调用走 ``GET /runs/{run_id}/traces``（``kind=tool_call``）。
 
+⚠️ **节点 id 住在 workflow 的 YAML 里，改名会静默打断这里**（``approve-plan`` →
+``diagnose-output`` 就踩过）：本模块的常量只是**兜底/优先项**，真正可信的来源是 run 的
+``pending_approvals[].node_id``（``_build_approval`` 会用它兜底）。拔掉流程里的
+``know`` 节点时也留下过 ``_EVIDENCE_NODES`` / ``_NODE_LABELS`` 里的死条目。
+
 **已知能力缺口（有意接受，不是遗漏）**：``problem-log-diagnose`` 只做
-「日志分析 → 根因 → 修复计划 → 审批」，**不产出 diff**，故视图模型的
-``suggested_diff`` 恒为空；UI 侧已有存在性判断，不会渲染空代码块。
+「日志分析 → 根因 → 修复计划 → 人工裁定」，**不产出 diff、也不改代码**（修复段已于
+2026-09-21 整体删除），故视图模型的 ``suggested_diff`` 恒为空；UI 侧已有存在性判断，
+不会渲染空代码块。
 """
 
 from __future__ import annotations
@@ -31,9 +37,12 @@ from .viewmodel import (
 )
 
 #: 视图模型里代表"根因""修复计划""审批门"的节点 id（与 workflow YAML 对齐）。
+#: ⚠️ ``NODE_APPROVAL`` 只是**优先项**——`_build_approval` 在它不在 ``pending_approvals``
+#: 里时会退回 ``pending[0].node_id``，所以改 workflow 的节点名**不必**同步这里也不会崩，
+#: 但会让"门确实在等"这个判断退化。改 YAML 时一并改。
 NODE_RCA = "rca"
 NODE_PLAN = "plan"
-NODE_APPROVAL = "approve-plan"
+NODE_APPROVAL = "diagnose-output"
 
 #: 取分析链路时最多回看的工具调用条数（护栏：单轮工具调用可能上千）。
 _MAX_TOOL_CALLS = 200
@@ -342,6 +351,30 @@ def _build_options(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return options
 
 
+def conclusion_digest(run: dict[str, Any]) -> dict[str, Any]:
+    """run 的**诊断结论摘要**（根因 / 置信度 / 总结 / 建议方案）。
+
+    给「升级」建修复工单用：拿到工单的人不该被要求回平台翻诊断。刻意**不带** ``evidence``
+    链与工具调用——那是 View Diagnosis 的展示内容，塞进工单只把 payload 撑大。
+
+    复用 :func:`_build_conclusion` 保证与页面上显示的结论**同源**：这里若另拼一份，
+    页面改了措辞、工单还是旧的那份，且不会有任何提示。
+
+    结论为空（诊断失败 / 走 halt 中断）时返回 ``{}``——调用方据此判断"值不值得升级"。
+    """
+    rca = _node_output(run, NODE_RCA)
+    plan = _plan_payload(_node_output(run, NODE_PLAN))
+    conclusion = _build_conclusion(rca, plan, [])
+    if conclusion is None:
+        return {}
+    return {
+        "root_cause": conclusion["root_cause"],
+        "confidence": conclusion["confidence"],
+        "summary": conclusion["summary"],
+        "recommended_fix": conclusion["recommended_fix"],
+    }
+
+
 #: run 节点状态 → ``dgxTaskView`` 认的任务状态。
 _TASK_STATUS: dict[str, str] = {
     "done": "done",
@@ -356,9 +389,9 @@ _TASK_STATUS: dict[str, str] = {
 
 
 #: 取数节点 → 证据链里的来源标签。
+#: 原有一条 ``know``：那个节点早已从流程里拔掉（占位工具恒返回 INC0001），条目留着是死的。
 _EVIDENCE_NODES: tuple[tuple[str, str], ...] = (
     ("logs", "日志证据"),
-    ("know", "历史知识"),
     ("locate", "代码定位"),
 )
 
@@ -366,17 +399,16 @@ _EVIDENCE_NODES: tuple[tuple[str, str], ...] = (
 #: ``problem-log-diagnose`` 各节点的中文标签。
 #:
 #: ``GET /runs/{id}`` 的节点字典**不含** ``name``（workflow YAML 里的 name 没随 run 快照出来），
-#: 不映射的话页面上直接印节点 id（``approve-plan``/``know``…），对使用者没有意义。
+#: 不映射的话页面上直接印节点 id（``diagnose-output``/``halt``…），对使用者没有意义。
 #: 节点上的 ``name`` 若存在则优先用它。
 _NODE_LABELS: dict[str, str] = {
     "triage": "症状分类",
     "logs": "日志证据",
-    "know": "历史知识",
     "locate": "代码定位",
     "rca": "根因分析",
     "plan": "修复计划",
-    "approve-plan": "审核修复计划",
-    "recap": "复盘",
+    "diagnose-output": "诊断输出",
+    "halt": "中断",
 }
 
 

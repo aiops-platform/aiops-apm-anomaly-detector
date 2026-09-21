@@ -36,6 +36,12 @@ _SEV_MAP = {
     "warning": ("3", "3", "3"),
 }
 
+#: 问题单的终态：落了这几档就不能再发起分析 / 诊断 / 裁定。
+#:
+#: ⚠️ 收成一个常量是防漏：这三个字面量原本**复制了三份**（analyze / diagnose / decision
+#: 各一处），加 `escalated` 时只改两处就会留下一个能对已升级的单重跑诊断的入口。
+#: `archived` 在词表里但全仓没有任何写入方，留着是防御性的。
+_TERMINAL_STATES = ("resolved", "closed", "archived", "escalated")
 
 def _primary_service(rec: dict) -> str:
     """记录的主服务名（单个）。
@@ -395,7 +401,7 @@ async def analyze_problem(request: Request, record_id: str, body: AnalyzeProblem
     if rec is None:
         raise AppException(ErrorCode.NOT_FOUND, f"problem record not found: {record_id}")
     state = rec.get("state") or "pending"
-    if state in ("resolved", "closed", "archived"):
+    if state in _TERMINAL_STATES:
         raise AppException(
             ErrorCode.CONFLICT,
             f"problem {record_id} is {state}; analysis not allowed",
@@ -636,7 +642,7 @@ async def diagnose_problem(
     rec = await storage.records.get(tenant, record_id)
     if rec is None:
         raise AppException(ErrorCode.NOT_FOUND, f"problem record not found: {record_id}")
-    if (rec.get("state") or "pending") in ("resolved", "closed", "archived"):
+    if (rec.get("state") or "pending") in _TERMINAL_STATES:
         raise AppException(
             ErrorCode.CONFLICT,
             f"problem {record_id} is {rec.get('state')}; diagnosis not allowed",
@@ -771,8 +777,15 @@ async def get_problem_diagnosis(request: Request, record_id: str) -> dict:
 
 
 class DiagnoseDecisionBody(BaseModel):
-    decision: Literal["reject", "ignore", "false_positive"]
-    feedback: str = Field("", max_length=2000)  # reject 必填非空；忽略/误报忽略之
+    """诊断输出的三种裁定。
+
+    ``false_positive`` **保留但前端不再出按钮**（2026-09-21「升级」顶掉了它在处理模块上的位置）：
+    它的后端链路（FPR 回写 + `resolve(reason=false_positive)`）仍被 M7 的既有测试与
+    `POST /{id}/resolve{false_positive:true}` 使用，删枚举值是不必要的破坏性改动。
+    """
+
+    decision: Literal["reject", "ignore", "escalate", "false_positive"]
+    feedback: str = Field("", max_length=2000)  # reject 必填非空；其余忽略之
     option_index: int | None = None  # 1-based；缺省 → spike 侧推荐方案
 
 
@@ -894,6 +907,173 @@ async def _agentflow_reject_node(
     return "rejected"
 
 
+async def _agentflow_approve_node(
+    request: Request, tenant: str, run_id: str, node_id: str, *, by: str, comment: str = ""
+) -> str:
+    """放行 agentflow run 上的审批节点（「升级」用）；返回节点状态描述，**失败不抛**。
+
+    与 :func:`_agentflow_reject_node` 逐字同构，差别只在 URL（``/approve``）与语义。
+    失败宽容的理由也一样：审批是**终态 CAS、不可逆**——重试一次「升级」时节点早已被答复，
+    二次 approve 必然 CAS 冲突（409），那不是错误，也不该挡住"建工单"这个更重要的动作。
+
+    但**不答这个门后果更重**：run 会永远停在 ``waiting_approval``，而那是 agentflow 的
+    活动状态、**一直占着租户的并发额度**，直到审批超时（本流程 86400s）才自愈。
+    """
+    settings = request.app.state.settings
+    url = str(settings.bug_solve_base_url).rstrip("/") + f"/runs/{run_id}/approve"
+    OutboundGateway.validate_url(url)
+    http = request.app.state.http_client
+    agentflow_tenant = settings.agentflow_tenant or tenant
+    try:
+        resp = await http.request(
+            "POST",
+            url,
+            json={"node_id": node_id, "by": by, "comment": comment},
+            headers={"Content-Type": "application/json", "X-Tenant-ID": agentflow_tenant},
+        )
+    except httpx.HTTPError as exc:
+        return f"unreachable: {exc}"
+    if resp.status_code >= 300:
+        return f"failed: HTTP {resp.status_code} {_resp_detail(resp)}"
+    return "approved"
+
+
+def _agentflow_gate_node(run: dict | None) -> str | None:
+    """该 run 当前**真正在等**的审批节点 id；**没有在等的门则返回 None**。
+
+    为什么不能写死：审批节点的 id 住在 workflow 的 YAML 里，改名（``approve-plan`` →
+    ``diagnose-output``）会让写死的那份**静默打偏**——reject/approve 打到一个不存在的
+    节点，run 永远停在 ``waiting_approval`` 占着并发额度，而调用方看不出是节点名对不上。
+
+    ⚠️ 原实现读 ``run_entry["approval_node_id"]``，而那个字段**全仓从来没有任何写入方**
+    （只有那一处读），所以恒等于写死的回退值——是个只在改名时才暴露的哑弹。改成从 run 的
+    ``pending_approvals`` 现取（形状见 ``GET /runs/{id}``）。
+
+    ⚠️ **返回 None 时调用方必须不发那次出站调用**（不要退回一个猜的节点 id）：
+    - run 的状态列可能是**陈旧的 `waiting_approval`**（checkpoint 才是"门开着没有"的真源，
+      ``pending_approvals`` 由节点状态算出），实测库里就有一条这样的记录；
+    - 猜一个 id 打过去，agentflow 的 ``DAGExecutor.approve`` 第一行 ``self.dag.nodes[nid]``
+      对不存在的节点抛 ``KeyError`` → **HTTP 500**（"节点存在但不在等待"才是干净的 400，
+      那个 KeyError 没进异常映射，是既有缺陷）。
+    - 就算打中一个存在的节点，也只会拿到 400 —— 一次注定的失败出站，还得在 evidence 里
+      记一句读不懂的 "HTTP 500"。
+    """
+    pending = (run or {}).get("pending_approvals") or []
+    for entry in pending:
+        node_id = (entry or {}).get("node_id") if isinstance(entry, dict) else None
+        if node_id:
+            return str(node_id)
+    return None
+
+
+def _created_ticket(rec: dict) -> dict | None:
+    """记录里已有的**升级裁定**（幂等判据）；没有则 None。
+
+    ⚠️ 判据是 ``diagnose_decision`` + ``decision == "escalate"`` + 非空 ``ticket_id``，
+    **不是**一个独立的 ``ticket_created`` 条目——「升级」与「它建出的那张工单」是
+    **同一件事**，拆成两条 evidence 会让"读的人得自己把两条拼起来"，也会多一个
+    只写不读的类型。
+
+    ``ticket_id`` 非空是必要的第二条件：escalate 分支在**建单失败**时不会走到写 evidence
+    （那时直接抛 502），但历史里可能留着更早期的、没有工单号的 escalate 条目。
+    """
+    for e in rec.get("evidence") or []:
+        if (
+            isinstance(e, dict)
+            and e.get("type") == "diagnose_decision"
+            and e.get("decision") == "escalate"
+            and e.get("ticket_id")
+        ):
+            return e
+    return None
+
+
+async def _apply_escalated_state(storage, tenant: str, record_id: str, decision: str, recorded: dict) -> None:
+    """``escalate`` 才把记录落成终态；非 escalate 是空操作。
+
+    ⚠️ **必须在 ``append_evidence`` 之后调**——顺序反了（终态先落、evidence 没落）时，
+    重试的幂等判据（``_created_ticket`` 读的是 evidence 里的升级裁定）不成立
+    → **建出第二张工单**。
+    这个顺序下最坏只是"单已建、状态还没翻"，重试会补齐（``mark_escalated`` 对同状态幂等）。
+
+    ``reason`` 里带上工单号：它会显示在前端 Detail 弹窗的「Resolve Reason」行上，
+    是**不展开 evidence 就能看到工单号**的唯一位置。
+    """
+    if decision != "escalate":
+        return
+    ticket_number = recorded.get("ticket_number") or ""
+    await storage.records.mark_escalated(
+        tenant, record_id, reason=f"escalated:{ticket_number}" if ticket_number else "escalated"
+    )
+
+
+async def _agentflow_create_ticket(
+    request: Request, tenant: str, rec: dict, run: dict | None
+) -> dict:
+    """在 agentflow 建一张修复工单，返回 ``{ticket_id, ticket_number}``。
+
+    **失败抛 ``UPSTREAM``**——与上面两个 best-effort 的审批动作刻意不同：建单没成就不该
+    对外说"已升级"，调用方据此**不置终态**，人可以重试。
+
+    ``number`` 由本仓生成（``SequenceStore.next_ticket_number`` → ``INC-YYYYMMDD-NNNN``）：
+    agentflow 的 ``tickets.number`` 列是**可空、无唯一约束、平台不生成**的自由文本列
+    （它是"外部工单号"的语义），由派单方给号才对——这里 APM 正是派单方。
+
+    ``bug_report`` 用 ``_build_ticket`` 原样 + 一份诊断结论摘要（``conclusion_digest``）：
+    工单在 agentflow 的 Ticket Inbox 里可见，且 ``inputs`` 形态与 ``/analyze`` 一致，
+    需要时可直接 ``POST /tickets/{tid}/run`` 把它跑起来。
+    """
+    settings = request.app.state.settings
+    storage = request.app.state.storage
+    agentflow_tenant = settings.agentflow_tenant or tenant
+
+    bug_report = dict(_build_ticket(rec))
+    digest = from_agentflow.conclusion_digest(run or {})
+    if digest:
+        bug_report["diagnosis"] = digest
+
+    start, end = _analysis_window(rec)
+    payload = {
+        "title": _ticket_title(rec)[:200],
+        "bug_report": bug_report,
+        "number": await storage.sequence.next_ticket_number(),
+        "service": _primary_service(rec),
+        "namespace": rec.get("instance"),
+        "severity": rec.get("severity"),
+        "window_start": start,
+        "window_end": end,
+    }
+
+    url = str(settings.bug_solve_base_url).rstrip("/") + "/tickets"
+    OutboundGateway.validate_url(url)
+    # 租户头与 body 都带：agentflow 的 ``_ticket_inputs`` 从 body 的 bug_report 组装 inputs，
+    # 而工单落哪张表由**头**决定（与 analyze_problem 同一条约定）。
+    payload["tenant_id"] = agentflow_tenant
+    http = request.app.state.http_client
+    try:
+        resp = await http.request(
+            "POST",
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json", "X-Tenant-ID": agentflow_tenant},
+        )
+    except httpx.HTTPError as exc:
+        raise AppException(ErrorCode.UPSTREAM, f"create ticket failed: {exc}") from exc
+    if resp.status_code >= 300:
+        raise AppException(
+            ErrorCode.UPSTREAM,
+            f"create ticket failed: HTTP {resp.status_code} {_resp_detail(resp)}",
+        )
+    try:
+        row = resp.json() or {}
+    except Exception as exc:  # noqa: BLE001
+        raise AppException(ErrorCode.UPSTREAM, "create ticket returned invalid body") from exc
+    ticket_id = str(row.get("id") or "")
+    if not ticket_id:
+        raise AppException(ErrorCode.UPSTREAM, "create ticket returned no id")
+    return {"ticket_id": ticket_id, "ticket_number": str(row.get("number") or "")}
+
+
 async def _decide_agentflow(
     request: Request,
     storage,
@@ -918,7 +1098,10 @@ async def _decide_agentflow(
     if body.decision == "reject" and not (body.feedback or "").strip():
         raise AppException(ErrorCode.VALIDATION, "拒绝必须带修改建议")
 
-    node_id = str(run_entry.get("approval_node_id") or "approve-plan")
+    # run 详情只拉一次，两处共用：门的 node_id（`_agentflow_gate_node`）与工单里的诊断摘要
+    # （`conclusion_digest`）。取不到（None）两条路径都有兜底，不阻断决策。
+    run = await from_agentflow.fetch_run(request, run_id)
+    node_id = _agentflow_gate_node(run)
     by = "problem-center"
     recorded: dict = {
         "type": "diagnose_decision",
@@ -934,14 +1117,42 @@ async def _decide_agentflow(
         "reanalyze_count": None,
         "max_reanalyze": None,
         "snapshot": None,
+        "ticket_id": None,
+        "ticket_number": None,
         "decided_at": datetime.now(timezone.utc),
     }
 
-    if body.decision == "reject":
-        node_result = await _agentflow_reject_node(
-            request, tenant, run_id, node_id, by=by, comment=(body.feedback or "").strip()
+    if body.decision == "escalate":
+        # 幂等前置：**看 evidence 不看 state**。重试路径真实存在——工单建出来但
+        # append_evidence 失败时，人看到的是报错，而单已经在 agentflow 里了。
+        existing = _created_ticket(rec)
+        if existing is not None:
+            recorded["remediation_status"] = "already_escalated"
+        else:
+            # 先放行门、再建单。反过来的话，"建单成功而 approve 失败"会留下一张
+            # 已派单、run 却还挂在门上的记录——而挂在门上的 run 一直占着租户并发额度。
+            # **没有在等的门就跳过这一步**（不猜一个 id 去打，见 `_agentflow_gate_node`）：
+            # 那说明门早被答复过（run 的状态列可能是陈旧的 waiting_approval），
+            # 或者这是个 halt/failed 的 run——两种情况下"派单"都不需要它。
+            if node_id:
+                recorded["remediation_status"] = await _agentflow_approve_node(
+                    request, tenant, run_id, node_id, by=by
+                )
+            else:
+                recorded["remediation_status"] = "no_pending_gate"
+            existing = await _agentflow_create_ticket(request, tenant, rec, run)
+        recorded["ticket_id"] = existing.get("ticket_id")
+        recorded["ticket_number"] = existing.get("ticket_number")
+        recorded["session_status"] = "escalated"
+    elif body.decision == "reject":
+        # 没有在等的门 → 跳过那次驳回（不猜 id；驳回只是让旧 run 收尾，起新一轮才是重点）。
+        recorded["remediation_status"] = (
+            await _agentflow_reject_node(
+                request, tenant, run_id, node_id, by=by, comment=(body.feedback or "").strip()
+            )
+            if node_id
+            else "no_pending_gate"
         )
-        recorded["remediation_status"] = node_result
 
         # 起新一轮：与 analyze_problem 同一条链路（起 run + 绑 evidence），
         # 复用其 inputs 组装与租户桥接约定。
@@ -986,8 +1197,13 @@ async def _decide_agentflow(
         recorded["session_status"] = "running"
     else:
         # 忽略 / 误报：尽力驳回节点（让 run 收尾），然后关单。
-        recorded["remediation_status"] = await _agentflow_reject_node(
-            request, tenant, run_id, node_id, by=by, comment=body.decision
+        # 同样地，没有在等的门就跳过那次驳回——理由与 escalate 分支那句相同。
+        recorded["remediation_status"] = (
+            await _agentflow_reject_node(
+                request, tenant, run_id, node_id, by=by, comment=body.decision
+            )
+            if node_id
+            else "no_pending_gate"
         )
         recorded["session_status"] = "dismissed"
         if body.decision == "false_positive":
@@ -999,6 +1215,8 @@ async def _decide_agentflow(
     if not await storage.records.append_evidence(tenant, record_id, recorded):
         raise AppException(ErrorCode.CONFLICT, f"problem {record_id} vanished before recording")
 
+    await _apply_escalated_state(storage, tenant, record_id, body.decision, recorded)
+
     fresh = await storage.records.get(tenant, record_id)
     return {
         "record_id": record_id,
@@ -1008,6 +1226,8 @@ async def _decide_agentflow(
         "remediation_status": recorded["remediation_status"],
         "reanalyze_count": recorded["reanalyze_count"],
         "max_reanalyze": recorded["max_reanalyze"],
+        "ticket_id": recorded["ticket_id"],
+        "ticket_number": recorded["ticket_number"],
         "record_state": (fresh or rec).get("state"),
     }
 
@@ -1033,7 +1253,7 @@ async def decide_problem_diagnosis(
     rec = await storage.records.get(tenant, record_id)
     if rec is None:
         raise AppException(ErrorCode.NOT_FOUND, f"problem record not found: {record_id}")
-    if (rec.get("state") or "pending") in ("resolved", "closed", "archived"):
+    if (rec.get("state") or "pending") in _TERMINAL_STATES:
         raise AppException(
             ErrorCode.CONFLICT,
             f"problem {record_id} is {rec.get('state')}; decision not allowed",
@@ -1065,6 +1285,8 @@ async def decide_problem_diagnosis(
         "reanalyze_count": None,
         "max_reanalyze": None,
         "snapshot": None,
+        "ticket_id": None,
+        "ticket_number": None,
         "decided_at": datetime.now(timezone.utc),
     }
 
@@ -1121,6 +1343,30 @@ async def decide_problem_diagnosis(
             max_reanalyze=appr.get("max_reanalyze"),
         )
         # 记录 state 不变（仍在 pending/in_progress，重跑中）
+    elif body.decision == "escalate":
+        # 老路径（spike 会话）没有 agentflow 审批门，「放行门」这一步自然省掉；
+        # 其余与 agentflow 路径同构——同一份幂等判据、同一个建单 helper、同样的落库顺序。
+        # ``run=None``：spike 会话读不到 run 详情，工单里的诊断摘要只能来自记录本身
+        # （``snapshot`` 是这一轮的历史留存、属于 View Diagnosis 的展示内容，不塞进工单）。
+        #
+        # ⚠️ dismiss 在这里是 **best-effort**，与忽略/误报的严格姿态刻意不同：
+        # ``reason`` 的取值枚举属于 spike 服务（``aidiag``，**另一个仓**），本仓只能看到
+        # 它接受过 ``ignored`` / ``false_positive`` 两个值——``escalated`` 是**猜的**。
+        # 猜错不该让"工单已经建出来"这件事回滚，所以失败只记进 ``session_status``
+        # （在历史里可见，**不是静默降级**），不抛。
+        resp = await _spike_post(request, f"/dismiss/{sid}", {"reason": "escalated"})
+        if resp.status_code == 404:
+            recorded["session_status"] = "expired"
+        elif resp.status_code >= 300:
+            recorded["session_status"] = f"dismiss_failed: HTTP {resp.status_code}"
+        else:
+            recorded["session_status"] = "dismissed"
+
+        existing = _created_ticket(rec)
+        if existing is None:
+            existing = await _agentflow_create_ticket(request, tenant, rec, None)
+        recorded["ticket_id"] = existing.get("ticket_id")
+        recorded["ticket_number"] = existing.get("ticket_number")
     else:
         # 忽略 / 误报：签终态。会话过期（404）不阻断关单。
         reason = "ignored" if body.decision == "ignore" else "false_positive"
@@ -1144,6 +1390,8 @@ async def decide_problem_diagnosis(
     if not await storage.records.append_evidence(tenant, record_id, recorded):
         raise AppException(ErrorCode.CONFLICT, f"problem {record_id} vanished before recording")
 
+    await _apply_escalated_state(storage, tenant, record_id, body.decision, recorded)
+
     fresh = await storage.records.get(tenant, record_id)
     return {
         "record_id": record_id,
@@ -1153,6 +1401,8 @@ async def decide_problem_diagnosis(
         "remediation_status": recorded["remediation_status"],
         "reanalyze_count": recorded["reanalyze_count"],
         "max_reanalyze": recorded["max_reanalyze"],
+        "ticket_id": recorded["ticket_id"],
+        "ticket_number": recorded["ticket_number"],
         "record_state": (fresh or rec).get("state"),
     }
 
