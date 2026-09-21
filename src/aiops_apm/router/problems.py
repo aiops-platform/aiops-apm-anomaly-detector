@@ -219,6 +219,115 @@ async def ignore_problem(request: Request, record_id: str) -> dict:
     return {"record_id": record_id, "state": "closed"}
 
 
+# ── 工单回传：agentflow 修完之后把工单状态送回来 ──────────────────────────────
+#
+# 链路：本仓 escalate 派单（`_agentflow_create_ticket`）→ agentflow 跑修复工作流
+# → `returnApmTicketStatus`（MCP 写工具）POST 回这里。
+#
+# **这是本仓唯一由外部系统（而非人）驱动的工单写面**，所以幂等必须自己做：
+# agentflow 侧的节点是幂等节点（`SIDE_EFFECT_AGENTS`，键 `run_id:node_id`），
+# 但它 resume / 换轮次时仍可能重放同一次回传，而 `append_evidence` 是无条件追加。
+
+#: 回传状态 → 问题单动作。
+#:
+#: **只有 `resolved` 改问题单状态**：那是"修复已落地"，问题真的没了。另外两个
+#: （`failed` 修复没走完 / `insufficient` 没定位到可改的东西）都是"还没修好"——
+#: 单子仍该挂 `escalated` 等人处理，把它改成别的状态等于**替现场编造一个结论**。
+_TICKET_RESOLVED = "resolved"
+
+
+class TicketStatusBody(BaseModel):
+    """agentflow `returnApmTicketStatus` 回传的载荷。
+
+    ⚠️ ``ticket_id`` 装的是**本仓派出的工单号**（``INC-YYYYMMDD-NNNN``，由
+    ``SequenceStore.next_ticket_number`` 生成），不是 agentflow 内部的 ticket id。
+    名字沿用调用方契约；反查时两个都认（见 ``RecordStore.find_by_ticket``）。
+    """
+
+    ticket_id: str
+    status: Literal["resolved", "failed", "insufficient"]
+    description: str = ""
+
+
+def _same_ticket_status(entry: dict, incoming: dict) -> bool:
+    """两条回传条目是不是同一次。
+
+    比对时**必须排除时间戳**——``reported_at`` 每次都不同，带上它这条判据永远为假，
+    幂等就形同虚设（而症状恰好是"看不出问题"：重放时多一条证据，界面照常渲染）。
+    """
+    return (
+        isinstance(entry, dict)
+        and entry.get("type") == "ticket_status"
+        and entry.get("ticket_id") == incoming["ticket_id"]
+        and entry.get("status") == incoming["status"]
+        and entry.get("description") == incoming["description"]
+    )
+
+
+@router.post("/ticket-status")
+async def report_ticket_status(request: Request, body: TicketStatusBody) -> dict:
+    """agentflow 修复工作流把工单状态回传到这里。
+
+    按 ``ticket_id`` **反查**持有该工单的问题单（回传方手里只有工单号，没有
+    ``record_id``）—— 查不到就 404，不静默丢。
+
+    **人的裁定优先**：问题单若已被人工置为 ``resolved`` / ``closed``，回传只追加证据、
+    不改状态。反过来的话，一次迟到的回传会**覆盖掉人刚做的判断**。
+    """
+    tenant = get_tenant_id(request)
+    storage = request.app.state.storage
+    ticket = (body.ticket_id or "").strip()
+    if not ticket:
+        raise AppException(ErrorCode.VALIDATION, "ticket_id 不能为空")
+    # `status` 不用在这里再校验一次：本体是 `Literal`，pydantic 已经拦在入口
+    # （422）。再加一段同样的判断就是**到不了的死代码**。
+
+    rec = await storage.records.find_by_ticket(tenant, ticket)
+    if rec is None:
+        # 不建单、不猜：回传的是一个本租户没派出去过的号（或租户头错了）。
+        raise AppException(ErrorCode.NOT_FOUND, f"没有持有工单 {ticket} 的问题单")
+    record_id = rec["record_id"]
+
+    entry = {
+        "type": "ticket_status",
+        "ticket_id": ticket,
+        "status": body.status,
+        "description": body.description,
+        "reported_at": datetime.now(timezone.utc),
+    }
+    if any(_same_ticket_status(e, entry) for e in (rec.get("evidence") or [])):
+        return {
+            "ok": True, "duplicate": True, "record_id": record_id,
+            "state": rec["state"], "state_changed": False,
+        }
+
+    await storage.records.append_evidence(tenant, record_id, entry)
+
+    state_changed = False
+    if body.status == _TICKET_RESOLVED and rec["state"] == "escalated":
+        await storage.records.resolve(
+            tenant, record_id, reason=f"agentflow:resolved:{ticket}"
+        )
+        state_changed = True
+        note = "修复已落地，问题单置 resolved"
+    elif body.status == _TICKET_RESOLVED:
+        # 已经是 resolved/closed 等终态 → 人已经定过，不回写
+        note = f"问题单已是 {rec['state']}，仅追加证据、不改状态（人的裁定优先于回传）"
+    else:
+        note = "修复未完成，问题单保持 escalated 等人处理"
+
+    return {
+        "ok": True,
+        "duplicate": False,
+        "record_id": record_id,
+        "ticket_id": ticket,
+        "status": body.status,
+        "state": "resolved" if state_changed else rec["state"],
+        "state_changed": state_changed,
+        "note": note,
+    }
+
+
 # ── Analyze：把 problem_record 映射成平铺 ServiceNow 风格 ticket ──────────────
 
 def _ticket_title(rec: dict) -> str:

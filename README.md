@@ -58,7 +58,7 @@ APM（应用性能监控）告警模块：从第三方 API 采集指标/日志�
   - `src/aiops_apm/auth/` — `AuthMiddleware` + `Principal`：**配置了才强制**（`APM_API_KEYS` 非空才挂），无 key→401、跨租户→403、master key admin；未配置 = 放行
   - `src/aiops_apm/storage/lease.py` — `LeaseStore` ABC + InMemory + PG（`ON CONFLICT ... RETURNING` 原子接管 SQL）
   - `src/aiops_apm/summary.py` — `SummaryProvider` 钩子（模板默认，`enable_llm_summary` 开关，不接真实 LLM）
-  - `src/aiops_apm/router/` — `alerts.py`（`POST /v1/alerts/run` 全量/域过滤）、`problems.py`（`/v1/problems` 查询 + resolve/ignore）、`config.py`（reload + 域配置读写）、`maintenance.py`（维护窗口 CRUD）、`blacklist.py`（黑名单 CRUD）；`monitors.py` 加 `POST /{id}/run` 手动单跑
+  - `src/aiops_apm/router/` — `alerts.py`（`POST /v1/alerts/run` 全量/域过滤）、`problems.py`（`/v1/problems` 查询 + resolve/ignore + **工单回传 `/ticket-status`**）、`config.py`（reload + 域配置读写）、`maintenance.py`（维护窗口 CRUD）、`blacklist.py`（黑名单 CRUD）；`monitors.py` 加 `POST /{id}/run` 手动单跑
   - §13 用例 2 端到端：related + high metric + high log → critical（`test_uc62_combo_critical.py`）；reconcile 自动关单、跨租户 403、多副本 lease 全部测试覆盖（原 225 不回归，新增 62 → 287）
 - **M7 可观测性、安全加固、交付**（Prometheus 指标 + 轮次审计 + 安全审计日志 + 配置校验 + fpr 回写 + Docker/压测，原 287 不回归，新增 64 → 351）：
   - `src/aiops_apm/metrics.py` — Prometheus 7 类指标（round_total/success、records_created、degraded_sources、suppressed_total、false_positive_rate Gauge、round_duration Histogram）；`/metrics` 端点暴露；`poller.run_round` 每轮打点（`test_metrics.py`）
@@ -299,6 +299,14 @@ curl -i "http://127.0.0.1:<port>/v1/problems?state=pending&severity=high"
 curl -i http://127.0.0.1:<port>/v1/problems/PR-20260826-0001
 curl -i -X POST http://127.0.0.1:<port>/v1/problems/PR-20260826-0001/resolve   # → state=resolved（reason=manual）
 curl -i -X POST http://127.0.0.1:<port>/v1/problems/PR-20260826-0001/ignore    # → state=closed（reason=ignored），不记误报
+
+# 工单回传：agentflow 修复工作流跑完后把工单状态送回来（由外部系统驱动，非人工）
+# ticket_id 是本仓派出去的工单号（INC-YYYYMMDD-NNNN），不是 agentflow 的内部 id
+curl -i -X POST http://127.0.0.1:<port>/v1/problems/ticket-status \
+  -H "Content-Type: application/json" -H "X-Tenant-Id: default" \
+  -d '{"ticket_id":"INC-20260826-0007","status":"resolved","description":"根因：数据盘写满，已提交修复"}'
+# status: resolved → 问题单 escalated→resolved；failed / insufficient → 只追加证据、状态不动
+# 幂等：同 (ticket_id,status,description) 重放只追加一次；查不到该工单 → 404
 
 # 配置热加载（reload 声明在 /config/{domain} 之前避免路径冲突；写配置需 admin）
 curl -i -X POST http://127.0.0.1:<port>/v1/config/reload

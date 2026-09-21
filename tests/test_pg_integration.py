@@ -639,3 +639,61 @@ async def test_session_timezone_is_utc(pool) -> None:
     """会话时区固定为 UTC，DB 生成的 CURRENT_TIMESTAMP 才与写入的 naive UTC 对齐。"""
     row = await pool.fetchone("SHOW TimeZone")
     assert row is not None and row[0] == "UTC"
+
+
+# ---- find_by_ticket：按派单工单号反查问题单 ----
+
+
+async def test_find_by_ticket_jsonb_containment(pool) -> None:
+    """`find_by_ticket` 的 **PG 分支**：`evidence @> '[{…}]'::jsonb` 包含查询。
+
+    Memory 实现是 Python 遍历、怎么都能过；PG 这条是本仓**第一处 JSONB 包含查询**，
+    它的失败模式（绑定成 JSON 字符串而不是 Jsonb、`@>` 的数组语义、参数顺序）在
+    FakePool 的字符串断言下一个都抓不到 —— 只有真库能验。
+
+    刻意分两步：先只写 evidence（``resolve_reason`` 还是 NULL），证明命中的是 **JSONB
+    那条路径**；再 ``mark_escalated``，证明"人眼副本"那条路径同样成立。
+    """
+    records = PGRecordStore(pool)
+    await records.write_or_append(
+        "default",
+        _record(
+            record_id="PR-20260921-0001",
+            evidence=[
+                {"type": "diagnose_decision", "decision": "escalate",
+                 "ticket_id": "t_9f3c11", "ticket_number": "INC-20260921-0007"}
+            ],
+        ),
+    )
+
+    # ① 只有 evidence → 命中的必须是 JSONB 包含，不是 resolve_reason
+    row = await records.find_by_ticket("default", "INC-20260921-0007")
+    assert row is not None and row["record_id"] == "PR-20260921-0001"
+    assert row["resolve_reason"] is None, "此时还没有 reason，命中的只能是 evidence"
+
+    # 同一个号，按 agentflow 内部 id 也认
+    assert (await records.find_by_ticket("default", "t_9f3c11"))["record_id"] == "PR-20260921-0001"
+
+    # ② mark_escalated 之后，reason 那条路径也成立（两处都看）
+    await records.mark_escalated(
+        "default", "PR-20260921-0001", reason="escalated:INC-20260921-0007"
+    )
+    assert (await records.find_by_ticket("default", "INC-20260921-0007"))["record_id"] == (
+        "PR-20260921-0001"
+    )
+
+    # ③ 只有 reason、没有 evidence 条目的记录（早期数据形态）→ 靠 reason 那条命中。
+    #    单独造一条，是为了让两个 OR 分支**各自可验**：只测 ①② 的话，删掉 reason
+    #    分支测试照样全绿（JSONB 把两边都覆盖了），那条于是成了没人管的代码。
+    await records.write_or_append("default", _record(record_id="PR-20260921-0002"))
+    await records.mark_escalated(
+        "default", "PR-20260921-0002", reason="escalated:INC-20260921-0008"
+    )
+    assert (await records.find_by_ticket("default", "INC-20260921-0008"))["record_id"] == (
+        "PR-20260921-0002"
+    )
+
+    # ④ 不误命中：没派出去过的号 / 空号 / 别的租户
+    assert await records.find_by_ticket("default", "INC-20260921-9999") is None
+    assert await records.find_by_ticket("default", "") is None
+    assert await records.find_by_ticket("team-b", "INC-20260921-0007") is None

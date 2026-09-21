@@ -58,6 +58,25 @@ _JSON_COLUMNS = {
 }
 
 
+def _holds_ticket(row: dict, ticket: str) -> bool:
+    """这条记录是不是**派出去的那张工单**的持有者。
+
+    ``resolve_reason`` 与 ``evidence`` **两处都看**：前者是 ``mark_escalated`` 直接写下的
+    副本（``escalated:<号>``，人眼在详情弹窗就能看到），后者是结构化真源。只看一处都会
+    漏——单号为空时 reason 退化成 ``"escalated"``，而早期记录可能没有 evidence 条目。
+    """
+    if not ticket:
+        return False
+    if (row.get("resolve_reason") or "") == f"escalated:{ticket}":
+        return True
+    for entry in row.get("evidence") or []:
+        if not isinstance(entry, dict):
+            continue
+        if ticket in (entry.get("ticket_id"), entry.get("ticket_number")):
+            return True
+    return False
+
+
 class RecordStore(ABC):
     """problem_record 读写/去重接口。"""
 
@@ -84,6 +103,25 @@ class RecordStore(ABC):
     @abstractmethod
     async def get(self, tenant_id: str, record_id: str) -> dict | None:
         """按 record_id 取单条记录；不存在返回 None。"""
+
+    @abstractmethod
+    async def find_by_ticket(self, tenant_id: str, ticket: str) -> dict | None:
+        """按**派出去的工单**反查持有它的问题单；无则 None。
+
+        存在理由：agentflow 把修复结果回传时手里只有工单号
+        （``INC-YYYYMMDD-NNNN``），没有 ``record_id`` —— 而这个号是本仓派单时自己
+        取的（``SequenceStore.next_ticket_number``），agentflow 只是原样收下再原样送回。
+        所以必须有一条反查路径，否则回传无处可落。
+
+        **真源是 evidence**：升级那一步写下的条目
+        （``{"decision":"escalate", "ticket_id": …, "ticket_number": …}``）。
+        ``resolve_reason`` 里那份（``escalated:<号>``）是给人看的副本，不拿它当判据
+        —— 单号为空时它是 ``"escalated"``（见 ``mark_escalated``），拿它查会静默漏。
+
+        ``ticket_id``（agentflow 内部 id）与 ``ticket_number``（本仓派出的号）**两个都认**：
+        对外契约传的是后者，但前者也确实是"这张工单"，一起匹配免得调用方拿错 id 时
+        只得到一句"查不到"。
+        """
 
     @abstractmethod
     async def resolve(self, tenant_id: str, record_id: str, reason: str = "auto") -> None:
@@ -203,6 +241,14 @@ class InMemoryRecordStore(RecordStore):
         if row is None or row["tenant_id"] != tenant_id:
             return None
         return dict(row)
+
+    async def find_by_ticket(self, tenant_id: str, ticket: str) -> dict | None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        for row in self._rows.values():
+            if row["tenant_id"] == tenant_id and _holds_ticket(row, ticket):
+                return dict(row)
+        return None
 
     async def resolve(self, tenant_id: str, record_id: str, reason: str = "auto") -> None:
         self._set_terminal_state(tenant_id, record_id, "resolved", reason)
@@ -377,6 +423,32 @@ class PGRecordStore(RecordStore):
         row = await self._pool.fetchone(
             f"SELECT {cols} FROM problem_record WHERE tenant_id=%s AND record_id=%s",
             (tenant_id, record_id),
+        )
+        return None if row is None else self._row_to_dict(row)
+
+    async def find_by_ticket(self, tenant_id: str, ticket: str) -> dict | None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if not ticket:
+            return None
+        cols = ", ".join(_RECORD_COLUMNS)
+        # evidence @> '[{…}]' 走 JSONB 包含：只要数组里**有一条**条目含该键值即命中，
+        # 与 Memory 实现的 _holds_ticket 同义。resolve_reason 的等值匹配是那条「人眼副本」
+        # 的兜底（早期记录可能没有 evidence 条目）。**没有走 LIKE** —— 工单号含 '-' 与数字，
+        # LIKE '%x%' 会误匹配到别的号的前后缀。
+        sql = (
+            f"SELECT {cols} FROM problem_record WHERE tenant_id=%s AND ("
+            "resolve_reason = %s OR evidence @> %s::jsonb OR evidence @> %s::jsonb"
+            ") ORDER BY detected_at DESC LIMIT 1"
+        )
+        row = await self._pool.fetchone(
+            sql,
+            (
+                tenant_id,
+                f"escalated:{ticket}",
+                _as_json([{"ticket_number": ticket}]),
+                _as_json([{"ticket_id": ticket}]),
+            ),
         )
         return None if row is None else self._row_to_dict(row)
 
