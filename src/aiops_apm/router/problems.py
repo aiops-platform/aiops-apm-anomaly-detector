@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -411,6 +412,10 @@ def _build_ticket(rec: dict) -> dict:
         "state": "New",
         "cmdb_ci": cmdb_ci,
         "symptom": rec.get("symptom") or {"summary": ""},
+        # 严重度：建单搬进 run 后（2026-09-21），agentflow 的建单节点只能从 run 的 inputs
+        # 里拿它——工单列表要显示这一列，而 impact/urgency/priority 是**有损映射**
+        # （3 档 → 3 档但语义不同），反推回去等于在 agentflow 侧复制一份 `_SEV_MAP`。
+        "severity": rec.get("severity"),
     }
     req_id = _first_log_chain_id(rec)
     if req_id:
@@ -1097,6 +1102,72 @@ def _created_ticket(rec: dict) -> dict | None:
     return None
 
 
+#: 回读建单结果的轮询参数（`_read_escalation_ticket`）。
+#:
+#: 为什么要有轮询：`inline`（默认）模式下 `POST /runs/{id}/approve` 会**同步跑完剩余
+#: DAG**（`service.approve` 里那句 `await ex.run()`），返回时建单节点早就 DONE → 第一次
+#: 读就有；而 `queue` 模式下 approve 只落 CAS + 发命令就返回，run 还在 Worker 手里。
+#: 上限约 6s：节点本身只是一次 DB 插入，worker 的接单延迟占大头，正常远小于它。
+_TICKET_POLL_ATTEMPTS = 15
+_TICKET_POLL_INTERVAL_SEC = 0.4
+
+#: `GET /runs/{id}` 的终态取值（agentflow 已把内部的 done 翻成 success）
+_RUN_TERMINAL = ("success", "failed", "cancelled")
+
+
+def _ticket_node_id(run: dict) -> str | None:
+    """run 图里 `kind == "ticket"` 的节点 id。
+
+    **按 kind 找，不写死节点名**——节点 id 住在 workflow 的 YAML 里，改名会让写死的那份
+    **静默打偏**（今天刚在 `approve-plan → diagnose-output` 那次改名上踩过同一个坑）。
+    """
+    graph = run.get("graph")
+    if not isinstance(graph, dict):
+        return None
+    for n in graph.get("nodes") or []:
+        if isinstance(n, dict) and n.get("kind") == "ticket":
+            return str(n.get("id") or "") or None
+    return None
+
+
+async def _read_escalation_ticket(request: Request, run_id: str) -> dict:
+    """回读 run 里建单节点的输出（带**有界轮询**）。
+
+    「升级」的建单动作住在 run 内部（`kind: ticket` 节点），本仓**只回读**、**不再自己建**
+    ——两边都建会出两张单。
+
+    拿不到就抛 `UPSTREAM` 且**不置终态**：重试是安全且自愈的（节点输出存在 checkpoint 里，
+    第二次调用直接读到），所以宁可让人重试，也不要落一个说不清的终态。
+    """
+    for attempt in range(_TICKET_POLL_ATTEMPTS):
+        run = await from_agentflow.fetch_run(request, run_id)
+        if run is not None:
+            node_id = _ticket_node_id(run)
+            nodes = run.get("nodes")
+            node = nodes.get(node_id) if (node_id and isinstance(nodes, dict)) else None
+            node = node if isinstance(node, dict) else {}
+            status = node.get("status")
+            if status == "done":
+                out = node.get("output")
+                if isinstance(out, dict) and out.get("ticket_id"):
+                    return out
+                raise AppException(ErrorCode.UPSTREAM, "建单节点已完成但没有工单号")
+            if status == "failed":
+                raise AppException(
+                    ErrorCode.UPSTREAM,
+                    f"建单节点失败：{str(node.get('error') or '')[:200] or '见 run 详情'}",
+                )
+            if run.get("status") in _RUN_TERMINAL:
+                raise AppException(
+                    ErrorCode.UPSTREAM,
+                    f"run 已 {run.get('status')}，但建单节点未执行（status={status}）"
+                    "——门可能不是通过放行的",
+                )
+        if attempt < _TICKET_POLL_ATTEMPTS - 1:
+            await asyncio.sleep(_TICKET_POLL_INTERVAL_SEC)
+    raise AppException(ErrorCode.UPSTREAM, "工单生成中，请稍后重试")
+
+
 async def _apply_escalated_state(storage, tenant: str, record_id: str, decision: str, recorded: dict) -> None:
     """``escalate`` 才把记录落成终态；非 escalate 是空操作。
 
@@ -1120,6 +1191,12 @@ async def _agentflow_create_ticket(
     request: Request, tenant: str, rec: dict, run: dict | None
 ) -> dict:
     """在 agentflow 建一张修复工单，返回 ``{ticket_id, ticket_number}``。
+
+    ⚠️ **只给 spike 老路径用**（`_decide_agentflow` 的 escalate 分支**不再**调它）。
+    agentflow 那条路径的建单已经搬进 run 内部（`kind: ticket` 节点），本仓改成回读——
+    两边都建会出两张单。spike 会话**没有 run**，也就没有那个节点可读，所以这一支保留
+    自己的建单（老记录不至于点「升级」就撞死路）。
+
 
     **失败抛 ``UPSTREAM``**——与上面两个 best-effort 的审批动作刻意不同：建单没成就不该
     对外说"已升级"，调用方据此**不置终态**，人可以重试。
@@ -1249,7 +1326,10 @@ async def _decide_agentflow(
                 )
             else:
                 recorded["remediation_status"] = "no_pending_gate"
-            existing = await _agentflow_create_ticket(request, tenant, rec, run)
+            # 建单**发生在 run 内**（`kind: ticket` 节点，2026-09-21 从本仓搬过去）——
+            # 这里只**回读**它的输出。⚠️ **不要**在这里再调一次 `POST /tickets`：那会出两张单。
+            # 缺 `source_ref` 的旧 run（建单节点还没上线时起的）会回读不到 → 报错可重试。
+            existing = await _read_escalation_ticket(request, run_id)
         recorded["ticket_id"] = existing.get("ticket_id")
         recorded["ticket_number"] = existing.get("ticket_number")
         recorded["session_status"] = "escalated"

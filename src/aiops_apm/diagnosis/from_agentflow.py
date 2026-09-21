@@ -408,6 +408,7 @@ _NODE_LABELS: dict[str, str] = {
     "rca": "根因分析",
     "plan": "修复计划",
     "diagnose-output": "诊断输出",
+    "create-ticket": "生成工单",
     "halt": "中断",
 }
 

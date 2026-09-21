@@ -464,17 +464,47 @@ def _bind_agent_run(client, *, record_id="PR-0001", run_id="run_abc", workflow_i
     )
 
 
-def _run_detail(*, run_id="run_abc", gate="diagnose-output"):
-    """``GET /runs/{id}``：门的动态发现来源，同时供工单里的诊断摘要。
+def _ticket_output(ticket_id="tkt123456789", number="INC-20260921-0001"):
+    """建单节点的 output 形状（agentflow 侧 `create_from_node_params` 产的）。"""
+    return {
+        "ticket_id": ticket_id,
+        "ticket_number": number,
+        "title": "订单服务结账单无反应",
+        "service": "order-service",
+        "severity": "high",
+        "created": True,
+        "source_ref": "PR-0001",
+    }
 
-    ``gate=None`` → ``pending_approvals`` 为空（门早被答复 / run 的状态列陈旧）。
+
+def _run_detail(
+    *, run_id="run_abc", gate="diagnose-output", ticket=None,
+    run_status="waiting_approval", node_error=None,
+):
+    """``GET /runs/{id}``：门的动态发现来源 + **建单节点输出的回读来源**。
+
+    - ``gate=None`` → ``pending_approvals`` 为空（门早被答复 / run 的状态列陈旧）
+    - ``ticket=<output>`` → 建单节点 DONE 且带输出（= run 真的建了单，本仓回读它）
+    - ``ticket=None`` → 节点还没跑（模拟 queue 模式下 worker 尚未接单）
+    - ``node_error`` → 建单节点判 **failed**（`run_status` 通常一并传 failed）
     """
     return _resp(
         200,
         {
             "run_id": run_id,
-            "status": "waiting_approval",
+            "status": run_status,
             "pending_approvals": [] if gate is None else [{"node_id": gate, "trigger": None, "upstream": {"rca": {}}}],
+            # 「升级」的建单搬进 run 之后，本仓靠**图里的 kind** 找那个节点（不写死节点名）
+            "graph": {
+                "name": "problem-log-diagnose",
+                "nodes": [
+                    {"id": "rca", "agent": "root-cause", "kind": "agent"},
+                    {"id": "plan", "agent": "remediation-planning-analyst", "kind": "agent"},
+                    {"id": "diagnose-output", "agent": None, "kind": "approval"},
+                    {"id": "create-ticket", "agent": None, "kind": "ticket"},
+                ],
+                "edges": [],
+            },
             "nodes": {
                 "rca": {
                     "status": "done",
@@ -490,6 +520,11 @@ def _run_detail(*, run_id="run_abc", gate="diagnose-output"):
                         "steps": [{"type": "code_fix", "target": "QuotationService.java"}],
                     },
                 },
+                "create-ticket": (
+                    {"status": "done", "output": ticket} if ticket
+                    else {"status": "failed", "output": None, "error": node_error} if node_error
+                    else {"status": "pending", "output": None}
+                ),
             },
         },
         method="GET",
@@ -514,10 +549,17 @@ def _ticket_ok(ticket_id="tkt123456789", number="INC-20260921-0001"):
 
 
 def test_escalate_approves_gate_creates_ticket_and_marks_escalated(client):
-    """升级：先放行门、再建工单、最后置终态——三件事都要发生，且顺序固定。"""
+    """升级：读 run（发现门）→ 放行门 → **回读建单结果** → 置终态，顺序固定。
+
+    建单本身**发生在 run 内**（`kind: ticket` 节点），本仓不再自己 `POST /tickets`——
+    两边都建会出两张单。
+    """
     _seed_log_record(client)
     _bind_agent_run(client)
-    capture = CapturingHttp([_run_detail(), _approve_ok(), _ticket_ok()])
+    capture = CapturingHttp(
+        [_run_detail(), _approve_ok(),
+         _run_detail(ticket=_ticket_output(), run_status="success")]
+    )
     client.app.state.http_client = capture
 
     resp = client.post("/v1/problems/PR-0001/diagnose/decision", json={"decision": "escalate"})
@@ -526,30 +568,19 @@ def test_escalate_approves_gate_creates_ticket_and_marks_escalated(client):
     assert body["decision"] == "escalate"
     assert body["record_state"] == "escalated"
     assert body["ticket_id"] == "tkt123456789"
-    assert body["ticket_number"].startswith("INC-")  # 号由本仓生成，用现成的 SequenceStore
+    assert body["ticket_number"] == "INC-20260921-0001"  # 号来自 run 内建单节点的输出
     assert body["session_status"] == "escalated"
 
-    # 出站顺序：读 run（发现门 + 取摘要）→ 放行门 → 建单。
-    # **先放行后建单**：反过来的话，"建单成功而 approve 失败"会留下一张已派单、run 还挂在
-    # 门上的记录——而挂在门上的 run 一直占着租户并发额度。
+    # 出站顺序：读 run（发现门）→ 放行门 → **再读一次 run**（回读建单结果）。
+    # **先放行后读**：反过来的话，读完门还没放行，节点根本不会跑。
+    # 第三次是 GET 而不是 POST /tickets —— 那正是"建单搬进 run"的判据。
     assert [(c["method"], c["url"]) for c in capture.calls] == [
         ("GET", AGENTFLOW_BASE + "/runs/run_abc"),
         ("POST", AGENTFLOW_BASE + "/runs/run_abc/approve"),
-        ("POST", AGENTFLOW_BASE + "/tickets"),
+        ("GET", AGENTFLOW_BASE + "/runs/run_abc"),
     ]
     # 门节点从 pending_approvals 现取，不是写死的常量（改名后写死的那份会静默打偏）
     assert capture.calls[1]["json"]["node_id"] == "diagnose-output"
-
-    payload = capture.calls[2]["json"]
-    assert payload["number"].startswith("INC-")
-    assert payload["service"] == "sip-aiops-management"
-    assert payload["severity"] == "high"
-    assert payload["window_start"] and payload["window_end"]
-    # 诊断摘要随工单走：拿到工单的人不必回平台翻诊断。与页面同源（复用 _build_conclusion）
-    diag = payload["bug_report"]["diagnosis"]
-    assert diag["root_cause"] == "template 为 null 时缺少空值校验"
-    assert diag["summary"] == "补空值校验"
-    assert diag["recommended_fix"][0]["steps"][0]["target"] == "QuotationService.java"
 
     # state 落库 + evidence 绑号（工单号是"不查 evidence 就能看到"的那一份，写在 resolve_reason）
     detail = client.get("/v1/problems/PR-0001").json()
@@ -560,7 +591,7 @@ def test_escalate_approves_gate_creates_ticket_and_marks_escalated(client):
     assert len(created) == 1
     assert created[0]["type"] == "diagnose_decision"
     assert created[0]["ticket_id"] == "tkt123456789"
-    assert created[0]["ticket_number"] == payload["number"]
+    assert created[0]["ticket_number"] == "INC-20260921-0001"
 
 
 def test_escalate_discovers_gate_node_from_pending_approvals(client):
@@ -572,7 +603,10 @@ def test_escalate_discovers_gate_node_from_pending_approvals(client):
     """
     _seed_log_record(client)
     _bind_agent_run(client)
-    capture = CapturingHttp([_run_detail(gate="some-renamed-gate"), _approve_ok(), _ticket_ok()])
+    capture = CapturingHttp(
+        [_run_detail(gate="some-renamed-gate"), _approve_ok(),
+         _run_detail(ticket=_ticket_output(), run_status="success")]
+    )
     client.app.state.http_client = capture
 
     assert (
@@ -603,7 +637,7 @@ def test_escalate_is_idempotent_when_ticket_already_recorded(client):
             },
         )
     )
-    capture = CapturingHttp([_run_detail(), _approve_ok(), _ticket_ok()])
+    capture = CapturingHttp([_run_detail()])
     client.app.state.http_client = capture
 
     body = client.post(
@@ -617,18 +651,62 @@ def test_escalate_is_idempotent_when_ticket_already_recorded(client):
     assert [c["url"] for c in capture.calls] == [AGENTFLOW_BASE + "/runs/run_abc"]
 
 
-def test_escalate_ticket_failure_leaves_record_in_progress(client):
-    """建单失败 → 502 且**不置终态**：没派出单就不该对外说"已升级"，人可以重试。"""
+def test_escalate_ticket_node_failure_leaves_record_in_progress(client):
+    """建单节点判失败 → 502 且**不置终态**：没派出单就不该对外说"已升级"，人可以重试。"""
     _seed_log_record(client)
     _bind_agent_run(client)
     client.app.state.http_client = CapturingHttp(
-        [_run_detail(), _approve_ok(), _resp(500, {"detail": "boom"}, url=AGENTFLOW_BASE + "/tickets")]
+        [_run_detail(), _approve_ok(),
+         _run_detail(run_status="failed", node_error="DB 挂了")]
     )
 
     resp = client.post("/v1/problems/PR-0001/diagnose/decision", json={"decision": "escalate"})
     assert resp.status_code == 502
+    assert "建单节点失败" in resp.json()["reason"]
     detail = client.get("/v1/problems/PR-0001").json()
     assert detail["state"] == "in_progress"  # 没落终态
+    assert not [e for e in detail["evidence"] if e.get("decision") == "escalate"]
+
+
+def test_escalate_polls_until_the_ticket_node_runs(client):
+    """**queue 模式**：approve 只落 CAS 就返回，建单节点还没跑 → 轮询到它 DONE 为止。
+
+    inline 下 approve 同步跑完剩余 DAG，第一次读就有；这条测的是另一种时序。
+    """
+    _seed_log_record(client)
+    _bind_agent_run(client)
+    client.app.state.http_client = CapturingHttp([
+        _run_detail(),
+        _approve_ok(),
+        _run_detail(run_status="running"),                       # 还没跑完
+        _run_detail(ticket=_ticket_output(ticket_id="tkt_later"), run_status="success"),
+    ])
+
+    body = client.post(
+        "/v1/problems/PR-0001/diagnose/decision", json={"decision": "escalate"}
+    ).json()
+    assert body["ticket_id"] == "tkt_later"
+    assert body["record_state"] == "escalated"
+
+
+def test_escalate_times_out_without_touching_state(client, monkeypatch):
+    """轮询超时 → 502「工单生成中，请稍后重试」，**不置终态**（重试幂等且自愈）。"""
+    from aiops_apm.router import problems as problems_mod
+
+    monkeypatch.setattr(problems_mod, "_TICKET_POLL_ATTEMPTS", 2)
+    monkeypatch.setattr(problems_mod, "_TICKET_POLL_INTERVAL_SEC", 0)
+    _seed_log_record(client)
+    _bind_agent_run(client)
+    # 第三次起一直是"还没跑" → 轮询耗尽
+    client.app.state.http_client = CapturingHttp(
+        [_run_detail(), _approve_ok(), _run_detail(run_status="running")]
+    )
+
+    resp = client.post("/v1/problems/PR-0001/diagnose/decision", json={"decision": "escalate"})
+    assert resp.status_code == 502
+    assert "工单生成中" in resp.json()["reason"]
+    detail = client.get("/v1/problems/PR-0001").json()
+    assert detail["state"] == "in_progress"
     assert not [e for e in detail["evidence"] if e.get("decision") == "escalate"]
 
 
@@ -636,7 +714,10 @@ def test_escalate_on_already_escalated_record_is_conflict(client):
     """终态守卫：已升级的单不能再裁定（否则会重复派单）。"""
     _seed_log_record(client)
     _bind_agent_run(client)
-    client.app.state.http_client = CapturingHttp([_run_detail(), _approve_ok(), _ticket_ok()])
+    client.app.state.http_client = CapturingHttp(
+        [_run_detail(), _approve_ok(),
+         _run_detail(ticket=_ticket_output(), run_status="success")]
+    )
     assert (
         client.post("/v1/problems/PR-0001/diagnose/decision", json={"decision": "escalate"}).status_code
         == 200
@@ -649,7 +730,10 @@ def test_escalate_records_decision_in_history(client):
     """历史（View Diagnosis 的「历史计划」区）要能看到这一次升级与工单号。"""
     _seed_log_record(client)
     _bind_agent_run(client)
-    client.app.state.http_client = CapturingHttp([_run_detail(), _approve_ok(), _ticket_ok()])
+    client.app.state.http_client = CapturingHttp(
+        [_run_detail(), _approve_ok(),
+         _run_detail(ticket=_ticket_output(), run_status="success")]
+    )
     client.post("/v1/problems/PR-0001/diagnose/decision", json={"decision": "escalate"})
 
     items = _decisions(client)
@@ -720,7 +804,11 @@ def test_escalate_without_pending_gate_skips_approve(client):
     """
     _seed_log_record(client)
     _bind_agent_run(client)
-    capture = CapturingHttp([_run_detail(gate=None), _ticket_ok(ticket_id="tkt_nogate")])
+    # 没有在等的门 → 跳过 approve，直接回读（只两次 GET）
+    capture = CapturingHttp(
+        [_run_detail(gate=None),
+         _run_detail(ticket=_ticket_output(ticket_id="tkt_nogate"), run_status="success")]
+    )
     client.app.state.http_client = capture
 
     body = client.post(
@@ -729,8 +817,8 @@ def test_escalate_without_pending_gate_skips_approve(client):
     assert body["ticket_id"] == "tkt_nogate"
     assert body["remediation_status"] == "no_pending_gate"
     assert body["record_state"] == "escalated"
-    # **只有两次出站**：读 run + 建单。approve 那次被跳过了
-    assert [c["url"] for c in capture.calls] == [
-        AGENTFLOW_BASE + "/runs/run_abc",
-        AGENTFLOW_BASE + "/tickets",
+    # **两次出站都是 GET**：发现门 + 回读建单结果。approve 那次被跳过了
+    assert [(c["method"], c["url"]) for c in capture.calls] == [
+        ("GET", AGENTFLOW_BASE + "/runs/run_abc"),
+        ("GET", AGENTFLOW_BASE + "/runs/run_abc"),
     ]
