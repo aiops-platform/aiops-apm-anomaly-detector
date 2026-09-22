@@ -1228,16 +1228,6 @@ async def _agentflow_create_ticket(
         "severity": rec.get("severity"),
         "window_start": start,
         "window_end": end,
-        # 这张单**从哪来** —— agentflow 的图和 `ticket-done` 节点按它决定跑完要不要回传。
-        #
-        # ⚠️ **只有本函数这条老路径（spike 会话）需要它**：escalate 主路径已改成
-        #    「回读 run 内 `kind: ticket` 节点建的单」，工单由 agentflow 自己建、
-        #    `source_ref` 必填 → agentflow 据此推导成 `workflow`，无需本仓声明。
-        #
-        # 而这条路建的工单 `source_ref` 为空，agentflow 会推导成 `manual`（= 手工单，
-        # **不回传**）。但上游其实认这张单——号是本仓生成并记进 evidence 的，
-        # `find_by_ticket` 反查得到。不声明的话，spike 的工单**从此静默不回传**。
-        "origin": "apm",
     }
 
     url = str(settings.bug_solve_base_url).rstrip("/") + "/tickets"
