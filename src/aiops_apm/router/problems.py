@@ -220,6 +220,91 @@ async def ignore_problem(request: Request, record_id: str) -> dict:
     return {"record_id": record_id, "state": "closed"}
 
 
+class EscalateBody(BaseModel):
+    """直接派单的载荷。
+
+    ``workflow_name`` = 这张单**后续跑哪条流程**（建单时就钉死）。空 = 不钉，
+    发起时退回库里最新一条（agentflow ``_workflow_for_ticket`` 的第三档）。
+
+    ⚠️ 传**名字**不传 id：``workflows.id`` 每个租户库都不同，名字才是可移植的键
+    （与 workflow YAML 里 ``next_workflow`` 的字面量同一条约定）。本仓按名字查回 id
+    再交给 agentflow——``POST /tickets`` 只收 id。
+    """
+
+    workflow_name: str = ""
+
+
+@router.post("/{record_id}/escalate")
+async def escalate_problem(
+    request: Request, record_id: str, body: EscalateBody | None = None
+) -> dict:
+    """把问题单**直接**派成一张修复工单（本仓取号 + 绑定 + 转 ``escalated`` 终态）。
+
+    与 ``POST /{id}/diagnose/decision {decision: "escalate"}`` 的区别是**它不经过诊断裁定**：
+
+    - 那条路要有一轮诊断、要放行 agentflow 的审批门，工单由 run 里的 ``kind: ticket``
+      节点建出、跑哪条流程由 YAML 的 ``next_workflow`` 说了算；
+    - 这条给**没诊断过 / 诊断没给出方案**的单用（页面上两处「Escalate」），
+      由调用方指定流程。
+
+    **两者产出的 evidence 是同一个形状**（``diagnose_decision`` + ``decision=escalate``
+    + ``ticket_id``/``ticket_number``）——「升级」与「它建出的那张工单」是同一件事，
+    拆成两种条目会让"读的人自己把两条拼起来"（见 ``_created_ticket``）。
+    区别只在 ``engine``：``manual`` = 人直接派的，没有诊断轮次，故**不写** ``session_id``
+    （前端的「历史计划」据此不再打印"该轮快照不可用"——那轮根本不存在）。
+
+    **派单方仍是本仓**：号由 ``SequenceStore`` 取，绑定写进 evidence，回传（``/ticket-status``）
+    才能按号反查回来。绕过本仓直接在 agentflow 建单的话，那张单既没有号、也不绑问题单，
+    修完的回传会查无此单。
+    """
+    tenant = get_tenant_id(request)
+    storage = request.app.state.storage
+    rec = await storage.records.get(tenant, record_id)
+    if rec is None:
+        raise AppException(ErrorCode.NOT_FOUND, f"problem record not found: {record_id}")
+
+    # 幂等守卫放在终态守卫**之前**：已经派过单的记录，这句话比"is escalated"有用得多
+    # （它直接给出是哪个号）。`_created_ticket` 认的正是升级那一步写的 evidence。
+    existing = _created_ticket(rec)
+    if existing is not None:
+        held = existing.get("ticket_number") or existing.get("ticket_id") or ""
+        raise AppException(
+            ErrorCode.CONFLICT, f"problem {record_id} already holds ticket {held}"
+        )
+    if (rec.get("state") or "pending") in _TERMINAL_STATES:
+        raise AppException(
+            ErrorCode.CONFLICT,
+            f"problem {record_id} is {rec.get('state')}; escalate not allowed",
+        )
+
+    name = str((body.workflow_name if body else "") or "").strip()
+    workflow_id = await _resolve_workflow_id(request, name)
+
+    created = await _agentflow_create_ticket(
+        request, tenant, rec, None, workflow_id=workflow_id
+    )
+    recorded: dict = {
+        "type": "diagnose_decision",
+        "decision": "escalate",
+        "engine": "manual",
+        "ticket_id": created["ticket_id"],
+        "ticket_number": created["ticket_number"],
+        "workflow_name": name or None,
+        "decided_at": datetime.now(timezone.utc),
+    }
+    # ⚠️ evidence 必须在**终态之前**落（顺序见 `_apply_escalated_state`）：反过来的话
+    # 重试时幂等判据（`_created_ticket` 读 evidence）不成立 → 建出第二张工单。
+    await storage.records.append_evidence(tenant, record_id, recorded)
+    await _apply_escalated_state(storage, tenant, record_id, "escalate", recorded)
+    return {
+        "record_id": record_id,
+        "state": "escalated",
+        "ticket_id": created["ticket_id"],
+        "ticket_number": created["ticket_number"],
+        "workflow_name": name,
+    }
+
+
 # ── 工单回传：agentflow 修完之后把工单状态送回来 ──────────────────────────────
 #
 # 链路：本仓 escalate 派单（`_agentflow_create_ticket`）→ agentflow 跑修复工作流
@@ -1187,15 +1272,41 @@ async def _apply_escalated_state(storage, tenant: str, record_id: str, decision:
     )
 
 
+async def _resolve_workflow_id(request: Request, name: str) -> str:
+    """workflow **名字** → id（`POST /tickets` 只收 id，名字才是跨租户可移植的键）。
+
+    名字在库里**可能不唯一**（`workflows.name` 没有唯一约束）：取 ``created_at`` 最新那条，
+    与 agentflow 侧 ``get_by_name`` 同一口径 —— 否则"建单时钉的"与"发起时跑起来的"
+    可能不是同一条，而两处都不会报错。
+
+    查不到 → **404，绝不退回不钉**：钉 `bug-fix-scenario2` 却跑起一条别的流程，
+    比跑不起来危险得多（这条与 agentflow `_workflow_for_ticket` 的 409 同一个理由）。
+    """
+    name = (name or "").strip()
+    if not name:
+        return ""
+    items = await from_agentflow.fetch_workflows(request)
+    if items is None:
+        raise AppException(ErrorCode.UPSTREAM, "list workflows failed: agentflow 不可达")
+    hits = [w for w in items if str(w.get("name") or "") == name and w.get("id")]
+    if not hits:
+        raise AppException(ErrorCode.NOT_FOUND, f"workflow「{name}」不在库里（被删或改名了）")
+    hits.sort(key=lambda w: str(w.get("created_at") or ""), reverse=True)
+    return str(hits[0]["id"])
+
+
 async def _agentflow_create_ticket(
-    request: Request, tenant: str, rec: dict, run: dict | None
+    request: Request, tenant: str, rec: dict, run: dict | None, *, workflow_id: str = ""
 ) -> dict:
     """在 agentflow 建一张修复工单，返回 ``{ticket_id, ticket_number}``。
 
-    ⚠️ **只给 spike 老路径用**（`_decide_agentflow` 的 escalate 分支**不再**调它）。
+    ⚠️ **只给 spike 老路径与「直接派单」用**（`_decide_agentflow` 的 escalate 分支**不再**调它）。
     agentflow 那条路径的建单已经搬进 run 内部（`kind: ticket` 节点），本仓改成回读——
-    两边都建会出两张单。spike 会话**没有 run**，也就没有那个节点可读，所以这一支保留
-    自己的建单（老记录不至于点「升级」就撞死路）。
+    两边都建会出两张单。spike 会话与直接派单**没有 run**，也就没有那个节点可读，
+    所以这两支保留自己的建单（老记录不至于点「升级」就撞死路）。
+
+    ``workflow_id`` 非空 = 建单时就把这张单**钉**到该流程上（发起诊断时按它选，
+    见 agentflow ``_workflow_for_ticket`` 的第二档）；空 = 不钉，沿用平台今天的默认。
 
 
     **失败抛 ``UPSTREAM``**——与上面两个 best-effort 的审批动作刻意不同：建单没成就不该
@@ -1229,6 +1340,9 @@ async def _agentflow_create_ticket(
         "window_start": start,
         "window_end": end,
     }
+    if workflow_id:
+        # 钉流程：agentflow 收 id、把**名字**存进 tickets.workflow_name（见其 create_ticket）。
+        payload["workflow_id"] = workflow_id
 
     url = str(settings.bug_solve_base_url).rstrip("/") + "/tickets"
     OutboundGateway.validate_url(url)

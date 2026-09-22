@@ -102,6 +102,26 @@ async def fetch_traces(request: Request, run_id: str) -> list[dict[str, Any]]:
     return [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
 
 
+async def fetch_workflows(request: Request) -> list[dict[str, Any]] | None:
+    """列出 agentflow 里的 workflow（``[{id, name, created_at}]``）。
+
+    **失败返回 ``None``，不是空表** —— 与 ``fetch_traces`` 那类"失败返回空表"的区别在这里：
+    调用方（``_resolve_workflow_id``）要按**名字**解析出 id 去钉流程，把"上游挂了"当成
+    "库里没有这条流程"会把**部署故障报成配置错误**（人照着那句话去查名字/改 YAML，白跑一趟）。
+    两种结局必须分得开，所以这里把"读不到"如实交出去。
+    """
+    resp = await _get(request, "/workflows", get_tenant_id(request))
+    if resp is None:
+        return None
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(data, dict):  # 兼容 {"items": [...]} 形状
+        data = data.get("items")
+    return [w for w in data if isinstance(w, dict)] if isinstance(data, list) else None
+
+
 async def fetch_executions(request: Request, run_entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """把问题单里的 ``agent_run`` evidence 列表补上**实时状态**，供 UI 的「历次执行」区展示。
 
@@ -577,4 +597,5 @@ __all__ = [
     "fetch_executions",
     "fetch_run",
     "fetch_traces",
+    "fetch_workflows",
 ]
