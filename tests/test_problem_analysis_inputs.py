@@ -106,9 +106,60 @@ def test_build_analysis_inputs_wraps_bug_report():
         verification=Verification(passed=True, persistence_ok=True, final_severity="high"),
     )
     inputs = _build_analysis_inputs(rec.model_dump())
-    assert set(inputs.keys()) == {"bug_report", "window_start", "window_end"}
+    assert set(inputs.keys()) == {"bug_report", "window_start", "window_end", "review_feedback"}
     assert inputs["bug_report"]["cmdb_ci"]["name"] == "order-service"
     assert inputs["bug_report"]["short_description"] == "结账无响应"
+    # 无驳回 evidence → 空串（**不是缺键**：workflow 侧靠"恒存在"免去区分"缺失 vs 空"两种情况）
+    assert inputs["review_feedback"] == ""
+
+
+def _decided(decision: str, feedback: str = "") -> dict:
+    return {"type": "diagnose_decision", "decision": decision, "feedback": feedback}
+
+
+def test_build_analysis_inputs_carries_latest_reject_feedback():
+    """驳回建议必须进 inputs —— 否则 UI 那句"带着这条建议重新分析"是空头支票。
+
+    在此之前 ``feedback`` 只被 ``append_evidence`` 记进 evidence，**从未进入新一轮 run 的输入**：
+    重跑的 inputs 与上一轮逐字节相同 → 缺的证据没变 → 大概率再次 halt。
+    """
+    rec = ProblemRecord(
+        record_id="PR-0002",
+        domain="application",
+        service="order-service",
+        severity="high",
+        detected_at=NOW - timedelta(hours=2),
+        symptom={"summary": "结账无响应"},
+        metric_anomalies=[],
+        log_anomalies=[],
+        correlation=Correlation(related=False, reason="log_only"),
+        verification=Verification(passed=True, persistence_ok=True, final_severity="high"),
+        evidence=[
+            _decided("reject", "第一次：请查 gateway 侧"),
+            _decided("ignore"),                      # 非驳回：不带建议，不该被取
+            _decided("escalate", "升级时的备注"),      # 同上
+            _decided("reject", "  第二次：仓库在 order-service  "),  # 取最新 + 去空白
+        ],
+    )
+    assert _build_analysis_inputs(rec.model_dump())["review_feedback"] == "第二次：仓库在 order-service"
+
+
+def test_build_analysis_inputs_ignores_blank_reject_feedback():
+    """驳回但 feedback 只有空白 → 视为没有，不要把空白串当"有建议"传下去。"""
+    rec = ProblemRecord(
+        record_id="PR-0003",
+        domain="application",
+        service="svc-a",
+        severity="high",
+        detected_at=NOW - timedelta(hours=2),
+        symptom={"summary": "x"},
+        metric_anomalies=[],
+        log_anomalies=[],
+        correlation=Correlation(related=False, reason="log_only"),
+        verification=Verification(passed=True, persistence_ok=True, final_severity="high"),
+        evidence=[_decided("reject", "   ")],
+    )
+    assert _build_analysis_inputs(rec.model_dump())["review_feedback"] == ""
 
 
 # ── 审批回写（POST /{id}/run-decision）：只记录，按 (run_id, node_id) 幂等 ──────────

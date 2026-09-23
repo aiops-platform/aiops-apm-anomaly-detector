@@ -586,9 +586,19 @@ def _build_analysis_inputs(rec: dict) -> dict:
     而 workflow 里各 agent 的入参是 ``$.inputs.bug_report[.cmdb_ci.name]``。早期直接把平铺
     ticket 当 inputs 发出去，所有 ``$.inputs.bug_report`` 都解析成 None —— 工作流在
     ``triage.require: [bug]`` 处就 ``NodeInputError`` 失败，页面上看不出真因。
+
+    ``review_feedback``：上一次驳回时人写的修改建议，**恒存在**（无驳回时为空串），让 workflow
+    侧不必区分"键缺失"与"值为空"两种情况。它是"带建议重跑"成真的载体 —— 在此之前这段文字
+    只落进 evidence，**从未进入新一轮 run 的输入**，于是 UI 那句"带着这条建议重新分析"是空头
+    支票，重跑的输入与上一轮逐字节相同。
     """
     start, end = _analysis_window(rec)
-    return {"bug_report": _build_ticket(rec), "window_start": start, "window_end": end}
+    return {
+        "bug_report": _build_ticket(rec),
+        "window_start": start,
+        "window_end": end,
+        "review_feedback": _latest_reject_feedback(rec),
+    }
 
 
 @router.post("/{record_id}/analyze")
@@ -826,6 +836,25 @@ def _latest_diagnose_session(rec: dict) -> dict | None:
     for e in rec.get("evidence") or []:
         if isinstance(e, dict) and e.get("type") == "diagnose_session" and e.get("session_id"):
             latest = e
+    return latest
+
+
+def _latest_reject_feedback(rec: dict) -> str:
+    """最近一次「驳回」时人写的修改建议（``feedback``）；没有则空串。
+
+    只认 ``decision == "reject"``：后端对驳回**强制**要求带建议（见 ``_decide_agentflow`` 的
+    "拒绝必须带修改建议"），其余裁定（ignore / false_positive / escalate）本来就没有这段文字——
+    手工升级那条 evidence 里**连 ``feedback`` 键都没有**，故一律 ``.get``。
+    """
+    latest = ""
+    for e in rec.get("evidence") or []:
+        if (
+            isinstance(e, dict)
+            and e.get("type") == "diagnose_decision"
+            and e.get("decision") == "reject"
+            and (e.get("feedback") or "").strip()
+        ):
+            latest = e["feedback"].strip()
     return latest
 
 
@@ -1419,13 +1448,21 @@ async def _decide_agentflow(
     run_id = str(run_entry["run_id"])
     workflow_id = str(run_entry.get("workflow_id") or "")
 
-    if body.decision == "reject" and not (body.feedback or "").strip():
-        raise AppException(ErrorCode.VALIDATION, "拒绝必须带修改建议")
-
     # run 详情只拉一次，两处共用：门的 node_id（`_agentflow_gate_node`）与工单里的诊断摘要
     # （`conclusion_digest`）。取不到（None）两条路径都有兜底，不阻断决策。
     run = await from_agentflow.fetch_run(request, run_id)
     node_id = _agentflow_gate_node(run)
+
+    # 驳回**一份方案**必须说明理由（前端也拦一层）。但 halt / 无结论时的重跑是**重试**语义 ——
+    # 没有方案可驳，理由选填（留空 = 直接重试，适用于 code-locator 轮次耗尽这类执行类失败）。
+    # 判据刻意取**服务端事实**（"这份诊断有没有给出方案"）而不是"客户端点了哪个按钮"：
+    # 后者能被伪造，前者不能。复用 `conclusion_digest`（halt / 诊断失败时它返回 `{}`），
+    # 它与页面上显示的结论**同源**，所以与前端 `canReject` 的判据天然一致。
+    # 代价：这条校验挪到了取 run 之后，注定 400 的请求会多一次出站 GET —— 可接受。
+    if body.decision == "reject" and not (body.feedback or "").strip():
+        if from_agentflow.conclusion_digest(run or {}).get("recommended_fix"):
+            raise AppException(ErrorCode.VALIDATION, "拒绝必须带修改建议")
+
     by = "problem-center"
     recorded: dict = {
         "type": "diagnose_decision",
@@ -1489,6 +1526,12 @@ async def _decide_agentflow(
                 f"run {run_id} has no workflow_id bound; cannot rerun",
             )
         inputs = _build_analysis_inputs(rec)
+        # ⚠️ 必须把**本轮**的反馈显式并进去：上面的 `rec` 是在追加本次裁定**之前**取的
+        # （`decide_problem_diagnosis` 取记录 → 这里起 run → 收尾才 `append_evidence`），
+        # 所以此刻 `rec["evidence"]` 里**还没有**人刚提交的这条 reject。只靠
+        # `_latest_reject_feedback` 会让**第一次驳回的建议丢失**（要等第二次驳回才带上第一次的），
+        # 而"带着建议重跑"恰恰就是它存在的理由。本轮值优先于 evidence 里的历史值。
+        inputs["review_feedback"] = (body.feedback or "").strip() or inputs["review_feedback"]
         url = str(settings.bug_solve_base_url).rstrip("/") + "/run"
         OutboundGateway.validate_url(url)
         http = request.app.state.http_client

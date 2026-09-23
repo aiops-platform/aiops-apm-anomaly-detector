@@ -121,7 +121,9 @@ def test_analyze_happy_path_captures_run_and_flips_state(client):
     # $.inputs.bug_report[.cmdb_ci.name]。早期发平铺 ticket 时该路径恒为 None，
     # 工作流在 triage.require 处就失败。时间窗同批下发（日志查询用）。
     inputs = body["ticket"]
-    assert set(inputs.keys()) == {"bug_report", "window_start", "window_end"}
+    assert set(inputs.keys()) == {"bug_report", "window_start", "window_end", "review_feedback"}
+    # 首次分析（无驳回历史）→ 空串
+    assert inputs["review_feedback"] == ""
     # detected_at = 12:00Z，无 first/last_seen → 12:00±10min = 20min，过窄撑到 30min
     assert inputs["window_end"] == "2026-08-26T12:10:00+00:00"
     assert inputs["window_start"] == "2026-08-26T11:40:00+00:00"

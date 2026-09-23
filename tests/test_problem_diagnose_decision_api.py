@@ -479,7 +479,7 @@ def _ticket_output(ticket_id="tkt123456789", number="INC-20260921-0001"):
 
 def _run_detail(
     *, run_id="run_abc", gate="diagnose-output", ticket=None,
-    run_status="waiting_approval", node_error=None,
+    run_status="waiting_approval", node_error=None, no_conclusion=False,
 ):
     """``GET /runs/{id}``：门的动态发现来源 + **建单节点输出的回读来源**。
 
@@ -487,6 +487,8 @@ def _run_detail(
     - ``ticket=<output>`` → 建单节点 DONE 且带输出（= run 真的建了单，本仓回读它）
     - ``ticket=None`` → 节点还没跑（模拟 queue 模式下 worker 尚未接单）
     - ``node_error`` → 建单节点判 **failed**（`run_status` 通常一并传 failed）
+    - ``no_conclusion`` → rca/plan 都 SKIPPED、无产出 = **走 halt 中断**的形状
+      （``conclusion_digest`` 对它返回 ``{}``，即"没有方案可驳"）
     """
     return _resp(
         200,
@@ -506,20 +508,29 @@ def _run_detail(
                 "edges": [],
             },
             "nodes": {
-                "rca": {
-                    "status": "done",
-                    "output": {
-                        "hypotheses": ["template 为 null 时缺少空值校验"],
-                        "confidence": 0.9,
-                    },
-                },
-                "plan": {
-                    "status": "done",
-                    "output": {
-                        "summary": "补空值校验",
-                        "steps": [{"type": "code_fix", "target": "QuotationService.java"}],
-                    },
-                },
+                "rca": (
+                    # halt 的形状：rca/plan 都 SKIPPED、无产出 → `conclusion_digest` 返回 {}
+                    {"status": "skipped", "output": None}
+                    if no_conclusion
+                    else {
+                        "status": "done",
+                        "output": {
+                            "hypotheses": ["template 为 null 时缺少空值校验"],
+                            "confidence": 0.9,
+                        },
+                    }
+                ),
+                "plan": (
+                    {"status": "skipped", "output": None}
+                    if no_conclusion
+                    else {
+                        "status": "done",
+                        "output": {
+                            "summary": "补空值校验",
+                            "steps": [{"type": "code_fix", "target": "QuotationService.java"}],
+                        },
+                    }
+                ),
                 "create-ticket": (
                     {"status": "done", "output": ticket} if ticket
                     else {"status": "failed", "output": None, "error": node_error} if node_error
@@ -592,6 +603,99 @@ def test_escalate_approves_gate_creates_ticket_and_marks_escalated(client):
     assert created[0]["type"] == "diagnose_decision"
     assert created[0]["ticket_id"] == "tkt123456789"
     assert created[0]["ticket_number"] == "INC-20260921-0001"
+
+
+def test_agentflow_reject_carries_feedback_into_the_rerun(client):
+    """驳回 → 起新一轮时，人写的建议必须**进新一轮的 inputs**。
+
+    这是"带着这条建议重新分析"成真的判据，也是**第一次驳回**的回归网：``_decide_agentflow``
+    里的 ``rec`` 是在追加本次裁定**之前**取的（取记录 → 起 run → 收尾才 ``append_evidence``），
+    所以此刻 evidence 里**还没有**这条 reject。只扫 evidence 就会把第一次的建议丢掉——
+    要等第二次驳回才带上第一次的，而那恰恰是用户第一次点按钮的那一次。
+    """
+    _seed_log_record(client)
+    _bind_agent_run(client)
+    capture = CapturingHttp(
+        [
+            _run_detail(),  # GET /runs：发现门（拒绝要先让旧 run 收尾）
+            _resp(
+                200,
+                {"approval": {"status": "REJECTED"}, "run_status": "done"},
+                url=AGENTFLOW_BASE + "/runs/run_abc/reject",
+            ),
+            _resp(200, {"run_id": "run_new", "status": "started"}, url=AGENTFLOW_BASE + "/run"),
+        ]
+    )
+    client.app.state.http_client = capture
+
+    feedback = "仓库在 order-service，先查 GlobalExceptionHandler 的映射"
+    resp = client.post(
+        "/v1/problems/PR-0001/diagnose/decision",
+        json={"decision": "reject", "feedback": feedback},
+    )
+    assert resp.status_code == 200
+
+    # 出站顺序：读 run（发现门）→ 驳回旧 run 的门 → 起新一轮
+    assert [c["url"] for c in capture.calls] == [
+        AGENTFLOW_BASE + "/runs/run_abc",
+        AGENTFLOW_BASE + "/runs/run_abc/reject",
+        AGENTFLOW_BASE + "/run",
+    ]
+    # 建议**同时**到两处，互不替代：旧 run 的门 comment（收尾）+ 新一轮的 inputs（真正干活的那个）
+    assert capture.calls[1]["json"]["comment"] == feedback
+    rerun_inputs = capture.calls[2]["json"]["ticket"]
+    assert rerun_inputs["review_feedback"] == feedback
+    assert set(rerun_inputs.keys()) == {
+        "bug_report", "window_start", "window_end", "review_feedback",
+    }
+
+    # 新一轮已绑定；记录仍在 in_progress（重跑不翻转状态）
+    detail = client.get("/v1/problems/PR-0001").json()
+    assert detail["state"] == "in_progress"
+    run_ids = [e.get("run_id") for e in detail["evidence"] if e.get("type") == "agent_run"]
+    assert run_ids[-1] == "run_new"
+
+
+def test_agentflow_reject_without_feedback_is_allowed_when_there_is_no_plan(client):
+    """走 halt（无结论）时的重跑**不强制**填理由 —— 那是重试语义，不是"驳斥一份方案"。
+
+    判据在**服务端**：``conclusion_digest(run)`` 为空（halt / 诊断失败）→ 没有方案可驳 →
+    ``feedback`` 选填。前端「补齐证据重跑」因此允许留空（适用于 code-locator 轮次耗尽这类
+    执行类失败：本来就只需重跑一轮，硬要人编一句理由是纯负担）。
+    """
+    _seed_log_record(client)
+    _bind_agent_run(client)
+    capture = CapturingHttp(
+        [
+            _run_detail(no_conclusion=True),  # halt 形状：无方案
+            _resp(
+                200,
+                {"approval": {"status": "REJECTED"}, "run_status": "done"},
+                url=AGENTFLOW_BASE + "/runs/run_abc/reject",
+            ),
+            _resp(200, {"run_id": "run_new", "status": "started"}, url=AGENTFLOW_BASE + "/run"),
+        ]
+    )
+    client.app.state.http_client = capture
+
+    resp = client.post("/v1/problems/PR-0001/diagnose/decision", json={"decision": "reject"})
+    assert resp.status_code == 200, resp.json()
+    # 留空 → inputs 里是空串（workflow 侧按"首次诊断"处理）
+    assert capture.calls[-1]["json"]["ticket"]["review_feedback"] == ""
+
+
+def test_agentflow_reject_without_feedback_is_400_when_a_plan_exists(client):
+    """有方案可驳却不说理由 → 仍然 400。这条守卫不能因为上面那条放宽而丢掉。"""
+    _seed_log_record(client)
+    _bind_agent_run(client)
+    capture = CapturingHttp([_run_detail()])  # 有 rca + plan 产出 → 有方案
+    client.app.state.http_client = capture
+
+    resp = client.post("/v1/problems/PR-0001/diagnose/decision", json={"decision": "reject"})
+    assert resp.status_code == 400
+    assert "拒绝必须带修改建议" in resp.json()["reason"]
+    # 拦在起 run 之前：只出了一次 GET /runs，没有 reject/起 run 的调用
+    assert [c["url"] for c in capture.calls] == [AGENTFLOW_BASE + "/runs/run_abc"]
 
 
 def test_escalate_discovers_gate_node_from_pending_approvals(client):
