@@ -150,8 +150,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(AppException)
     async def _app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
+        status = _status_for_code(exc.code)
+        # 记日志：此前这里**只返回 JSON**，于是访问日志里只剩一个状态码，
+        # `reason` 只存在于响应体里（一闪而过的前端 toast）。实测吃过亏——
+        # 排查一个 502 时只能靠"reason 是空字符串"反推，结果推错了方向（误判成配额）。
+        # 上游类错误尤其要留痕：它们几乎都是"外部状态"，事后无法从代码复现。
+        if exc.code is ErrorCode.UPSTREAM:
+            logger.warning(
+                "上游调用失败 %s %s -> %s: %s",
+                request.method, request.url.path, status, exc.reason,
+            )
+        else:
+            logger.info(
+                "%s %s -> %s %s: %s",
+                request.method, request.url.path, status, exc.code.value, exc.reason,
+            )
         return JSONResponse(
-            status_code=_status_for_code(exc.code),
+            status_code=status,
             content={
                 "code": exc.code.value,
                 "reason": exc.reason,

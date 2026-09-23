@@ -46,17 +46,19 @@ ES 在集群里是 ``svc/elasticsearch:9200``，本机经 port-forward 映射到
 
 --- 查询下发方式 -------------------------------------------------------------
 
-``time_field`` / ``service_field`` 两个键是**给采集器看的开关**：设了它们，
+``time_field`` / ``service_field`` / ``level_field`` 三个键是**给采集器看的开关**：设了它们，
 ``collectors/http_logs.py`` 的 ``_build_body`` 才会构造 ES 的 POST body——
 
 - ``service_field``：按 ``target["service"]`` 做 term 过滤（ES 侧要 ``.keyword`` 后缀）；
 - ``time_field``：把水位线增量窗口做成 body 里的 ``range`` filter。**ES 的 URI 查询不支持
   日期 range**，所以时间窗只能走 body；不下发的话每轮都重采最新一页、水位线推不动。
+- ``level_field`` + ``levels``：按级别做 ``terms`` 过滤（同样要 ``.keyword`` 后缀、同样精确大小写）。
 
-非 ES 源不设这两个键，采集器返回 ``None`` body，行为与改动前一致。
+非 ES 源不设这些键，采集器返回 ``None`` body，行为与改动前一致。
 
-另注：当前 ``app-logs`` 里只有 INFO / WARN 级别，且**没有堆栈字段**；
-依赖堆栈签名的 ``signature_aggregate`` 检测器暂无输入。
+另注：``app-logs`` 里 ERROR 是少数派但**确实存在**（2026-09-23 实测：全库 31 条，均带
+``stack_trace``；INFO 是压倒性多数，单次洪峰 4~7 万条）—— 这正是上面 ``level_field``
+存在的原因：不在 ES 侧挡掉 INFO，``signature_aggregate`` 拿不到 ERROR 的输入。
 """
 
 from __future__ import annotations
@@ -92,6 +94,14 @@ def _target(service: str, es_url: str) -> dict:
             # 而 _source 里的取值路径不带（见模块 docstring 的文档形状）
             "time_field": "@timestamp",
             "service_field": "app.service.keyword",
+            # 只取 ERROR（2026-09-23 加）：这三条 target 的 INFO 洪峰（实测单次 4~7 万条挤在
+            # 0.7 秒内）会把采集器每轮 500 条的 size 上限顶满，水位线一轮只推进几毫秒 →
+            # 积压永久累积、真正的 ERROR 永远轮不到（当时滞后 111,418 条 ≈ 4 小时）。
+            # 全库 ERROR 仅 31 条，加了它采集量降到可忽略，且同签名的 ERROR 能落在同一轮里
+            # 过 signature_aggregate 的 min_count=5 门槛。
+            # 取值须与源端**大小写完全一致**：.keyword 是精确 term，实测 ["error"] 匹配 0 条。
+            "level_field": "app.level.keyword",
+            "levels": ["ERROR"],
             # @timestamp 本身就是 UTC 带 Z，故不设 timezone（设了反而会二次偏移）
             # 路径带 _source. 前缀：采集器不剥壳（见模块 docstring 的契约说明）
             "field_mapping": {

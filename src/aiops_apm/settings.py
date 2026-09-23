@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     # agentflow（multi-agent-workflow，Bug Solve 后端）根地址：Problem Center Analyze 联动 POST /run 用。
     # APM_BUG_SOLVE_BASE_URL 可覆盖。
     bug_solve_base_url: str = "http://localhost:8000"
+    # 起 agentflow run 的**专用**超时（秒），不共用 outbound_timeout_sec。
+    # agentflow 的 POST /run 在返回前会**同步准备工作区**（拉修复侧仓库），实测超过 10s ——
+    # 用共用的 10s 会让它稳定超时。而且超时**不会阻止 agentflow 把 run 跑起来**：
+    # 于是我们报失败、它照跑，用户看到失败就重试 → **每点一次多一个孤儿 run**，
+    # 每个孤儿还占租户并发配额。故这里给足余量。
+    run_start_timeout_sec: float = 60.0
     # agentflow 侧租户（出站 X-Tenant-ID）。**两侧租户不是同一个**：问题单在 APM 租户下
     # （本机 default，前端用 X-Tenant-Id 指定该值），而 workflow / MCP server / agent 绑定
     # 在 agentflow 租户下（本机 otr）。必须显式桥接——否则 run 落到 agentflow 的 dev 缺省

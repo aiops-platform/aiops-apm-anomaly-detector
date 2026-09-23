@@ -44,6 +44,17 @@ _SEV_MAP = {
 #: `archived` 在词表里但全仓没有任何写入方，留着是防御性的。
 _TERMINAL_STATES = ("resolved", "closed", "archived", "escalated")
 
+#: 起 agentflow run 超时的统一文案（analyze 与 rerun 两处共用，同 ``_TERMINAL_STATES`` 的防漏理由）。
+#:
+#: **必须写明"run 可能已经在后台跑"**：agentflow 的 ``POST /run`` 在返回前同步准备工作区，
+#: 超时只表示我们不等了，它那边照建照跑。措辞若只说"失败"，用户就会重试 —— 而每次重试
+#: 都会**再起一个 run**（实测：66 秒内点了三次 → 三个 run，我们这边一个都不认识）。
+_RUN_START_TIMEOUT_REASON = (
+    "agent workflow run start timed out after {secs:g}s; agentflow prepares the fix-side workspace "
+    "synchronously before returning, so the run MAY ALREADY BE RUNNING in the background — check this "
+    "problem's evidence/run before retrying, because a retry starts ANOTHER run"
+)
+
 def _primary_service(rec: dict) -> str:
     """记录的主服务名（单个）。
 
@@ -588,6 +599,11 @@ async def analyze_problem(request: Request, record_id: str, body: AnalyzeProblem
     4) state=pending 正常开跑；state=in_progress 且 ``rerun=true`` → 起新 run 并追加绑定
     （打回后重跑），否则 409 → 5) 组 ``inputs``（``bug_report`` 包装 + 时间窗）→
     6) POST agentflow ``/run``（失败/非 2xx → 502，绝不翻转状态）→ 7) 成功才写绑定/翻状态。
+
+    ⚠️ 第 6 步的超时**不等于失败**：agentflow 在响应前同步准备工作区，超时只表示我们不等了，
+    它那边照样把 run 建起来并跑。故超时用独立文案（见 ``_RUN_START_TIMEOUT_REASON``），
+    且超时后**不写绑定**——这正是"点了报错、后台其实在跑、重试又多一个 run"的来源。
+    超时值走 ``settings.run_start_timeout_sec``（专用，不共用采集器的 ``outbound_timeout_sec``）。
     """
     workflow_id = (body.workflow_id or "").strip()
     if not workflow_id:
@@ -633,7 +649,15 @@ async def analyze_problem(request: Request, record_id: str, body: AnalyzeProblem
             url,
             json={"workflow_id": workflow_id, "ticket": inputs, "tenant_id": agentflow_tenant},
             headers=headers,
+            timeout=settings.run_start_timeout_sec,
         )
+    except httpx.TimeoutException as exc:
+        # 超时 ≠ 没起来：agentflow 的 POST /run 在返回前**同步**准备工作区（拉修复侧仓库），
+        # 耗时可能超过任何合理超时。超时只表示**我们不等了**，它那边照建照跑。
+        # 所以措辞必须拦住盲目重试 —— 重试会再起一个 run（每个还占租户并发配额）。
+        raise AppException(
+            ErrorCode.UPSTREAM, _RUN_START_TIMEOUT_REASON.format(secs=settings.run_start_timeout_sec)
+        ) from exc
     except httpx.HTTPError as exc:  # 连接 / 超时
         raise AppException(ErrorCode.UPSTREAM, f"agent workflow run start failed: {exc}") from exc
 
@@ -1475,7 +1499,13 @@ async def _decide_agentflow(
                 url,
                 json={"workflow_id": workflow_id, "ticket": inputs, "tenant_id": agentflow_tenant},
                 headers={"Content-Type": "application/json", "X-Tenant-ID": agentflow_tenant},
+                timeout=settings.run_start_timeout_sec,
             )
+        except httpx.TimeoutException as exc:
+            # 同 analyze_problem：超时不代表没起来，措辞要点明"可能已在跑"以拦住重试。
+            raise AppException(
+                ErrorCode.UPSTREAM, _RUN_START_TIMEOUT_REASON.format(secs=settings.run_start_timeout_sec)
+            ) from exc
         except httpx.HTTPError as exc:
             raise AppException(
                 ErrorCode.UPSTREAM, f"agent workflow rerun failed: {exc}"

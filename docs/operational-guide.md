@@ -256,6 +256,7 @@ APM 告警管理系统
 | `source_config.field_mapping` | 行 → 信号字段映射（`metric`/`value`/`timestamp`/`service`/`level`/`message`/`stack_trace`），支持点路径与 `value[1]` 数组索引 |
 | `source_config.headers` | 请求头；`authorization`/`x-api-key` 必须用 `${env:X}` 或 `${vault:path#key}` 引用（拒明文凭据） |
 | `source_config.params` | 额外查询参数（指标采集还会下推 `start` 水位线） |
+| `source_config.time_field` / `service_field` / `level_field` | **ES（`elk`）源的查询开关**，设任一个即启用：时间窗、服务过滤、级别过滤放进 **POST body** 的 ES 查询 DSL。ES 的日期 range **只认 body**，写进 URL 参数会 400；`.keyword` 后缀与大小写都必须精确。配了 `level_field` 再配 `levels`（如 `"app.level.keyword"` + `["ERROR"]`）生成 `terms` filter —— 用途是把无意义的量挡在 ES 侧：源端单轮新增量远超 `size`（默认 500）时，水位线一轮只推进几毫秒、积压永久累积，真正的 ERROR 永远轮不到。`levels` 为空则不下发该过滤（空 `terms` 匹配 0 条，会让该 target 静默采不到日志） |
 | `source_config.signature_frames` | 日志堆栈签名帧数（默认 3） |
 | `source_config.window_sec` | 滚动回看窗口（秒）。设了即每轮动态下推 `start=now-window_sec` / `end=now`（**覆盖水位线**）；未设走水位线增量。建议 `window_sec >= interval_sec` 防漏 |
 | `source_config.time_params` | 时间参数名映射，默认 `{"start":"start","end":"end"}`（源用 `from`/`to` 等时改这里）。水位线/窗口分支都遵守该映射 |

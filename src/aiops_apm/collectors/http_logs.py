@@ -25,8 +25,8 @@ def _build_body(
 ) -> dict | None:
     """构造 ES ``_search`` 的查询 body；非 ES 源返回 ``None``。
 
-    仅在 ``source_config`` 设了 ``time_field`` / ``service_field`` 时启用。这两个键表达的是
-    ES 侧的语义，HTTP 源用 ``params``/``time_params`` 即可，不需要 body：
+    仅在 ``source_config`` 设了 ``time_field`` / ``service_field`` / ``level_field`` 时启用。
+    这三个键表达的是 ES 侧的语义，HTTP 源用 ``params``/``time_params`` 即可，不需要 body：
 
     - ``time_field``（如 ``@timestamp``）：增量窗口**只能**放在 body 的 ``range`` filter 里 ——
       ES 的 URI 查询不支持日期 range。不放的话每轮都会重采最新一页（默认 size=10），
@@ -35,12 +35,20 @@ def _build_body(
       后缀（``_source`` 里取值时不带）。**必须在查询里按服务过滤，不能采集后再筛**——
       实测 169 条日志里有约 35% 是非 JSON 行、压根没有 ``app`` 对象，采集后筛会让这些行
       落到 ``service="unknown"``；且三个 target 会各自把同一批文档重采一遍。
+    - ``level_field`` + ``levels``（如 ``app.level.keyword`` + ``["ERROR"]``）：按日志级别过滤，
+      生成 ``terms`` filter。**取值须与源端大小写完全一致**——``.keyword`` 是精确 term，
+      实测 ``["error"]`` 匹配 0 条。这个键真正的用武之地是**把无意义的洪峰挡在 ES 侧**：
+      源端每轮新增量远超 ``size`` 时（实测单次 4~7 万条挤在 0.7 秒内），水位线一轮只推进
+      几毫秒、积压永久累积，真正的 ERROR 永远轮不到；只取 ERROR 后采集量降到可忽略。
+      两条静默归零的坑已设防：``levels`` 为空不下发（``{"terms": {f: []}}`` 匹配 0 条），
+      裸字符串按单元素列表处理（否则 ``list("ERROR")`` 碎成 ``['E','R','R','O','R']``）。
 
-    ``size`` 由 ``source_config.size`` 覆盖（默认 500）。
+    ``size`` 由 ``source_config.size`` 覆盖（默认 500）。它是**每轮**上限，且结果按时间升序取。
     """
     time_field = sc.get("time_field")
     service_field = sc.get("service_field")
-    if not time_field and not service_field:
+    level_field = sc.get("level_field")
+    if not time_field and not service_field and not level_field:
         return None
     tz = sc.get("timezone")
     filters: list[dict] = []
@@ -57,6 +65,11 @@ def _build_body(
                 }
             }
         )
+    levels = sc.get("levels") or []
+    if isinstance(levels, str):  # 裸字符串：按单元素列表处理，别碎成字符
+        levels = [levels]
+    if level_field and levels:
+        filters.append({"terms": {level_field: list(levels)}})
     body: dict = {"query": {"bool": {"filter": filters}}, "size": int(sc.get("size", 500))}
     if time_field:
         body["sort"] = [{time_field: "asc"}]
@@ -80,10 +93,12 @@ class HttpLogsCollector(Collector):
         resolved = {k: self.gateway.resolve_secret(v) for k, v in headers.items()}
 
         params = dict(sc.get("params", {}))
-        # ES 源（设了 time_field/service_field）的时间窗走 POST body 的 range filter，
+        # ES 源（设了 time_field/service_field/level_field）的时间窗走 POST body 的 range filter，
         # **不能**同时用 URL 参数下发——ES 不认识 start/end 这类查询串参数，会直接 400
         # （实测：`.../_search?start=...` → 400 Bad Request，整轮采集 failed）。
-        es_mode = bool(sc.get("time_field") or sc.get("service_field"))
+        # 这里必须与 ``_build_body`` 的启用条件保持一致，否则「只设 level_field」的 target
+        # 会把时间窗降级成 URL 参数下发 → 400。
+        es_mode = bool(sc.get("time_field") or sc.get("service_field") or sc.get("level_field"))
         # 本轮增量窗口的原始时间，供 ES 的 body range filter 复用。
         start_dt: datetime | None = None
         end_dt: datetime | None = None

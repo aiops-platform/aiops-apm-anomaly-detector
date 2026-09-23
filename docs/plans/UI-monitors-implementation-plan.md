@@ -73,7 +73,9 @@ Service Ops
 | Signature Frames | `source_config.signature_frames` | 数字 | log 时 | `3` | 日志堆栈签名帧数 |
 | Field Mapping | `source_config.field_mapping` | JSON 编辑器 | metric/log 必填 | — | 键：`metric`/`value`/`timestamp`/`service`/`level`/`message`/`stack_trace`；支持点路径与 `value[1]` 数组索引 |
 | Headers | `source_config.headers` | JSON 编辑器 | — | `{}` | `authorization`/`x-api-key` **必须用 `${env:X}` 或 `${vault:path#key}` 引用**（拒明文凭据） |
-| Params | `source_config.params` | JSON 编辑器 | — | `{}` | 额外查询参数（指标采集还会自动下推 `start` 水位线）；error 过滤如 `{"level":"error"}` 放这里 |
+| Params | `source_config.params` | JSON 编辑器 | — | `{}` | 额外查询参数（**URL 查询串**；指标采集还会自动下推 `start` 水位线）。⚠️ **不要在这里放日志级别过滤** —— 对 ES 源是死路：自定键会让 ES 返回 400 `unrecognized parameter`，换 `q` 则会整体覆盖 body 的 query、静默丢掉水位线窗口。级别过滤用 `level_field` + `levels`（见下） |
+| Time Field / Service Field / Level Field | `source_config.time_field` / `service_field` / `level_field` | 文本 | — | — | **ES（`elk`）源的查询开关**，设任一个即启用：时间窗、服务过滤、级别过滤放进 **POST body** 的 ES 查询 DSL。ES 的日期 range 只认 body，写进 URL 参数会 400；`.keyword` 后缀与大小写都必须精确。`level_field` 的用途是把无意义的量挡在 ES 侧：源端单轮新增量远超 `size`（默认 500）时，水位线一轮只推进几毫秒、积压永久累积，真正的 ERROR 永远轮不到 |
+| Levels | `source_config.levels` | 文本（逗号分隔） | — | — | 配合 `level_field` 生成 `terms` filter，如 `ERROR, WARN` → `["ERROR","WARN"]`。取值须与源端**大小写完全一致**（`.keyword` 是精确 term）；留空即不下发该过滤（空 `terms` 匹配 0 条，会让该端点静默采不到日志） |
 | Window (sec) | `source_config.window_sec` | 数字 | — | 未设 | **方案 B**：回看窗口（秒）。设了即每轮动态下推 `start=now-window_sec` / `end=now`（固定滚动窗口，覆盖水位线）；未设走水位线增量。**建议 `window_sec >= interval_sec` 防漏** |
 | Time Params | `source_config.time_params` | JSON 编辑器 | — | `{"start":"start","end":"end"}` | **方案 B**：窗口参数名映射（源用 `from`/`to` 等时改这里，如 `{"start":"from","end":"to"}`） |
 | Timezone | `source_config.timezone` | 文本 | — | — | 源所在时区（IANA，如 `Asia/Shanghai`）。出站时间统一 `yyyy-MM-dd'T'HH:mm:ss.SSS` + 时区后缀（UTC→`Z`）；**Spring 等源按本地墙钟解析查询参数（忽略时区后缀）**，水位线是 UTC，配了 `timezone` 才转源时区再发，否则漂移 8 小时重复采集 |
@@ -170,7 +172,7 @@ tests/test_collectors.py                 # 改：加窗口用例
 
 **设计注意**：
 - **建议 `window_sec >= interval_sec`**：等于=连续无重叠；大于=重叠靠幂等去重兜底；小于=可能漏采日志。
-- error 过滤仍用静态 `params: {"level":"error"}`，与窗口下推叠加（静态参数名若与 start/end 相同会被窗口覆盖，期望行为）。
+- ⚠️ **级别过滤不要用 `params`**（本文档早期版本此处写的是 `params: {"level":"error"}`，实测是死路：ES 400 `unrecognized parameter`；换 `q` 会整体覆盖 body 的 query、静默丢掉窗口）。走 `source_config.level_field` + `levels`，与窗口下推天然叠加（前者进 body，后者进 URL 查询串，互不干扰）。详见后端 `docs/logs/M9.md` 的「日志 target 按级别过滤」一节。
 - 时间格式：ISO8601 字符串（与现有水位线 `isoformat()` 一致）。
 
 ## 9. 前端改动文件清单（SIP UI 仓库，遵循其约定）

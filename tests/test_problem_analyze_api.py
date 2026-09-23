@@ -1,6 +1,7 @@
 """``POST /v1/problems/{record_id}/analyze`` → 组平铺 ticket + agentflow /run + in_progress 翻转。"""
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 
 import httpx
@@ -48,12 +49,32 @@ class CapturingHttp:
                 "url": url,
                 "json": kwargs.get("json"),
                 "headers": kwargs.get("headers"),
+                "timeout": kwargs.get("timeout"),
             }
         )
         return self._resp
 
     async def aclose(self) -> None:
         # app 生命周期 teardown 会调用 http_client.aclose()，桩需兼容
+        return None
+
+
+class TimeoutHttp:
+    """出站恒抛读超时。
+
+    **刻意用空消息**：真实场景里 ``httpx.ReadTimeout`` 的 ``str()`` 就是空的
+    （2026-09-23 实测 ``reason`` 落在 ``"agent workflow run start failed: "``），
+    所以桩必须复现这个形状，否则测不出"靠空字符串根本认不出是超时"。
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    async def request(self, method, url, **kwargs):
+        self.calls.append({"method": method, "url": url, "timeout": kwargs.get("timeout")})
+        raise httpx.ReadTimeout("", request=httpx.Request(method, url))
+
+    async def aclose(self) -> None:
         return None
 
 
@@ -251,3 +272,62 @@ def test_analyze_upstream_failure_leaves_pending(client):
     detail = client.get("/v1/problems/PR-0001").json()
     assert detail["state"] == "pending"
     assert not [e for e in detail["evidence"] if e.get("type") == "agent_run"]
+
+
+def test_analyze_uses_dedicated_run_start_timeout(client):
+    """起 run 用**专用**超时，不共用采集器的 ``outbound_timeout_sec``。
+
+    2026-09-23 实测：agentflow 的 ``POST /run`` 在返回前同步准备工作区（拉修复侧仓库），
+    耗时超过共用的 10s → 稳定超时。两个值必须分开，否则放宽其一就会连带影响采集器。
+    """
+    _seed(client)
+    http = CapturingHttp(_ok_resp())
+    client.app.state.http_client = http
+
+    assert client.post("/v1/problems/PR-0001/analyze", json={"workflow_id": "wf-1"}).status_code == 200
+
+    settings = client.app.state.settings
+    assert http.calls[0]["timeout"] == settings.run_start_timeout_sec
+    assert settings.run_start_timeout_sec > settings.outbound_timeout_sec
+
+
+def test_analyze_run_start_timeout_is_distinguishable_and_warns_against_retry(client):
+    """超时必须是**可识别**的文案，且点明"run 可能已在后台跑、重试会再起一个"。
+
+    为什么这两点都要守：
+    - **可识别**：``httpx.ReadTimeout`` 的 ``str()`` 是空的，走通用分支只会得到
+      ``"agent workflow run start failed: "`` —— 实测就是凭这个空字符串去反推原因，推错了方向。
+    - **拦住重试**：超时**不阻止** agentflow 把 run 跑起来（实测：两次"失败"的 analyze
+      各留下一个真 run）。措辞若只说失败，用户重试 → 每次多一个孤儿 run，还占并发配额。
+    """
+    _seed(client)
+    client.app.state.http_client = TimeoutHttp()
+
+    resp = client.post("/v1/problems/PR-0001/analyze", json={"workflow_id": "wf-1"})
+
+    assert resp.status_code == 502
+    reason = resp.json()["reason"]
+    assert "timed out" in reason
+    assert "MAY ALREADY BE RUNNING" in reason
+    assert "ANOTHER run" in reason
+    # 超时同样不写绑定（拿不到 run_id，写不了）
+    detail = client.get("/v1/problems/PR-0001").json()
+    assert not [e for e in detail["evidence"] if e.get("type") == "agent_run"]
+
+
+def test_upstream_failure_is_logged(client, caplog):
+    """上游失败必须留日志 —— 否则访问日志里只剩一个光秃秃的状态码。
+
+    这是本次排查的实际教训：502 的 ``reason`` 只存在于响应体（前端一闪而过的 toast），
+    库里、访问日志里都没有，最后只能凭"reason 是空字符串"去反推，推错了方向。
+    """
+    _seed(client)
+    client.app.state.http_client = TimeoutHttp()
+
+    with caplog.at_level(logging.WARNING, logger="aiops_apm._app"):
+        resp = client.post("/v1/problems/PR-0001/analyze", json={"workflow_id": "wf-1"})
+
+    assert resp.status_code == 502
+    logged = [r.getMessage() for r in caplog.records]
+    assert any("/v1/problems/PR-0001/analyze" in m for m in logged), logged
+    assert any("timed out" in m for m in logged), logged

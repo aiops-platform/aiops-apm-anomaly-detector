@@ -81,6 +81,24 @@ def _log_target(**overrides):
     return base
 
 
+def _es_log_sc(**overrides):
+    """ES 源的 ``source_config`` 基底（POST + time_field/service_field）。
+
+    ES 用例一律**整体重建** source_config，不用 ``_sc_with_window`` 那种合并式——
+    后者是给 ``window_sec``/``timezone`` 追加用的，而 ES 模式的键要么齐、要么不齐。
+    """
+    sc = {
+        "url": "https://elk.example.com:9200/logs/_search",
+        "method": "POST",
+        "rows_path": "hits.hits",
+        "time_field": "@timestamp",
+        "service_field": "app.service.keyword",
+        "field_mapping": {"timestamp": "_source.@timestamp"},
+    }
+    sc.update(overrides)
+    return sc
+
+
 # ---- FakeHttp ----
 
 
@@ -326,6 +344,86 @@ async def test_logs_es_mode_window_goes_in_body_not_params():
     rng = next(f["range"]["@timestamp"] for f in filters if "range" in f)
     assert rng["gte"] == "2026-08-26T12:00:00.000Z"
     assert body["sort"] == [{"@timestamp": "asc"}]
+
+
+async def test_logs_level_filter_is_appended_to_body_filters():
+    """``level_field`` + ``levels`` → ``terms`` filter **追加**进 ``bool.filter``，不挤掉既有过滤。
+
+    动机（2026-09-23 实测）：源端日志洪峰（单次 4~7 万条挤在 0.7 秒内）会顶满 ``size``
+    （默认 500），水位线一轮只推进几毫秒 → 积压永久累积，真正的 ERROR 永远轮不到。
+    在 **ES 侧**按级别过滤后采集量降到可忽略。三条 filter 必须同时在：过滤键只能追加，
+    不能替换掉服务与时间窗（``params: {"q": ...}`` 是替换的反例——它会让水位线窗口静默失效）。
+    """
+    http = FakeHttp(lambda params: {"hits": {"hits": []}})
+    collector = HttpLogsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0002", datetime(2026, 8, 26, 12, 0, 0))
+    ctx = CollectContext("tenant-a", watermark_store=wm)
+
+    target = _log_target(
+        source_config=_es_log_sc(level_field="app.level.keyword", levels=["ERROR"])
+    )
+    await collector.collect(ctx, target)
+
+    filters = http.calls[0]["json"]["query"]["bool"]["filter"]
+    assert {"term": {"app.service.keyword": "order-management"}} in filters
+    assert any("range" in f for f in filters), "时间窗不得被级别过滤挤掉"
+    assert {"terms": {"app.level.keyword": ["ERROR"]}} in filters
+
+
+async def test_logs_without_level_field_adds_no_terms_filter():
+    """回归守卫：不设 ``level_field`` 的 ES 源，body 不得凭空多出 ``terms``。"""
+    http = FakeHttp(lambda params: {"hits": {"hits": []}})
+    collector = HttpLogsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0002", datetime(2026, 8, 26, 12, 0, 0))
+    ctx = CollectContext("tenant-a", watermark_store=wm)
+
+    await collector.collect(ctx, _log_target(source_config=_es_log_sc()))
+
+    filters = http.calls[0]["json"]["query"]["bool"]["filter"]
+    assert len(filters) == 2
+    assert {"term": {"app.service.keyword": "order-management"}} in filters
+    assert not any("terms" in f for f in filters)
+
+
+@pytest.mark.parametrize("levels", [[], "", None], ids=["empty-list", "empty-str", "absent"])
+async def test_logs_empty_levels_sends_no_terms_filter(levels):
+    """守卫：``levels`` 为空/缺省时**不得**下发 ``terms``。
+
+    实测 ``{"terms": {field: []}}`` 匹配 **0 条**——下发它会让该 target 一声不响地
+    采不到任何日志，与本次要修的"静默失效"是同一类故障。
+    """
+    http = FakeHttp(lambda params: {"hits": {"hits": []}})
+    collector = HttpLogsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0002", datetime(2026, 8, 26, 12, 0, 0))
+    ctx = CollectContext("tenant-a", watermark_store=wm)
+
+    extra = {} if levels is None else {"levels": levels}
+    target = _log_target(source_config=_es_log_sc(level_field="app.level.keyword", **extra))
+    await collector.collect(ctx, target)
+
+    filters = http.calls[0]["json"]["query"]["bool"]["filter"]
+    assert not any("terms" in f for f in filters)
+
+
+async def test_logs_bare_string_levels_not_split_into_chars():
+    """守卫：``levels`` 写成裸字符串时按**单元素列表**下发。
+
+    ``list("ERROR")`` → ``['E','R','R','O','R']``，下发后同样是匹配 0 条的静默归零。
+    """
+    http = FakeHttp(lambda params: {"hits": {"hits": []}})
+    collector = HttpLogsCollector(http, OutboundGateway())
+    wm = InMemoryWatermarkStore()
+    await wm.update("tenant-a", "MT-0002", datetime(2026, 8, 26, 12, 0, 0))
+    ctx = CollectContext("tenant-a", watermark_store=wm)
+
+    target = _log_target(source_config=_es_log_sc(level_field="app.level.keyword", levels="ERROR"))
+    await collector.collect(ctx, target)
+
+    filters = http.calls[0]["json"]["query"]["bool"]["filter"]
+    assert {"terms": {"app.level.keyword": ["ERROR"]}} in filters
 
 
 async def test_logs_non_es_source_still_uses_url_params():
