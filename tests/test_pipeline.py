@@ -574,6 +574,54 @@ async def test_m9_group_key_stable_across_rounds() -> None:
         await storage.close()
 
 
+async def test_m9_per_request_ids_do_not_split_a_recurring_problem() -> None:
+    """正文带 per-request id 的无堆栈日志跨轮复发必须**追加**，不是每轮开新单。
+
+    实测背景（2026-09-28 活库）：`报价单模板缺失 orderId=… traceId=…` 没有堆栈，
+    `signature()` 回退 `message[:120]` ⇒ 每个请求一个新签名 ⇒ 新 `anomaly_key`；
+    而 `group_key` 是**组内异常集合**的哈希，成员一变就换键 ⇒ 去重闸门恒不命中，
+    同一故障在 3 轮里开了 3 张单（PR-20260928-0352/0354/0356）。
+
+    上面那条 `test_m9_group_key_stable_across_rounds` 抓不到它：它每轮喂的是**同一对
+    签名**（只换 trace id），成员集合恒定。这里两轮的 per-request id **都不同**，
+    且 `signature=None` 让 detector 自己算签名——走的正是生产那条路。
+    """
+    storage = await make_storage()
+    try:
+        for i, (trace_id, order_id) in enumerate([("91ca", "ORD-1"), ("f5ec", "ORD001")]):
+            ts = TS + timedelta(seconds=60 * i)
+            # 同一次请求失败的两条日志：堆栈那条签名稳定，明文那条带 per-request id。
+            await _run_logs(
+                storage,
+                [
+                    LogSignal(
+                        service="order-service",
+                        level="ERROR",
+                        message="unhandled exception: GET /quotation/exception",
+                        stack_trace=(
+                            "QuotationException: 报价单模板缺失\n"
+                            "\tat com.company.order.service.QuotationService.quotationSummary(QuotationService.java:289)"
+                        ),
+                        timestamp=ts,
+                        trace_id=trace_id,
+                    ),
+                    LogSignal(
+                        service="order-service",
+                        level="ERROR",
+                        message=f"报价单模板缺失 orderId={order_id} traceId={trace_id}",
+                        timestamp=ts,
+                        trace_id=trace_id,
+                    ),
+                ],
+                now=ts,
+            )
+        rows = await storage.records.list("default")
+        assert len(rows) == 1, f"同一故障复发应是 1 条（追加），实际 {len(rows)} 条"
+        assert rows[0]["occurrence_count"] == 2, "第二轮应是追加而非新开单"
+    finally:
+        await storage.close()
+
+
 async def test_m9_seen_keys_covers_every_anomaly() -> None:
     """分组必须是划分：每个异常都恰好进一次 l3_verify。
 
