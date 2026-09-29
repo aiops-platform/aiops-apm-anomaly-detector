@@ -83,6 +83,60 @@ def test_map_metric_prometheus_row():
     assert sig.tenant_id == "tenant-x"
 
 
+def test_map_metric_labels_from_metric_object():
+    """**per-pod 身份**：Prometheus 把标签放在 `metric` 对象里，映射必须取得到。
+
+    取不到的后果是**静默**的：所有 pod 的 labels 都是 `{}`，而
+    `anomaly_key = metric|tenant|service|指标名|labels` 因此完全相同 ⇒
+    多副本共享一个持续性计数器，记录里也说不出是哪个 pod 跑飞。
+    """
+    mapping = {
+        "metric": "metric.metric",
+        "value": "value[1]",
+        "timestamp": "value[0]",
+        "labels": "metric",
+    }
+    row = {
+        "metric": {"metric": "cpu_usage", "service": "order-service", "pod": "order-service-abc-1"},
+        "value": [1710000000, "1"],
+    }
+    sig = FieldMapper.map_metric(row, mapping, "tenant-x")
+    assert sig.labels == {
+        "metric": "cpu_usage",
+        "service": "order-service",
+        "pod": "order-service-abc-1",
+    }
+
+
+def test_map_metric_labels_fall_back_to_top_level_key():
+    """老形状（行里顶层就有 `labels`）不受影响。"""
+    mapping = {"metric": "metric.__name__", "value": "value[1]", "timestamp": "value[0]"}
+    row = {"metric": {"__name__": "cpu_usage"}, "value": [1710000000, "0.91"], "labels": {"pod": "p1"}}
+    sig = FieldMapper.map_metric(row, mapping, "tenant-x")
+    assert sig.labels == {"pod": "p1"}
+
+
+def test_map_metric_labels_mapping_to_non_dict_is_empty():
+    """映射指到非字典（配错路径）当空 —— 这是可选元信息，**不该炸掉采集**。"""
+    mapping = {
+        "metric": "metric.__name__",
+        "value": "value[1]",
+        "timestamp": "value[0]",
+        "labels": "metric.__name__",
+    }
+    row = {"metric": {"__name__": "cpu_usage"}, "value": [1710000000, "0.91"]}
+    sig = FieldMapper.map_metric(row, mapping, "tenant-x")
+    assert sig.labels == {}
+
+
+def test_map_metric_without_any_labels_is_empty():
+    """既没映射、行里也没顶层 labels（既有端点就是这个形状）⇒ 仍是空。"""
+    mapping = {"metric": "metric.__name__", "value": "value[1]", "timestamp": "value[0]"}
+    row = {"metric": {"__name__": "cpu_usage"}, "value": [1710000000, "0.91"]}
+    sig = FieldMapper.map_metric(row, mapping, "tenant-x")
+    assert sig.labels == {}
+
+
 # ---- map_log ----
 
 

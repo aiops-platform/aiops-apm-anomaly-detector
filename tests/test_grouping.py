@@ -122,6 +122,36 @@ def test_metric_alone_forms_own_group() -> None:
     assert len(groups) == 1 and groups[0] == [m]
 
 
+def test_same_service_metrics_merge_into_one_group() -> None:
+    """同一服务、同一轮的两个指标异常 → **一组**（一次事故的多面）。
+
+    2026-09-29 实测补的回归：此前 metric 只往日志组挂、**彼此不连边**，
+    于是「CPU 满」与「被限流」在同一轮各开一张单（两条记录的 detected_at 完全相同、
+    group_key 却不同），人要点两次 Analyze、跑两轮 LLM 诊断。
+    """
+    a = metric(service="svc-a", name="cpu_usage")
+    b = metric(service="svc-a", name="cpu_throttled_percent")
+    groups = group_anomalies([a, b])
+    assert len(groups) == 1, "同服务的 metric 异常应当并成一组"
+    assert group_services(groups[0]) == ["svc-a"]
+
+
+def test_metrics_of_different_services_stay_separate() -> None:
+    """只有**同服务**的 metric 相连；不同服务各成一组。"""
+    a = metric(service="svc-a", name="cpu_usage")
+    b = metric(service="svc-b", name="cpu_usage")
+    assert len(group_anomalies([a, b])) == 2
+
+
+def test_same_service_metric_group_still_merges_with_its_single_log_group() -> None:
+    """metric 组 + 该服务唯一的日志组 → 仍然并成一组（「同源 metric+log 升 critical」不变）。"""
+    m1 = metric(service="svc-a", name="cpu_usage")
+    m2 = metric(service="svc-a", name="cpu_throttled_percent")
+    lg = log(service="svc-a")
+    groups = group_anomalies([m1, m2, lg])
+    assert len(groups) == 1
+
+
 def test_metric_does_not_merge_distinct_log_groups_of_same_service() -> None:
     """该服务有多个日志组时，metric **不得**把它们合并。
 

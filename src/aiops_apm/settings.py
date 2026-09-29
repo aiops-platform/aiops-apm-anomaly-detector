@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     # 迁移是静态 SQL 读不到环境变量，由 MigrationRunner 以 GUC 注入（见 runner.py）。
     testbed_es_url: str = "http://localhost:19200/app-logs/_search"
 
+    # 指标监控端点（`docker/seed_testbed_metrics.py`）用的 Prometheus，本机同样走
+    # kubectl port-forward（19090）。与 testbed_es_url 同源的理由：**地址随环境变，
+    # 不要写死在 seed 脚本的字面量里**；容器里 localhost 指向容器自己。
+    testbed_prom_url: str = "http://localhost:19090/api/v1/query"
+
     # ---- 开关 ----
     enable_llm_summary: bool = False
     enable_scheduler: bool = True

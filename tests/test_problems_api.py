@@ -125,11 +125,17 @@ def _seed_with_evidence(client, *, record_id, service="svc-a", metric=False, log
 
 
 def test_detection_type_all_four_branches(client):
-    """log / metric / combined / unknown 四类都能识别。"""
-    _seed_with_evidence(client, record_id="PR-0001", metric=True)
-    _seed_with_evidence(client, record_id="PR-0002", log=True)
-    _seed_with_evidence(client, record_id="PR-0003", metric=True, log=True)
-    _seed_with_evidence(client, record_id="PR-0004")  # 两者皆空
+    """log / metric / combined / unknown 四类都能识别。
+
+    四条各用**不同的 service**：2026-09-29 起 ``write_or_append`` 会把
+    「已开单的异常集合 ⊂ 新集合」的那条**并入**（同一场故障证据变多时不重复开单），
+    同服务的 ``{metric}`` 与 ``{metric, log}`` 因此会被并成一条 —— 那是刻意的，
+    但本用例只想验 ``detection_type`` 的派生，所以让四条互不相干。
+    """
+    _seed_with_evidence(client, record_id="PR-0001", service="svc-metric", metric=True)
+    _seed_with_evidence(client, record_id="PR-0002", service="svc-log", log=True)
+    _seed_with_evidence(client, record_id="PR-0003", service="svc-both", metric=True, log=True)
+    _seed_with_evidence(client, record_id="PR-0004", service="svc-none")  # 两者皆空
 
     got = {i["record_id"]: i["detection_type"] for i in client.get("/v1/problems").json()["items"]}
     assert got == {

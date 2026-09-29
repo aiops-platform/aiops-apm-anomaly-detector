@@ -14,11 +14,85 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any
 
+from ..models import fingerprint
+from ..models.anomaly import LogAnomaly, MetricAnomaly
 from ..models.record import ProblemRecord
 from .connection import ConnectionPool, _as_json, _decode_json
 
 _OPEN_STATES = ("pending", "in_progress")
 _SEVERITY_RANK = {"warning": 0, "high": 1, "critical": 2}
+
+
+# ── 超集并入：让「同一场故障、异常集合慢慢长大」不重复开单 ──────────────────────
+#
+# 背景（2026-09-29 实测）：``group_key`` 是**精确异常集合**的哈希，而集合本来就会变 ——
+# 某条指标线晚一轮才越线、日志异常中途进来或退出。集合一变就是**另一张单**：
+# 一次 CPU 饱和会开出"只有症状线"和"两条都有"两张记录，人要点两次 Analyze。
+#
+# 判据取**严格子集**（相等的情形由既有的 ON CONFLICT 精确键路径处理，不必走读-改-写）。
+#
+# ⚠️ 已知边界：若同时存在两个**互不包含**的 partial 单（如 {A} 与 {B}），新的 {A,B}
+# 只能并进其中一条，另一条要等它的异常消失后由 sweep 关掉 —— 不在本函数职责内。
+
+
+def _as_model(a: Any, cls: type[MetricAnomaly] | type[LogAnomaly]) -> Any:
+    """库里读回来的是 dict（JSONB 列），新建的是 pydantic 模型 —— 统一成模型再算指纹。"""
+    return a if isinstance(a, cls) else cls.model_validate(a)
+
+
+def _anomaly_keys(metric_anomalies: Any, log_anomalies: Any) -> set[str]:
+    """一条记录的**异常身份**集合（与 value / severity / 时间无关，见 models/fingerprint.py）。
+
+    超集判定必须与去重键用**同一个函数**：换个口径会出现"并了但没认出来"，
+    静默退化回开新单 —— 那是这条路径最难发现的失效形态。
+    """
+    keys = {fingerprint.anomaly_key(_as_model(a, MetricAnomaly)) for a in (metric_anomalies or [])}
+    keys |= {fingerprint.anomaly_key(_as_model(a, LogAnomaly)) for a in (log_anomalies or [])}
+    return keys
+
+
+def _merge_anomalies(old: Any, new: Any, cls: type) -> list[dict]:
+    """按身份取并集（旧的在前、保留旧的值），产出可直接落 JSONB 的 dict 列表。"""
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for a in [*(old or []), *(new or [])]:
+        m = _as_model(a, cls)
+        key = fingerprint.anomaly_key(m)
+        if key not in seen:
+            seen.add(key)
+            merged.append(m.model_dump(mode="json"))
+    return merged
+
+
+def _superset_candidate(record: ProblemRecord, rows: list[dict], tenant_id: str) -> dict | None:
+    """在已开单里找「异常集合 ⊂ 新集合」的那条；多个命中取**最大的子集**。
+
+    服务维度不用单独比对：``anomaly_key`` 里含 service，不同服务的异常天然构不成子集。
+    """
+    new_keys = _anomaly_keys(record.metric_anomalies, record.log_anomalies)
+    if not new_keys:
+        return None
+    best: tuple[dict, int] | None = None
+    for row in rows:
+        if row.get("tenant_id") != tenant_id or row.get("state") not in _OPEN_STATES:
+            continue
+        keys = _anomaly_keys(row.get("metric_anomalies"), row.get("log_anomalies"))
+        if keys and keys < new_keys and (best is None or len(keys) > best[1]):
+            best = (row, len(keys))
+    return best[0] if best else None
+
+
+def _apply_merge(row: dict, record: ProblemRecord) -> None:
+    """把新记录并进已开的那条（原地改 dict）。字段规则与精确键追加路径保持一致。"""
+    row["metric_anomalies"] = _merge_anomalies(row.get("metric_anomalies"), record.metric_anomalies, MetricAnomaly)
+    row["log_anomalies"] = _merge_anomalies(row.get("log_anomalies"), record.log_anomalies, LogAnomaly)
+    # 提升为**超集键**：下一轮同样的集合就走精确键路径（ON CONFLICT），不再读-改-写
+    row["group_key"] = record.group_key
+    row["evidence"] = [*row.get("evidence", []), *record.evidence]
+    row["occurrence_count"] = int(row.get("occurrence_count", 1)) + 1
+    row["last_seen_at"] = record.last_seen_at or record.detected_at
+    if _SEVERITY_RANK.get(record.severity, 0) > _SEVERITY_RANK.get(row.get("severity", ""), 0):
+        row["severity"] = record.severity
 
 # problem_record 的标量 + JSON 业务列（不含生成列 open_group_key 与审计列）
 _RECORD_COLUMNS = [
@@ -196,6 +270,11 @@ class InMemoryRecordStore(RecordStore):
     async def write_or_append(self, tenant_id: str, record: ProblemRecord) -> None:
         if not tenant_id:
             raise ValueError("tenant_id is required")
+        # 超集并入：已开单的异常集合 ⊂ 新集合 ⇒ 并进它，不新开（见模块顶部说明）
+        target = _superset_candidate(record, list(self._rows.values()), tenant_id)
+        if target is not None:
+            _apply_merge(target, record)
+            return
         for row in self._rows.values():
             if (
                 row["tenant_id"] == tenant_id
@@ -345,9 +424,62 @@ class PGRecordStore(RecordStore):
         )
         return None if row is None else self._row_to_dict(row)
 
+    async def _find_superset_candidate(self, tenant_id: str, record: ProblemRecord) -> dict | None:
+        """已开单里「异常集合 ⊂ 新集合」的那条（同租户同域）。只取判定需要的三列。"""
+        rows = await self._pool.fetchall(
+            "SELECT record_id, state, metric_anomalies, log_anomalies FROM problem_record "
+            "WHERE tenant_id=%s AND domain=%s AND state = ANY(%s)",
+            (tenant_id, record.domain, list(_OPEN_STATES)),
+        )
+        candidates = [
+            {
+                "tenant_id": tenant_id,
+                "record_id": r[0],
+                "state": r[1],
+                "metric_anomalies": _decode_json(r[2]),
+                "log_anomalies": _decode_json(r[3]),
+            }
+            for r in rows
+        ]
+        return _superset_candidate(record, candidates, tenant_id)
+
+    async def _merge_into(self, tenant_id: str, target: dict, record: ProblemRecord) -> None:
+        """把新记录并进已开的那条：异常取并集、group_key 提升为超集键，其余照追加路径的规则。"""
+        merged_metric = _merge_anomalies(target["metric_anomalies"], record.metric_anomalies, MetricAnomaly)
+        merged_log = _merge_anomalies(target["log_anomalies"], record.log_anomalies, LogAnomaly)
+        await self._pool.execute(
+            "UPDATE problem_record SET group_key=%s, metric_anomalies=%s, log_anomalies=%s, "
+            "evidence = COALESCE(evidence, '[]'::jsonb) || %s, "
+            "occurrence_count = occurrence_count + 1, last_seen_at=%s, "
+            # 严重度取大：词表与 array_position 的坑见上面 INSERT 分支的注释
+            "severity = CASE WHEN "
+            "COALESCE(array_position(ARRAY['warning','high','critical'], %s), 0) > "
+            "COALESCE(array_position(ARRAY['warning','high','critical'], severity), 0) "
+            "THEN %s ELSE severity END, "
+            "updated_at = CURRENT_TIMESTAMP(3) "
+            "WHERE tenant_id=%s AND record_id=%s AND state = ANY(%s)",
+            (
+                record.group_key,
+                _as_json(merged_metric),
+                _as_json(merged_log),
+                _as_json(list(record.evidence)),
+                record.last_seen_at or record.detected_at,
+                record.severity,
+                record.severity,
+                tenant_id,
+                target["record_id"],
+                list(_OPEN_STATES),
+            ),
+        )
+
     async def write_or_append(self, tenant_id: str, record: ProblemRecord) -> None:
         if not tenant_id:
             raise ValueError("tenant_id is required")
+        # 超集并入：已开单的异常集合 ⊂ 新集合 ⇒ 并进它，不新开（见模块顶部说明）
+        target = await self._find_superset_candidate(tenant_id, record)
+        if target is not None:
+            await self._merge_into(tenant_id, target, record)
+            return
         d = record.model_dump()
         d["group_key"] = record.group_key
         args: list[Any] = []

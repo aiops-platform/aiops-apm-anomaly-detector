@@ -48,11 +48,13 @@ class MigrationRunner:
         scripts_dir: Path | None = None,
         *,
         testbed_es_url: str = "http://localhost:19200/app-logs/_search",
+        testbed_prom_url: str = "http://localhost:19090/api/v1/query",
     ) -> None:
         self._pool = pool
         self._schema = schema
         self._scripts_dir = scripts_dir if scripts_dir is not None else Path(__file__).parent
         self._testbed_es_url = testbed_es_url
+        self._testbed_prom_url = testbed_prom_url
 
     # ---- 纯函数（可单测）----
 
@@ -131,12 +133,15 @@ class MigrationRunner:
             await handle.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
             await handle.execute(f"SET search_path TO {self._schema}")
             # 以 GUC 把环境相关的配置注入给迁移脚本 —— SQL 是静态文件读不到环境变量，
-            # 而 V9 要往 source_config 里写 ES 地址（本机 port-forward 是 localhost:19200，
-            # 容器里得是 host.containers.internal:19200）。脚本侧用
-            # current_setting('aiops.testbed_es_url', true) 取，取不到再 COALESCE 兜底。
+            # 而 V9（日志端点）要写 ES 地址、V13（指标端点）要写 Prometheus 地址
+            # （本机 port-forward 分别是 19200 / 19090，**容器里 localhost 指向容器自己**）。
+            # 脚本侧用 current_setting('aiops.testbed_*', true) 取，取不到再 COALESCE 兜底。
             # 用 set_config 带参数而非拼 SET 语句：值来自环境变量，拼接会有转义问题。
             await handle.execute(
                 "SELECT set_config('aiops.testbed_es_url', %s, false)", (self._testbed_es_url,)
+            )
+            await handle.execute(
+                "SELECT set_config('aiops.testbed_prom_url', %s, false)", (self._testbed_prom_url,)
             )
             await handle.execute(
                 "CREATE TABLE IF NOT EXISTS schema_versions ("
@@ -168,7 +173,12 @@ async def run_migrations(settings: Settings) -> int:
 
     pool = ConnectionPool(settings)
     await pool.init()
-    runner = MigrationRunner(pool, schema=settings.db_schema, testbed_es_url=settings.testbed_es_url)
+    runner = MigrationRunner(
+        pool,
+        schema=settings.db_schema,
+        testbed_es_url=settings.testbed_es_url,
+        testbed_prom_url=settings.testbed_prom_url,
+    )
     try:
         return await runner.migrate()
     finally:

@@ -4,7 +4,12 @@ domains:
   - id: application
     enabled: true
     detectors:
+      # cpu_usage：既有的风险线（也复用于 docker/seed_testbed_metrics.py 的「风险线」端点
+      # —— 那条端点输出 0/1，故这里的 0.9 等价于"等于 1 才异常"，真门限在 PromQL 里）。
       - { signal: cpu_usage,   plugin: static_threshold,   params: { threshold: 0.9 },                severity: high }
+      # cpu_throttled_percent：被 CFS 限流的周期占比（0/1，同上）。**症状线** —— 用户已经在等，
+      # 比"CPU 占多少"更该开单。指标名必须与 cpu_usage 不同，否则两条线的 anomaly_key 会撞。
+      - { signal: cpu_throttled_percent, plugin: static_threshold, params: { threshold: 0.9 },        severity: high }
       - { signal: error_rate,  plugin: simple_compare,     params: { ratio: 1.5, baseline: 0.02 },     severity: high }
       - { signal: ERROR,       plugin: signature_aggregate, params: { min_count: 5, n_frames: 3 },     severity: warning }
     suppressors:

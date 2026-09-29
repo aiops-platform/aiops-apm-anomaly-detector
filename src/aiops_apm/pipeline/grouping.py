@@ -6,7 +6,8 @@
 1. 同 ``signature`` 的日志异常 → 同组；
 2. 业务链路 ``trace_ids`` 相交的日志异常 → 同组（**可跨服务**：一次请求失败在
    gateway/order/warranty 各打一条日志，共享 traceId，本质是一个事故）；
-3. metric 异常挂到「本服务日志异常」所在的组，从而保住「同源 metric+log 升 critical」。
+3. **同服务的 metric 异常互相 → 同组**（一次事故的多面）；
+4. metric 组挂到「本服务日志异常」所在的组，从而保住「同源 metric+log 升 critical」。
 
 于是：
 
@@ -94,6 +95,22 @@ def group_anomalies(anomalies: list[Any]) -> list[list[Any]]:
     # 否则「并入全部」会把该服务几个**不同类型**的日志组强行合并成一条记录，
     # 那正是 M9 要避免的（不同类型 error 应各自成单）。这种歧义场景下让 metric
     # 自成一組，日志分组保持独立。
+    # 同服务的 metric 异常**互相并入一组**（2026-09-29 加）。
+    #
+    # 一个服务的多个指标同时越线是**一次事故的多面**（CPU 满 + 被 CFS 限流），
+    # 分开成单会让人对着同一件事点两次 Analyze、跑两轮 LLM 诊断。实测踩过：
+    # 两条线在**同一轮**各开一张单，两条记录的 detected_at 完全相同、
+    # group_key 却不同（那条 run 的 trace-2617e3ff…）。
+    #
+    # 与下面的日志规则是两件事：这里只连 metric↔metric，且**只连同服务**；
+    # 要不要再并进日志组，由下一段决定。M9 的诉求（不同类型的 error 各自成单）
+    # 只涉及日志，不受这条影响。
+    metric_root_by_service: dict[str, int] = {}
+    for idx, metric in metrics:
+        anchor = metric_root_by_service.setdefault(metric.service, idx)
+        if anchor != idx:
+            uf.union(anchor, idx)
+
     log_root_by_service: dict[str, set[int]] = {}
     for idx, log in logs:
         log_root_by_service.setdefault(log.service, set()).add(uf.find(idx))

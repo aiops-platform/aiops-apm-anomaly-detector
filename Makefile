@@ -63,6 +63,14 @@ seed-testbed:
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	$(PY) docker/seed_testbed_logs.py
 
+# 测试床的**指标**监控端点 seed（幂等）：order-service 的 CPU 风险线 + 限流症状线，
+# 外加 application 域里那条 cpu_throttled_percent 检测器。
+# 与上面那个分开：日志走 ES（按堆栈签名聚合）、指标走 Prometheus（判"持续"），
+# 粒度与判据都不同。详见 docker/seed_testbed_metrics.py 的 docstring。
+seed-testbed-metrics:
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	$(PY) docker/seed_testbed_metrics.py
+
 # ---- M7 交付：Docker 一键演示 + 压测（本机无 docker/locust → 待补跑）----
 docker-up:
 	docker compose -f docker/docker-compose.yml up --build -d postgres mock-source apm-alert prometheus

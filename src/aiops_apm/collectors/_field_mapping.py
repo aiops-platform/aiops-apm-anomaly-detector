@@ -96,6 +96,23 @@ def _field(row: dict, mapping: dict, key: str, default: Any = None) -> Any:
     return value if value is not None else default
 
 
+def _labels(row: dict, mapping: dict) -> dict[str, str]:
+    """labels 有两个来源，按顺序取第一个可用的：
+
+    1. ``field_mapping["labels"]`` 指定的路径 —— **Prometheus 这类源把标签放在
+       ``metric`` 对象里**（``{"metric": {"pod": "…"}, "value": […]}}``），不认这个键就
+       只能读到空字典，于是 per-pod 身份在入口处丢掉（所有 pod 共享一个 anomaly_key）。
+    2. 行里顶层的 ``labels`` 键 —— 早期自定义源（M3 起的约定）就长这样。
+
+    取到的不是字典一律当空：这一路是**可选**的元信息，不该因为它形状不对而炸掉采集。
+    """
+    mapped = _field(row, mapping, "labels")
+    if isinstance(mapped, dict):
+        return {str(k): str(v) for k, v in mapped.items()}
+    raw = row.get("labels") if isinstance(row, dict) else None
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
 class FieldMapper:
     """把第三方响应行映射为 Signal 模型。"""
 
@@ -107,7 +124,7 @@ class FieldMapper:
             metric=_field(row, mapping, "metric", "unknown"),
             value=float(_field(row, mapping, "value")),
             timestamp=_parse_ts(_field(row, mapping, "timestamp"), timezone_name=timezone_name),
-            labels=dict(row.get("labels") or {}),
+            labels=_labels(row, mapping),
         )
 
     @staticmethod

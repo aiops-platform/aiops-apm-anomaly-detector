@@ -15,12 +15,17 @@ NOW = datetime(2026, 8, 26, 12, 0, 0, tzinfo=timezone.utc)
 NOW2 = datetime(2026, 8, 26, 12, 5, 0, tzinfo=timezone.utc)
 
 
-def _anomaly(service: str = "order-management", severity: str = "high", tenant_id: str = "default") -> MetricAnomaly:
+def _anomaly(
+    service: str = "order-management",
+    severity: str = "high",
+    tenant_id: str = "default",
+    metric: str = "cpu_usage",
+) -> MetricAnomaly:
     return MetricAnomaly(
         kind="metric",
         tenant_id=tenant_id,
         service=service,
-        metric="cpu_usage",
+        metric=metric,
         value=0.95,
         baseline=0.5,
         method="static_threshold",
@@ -38,8 +43,12 @@ def _record(
     severity: str = "high",
     evidence: list[dict] | None = None,
     last_seen_at: datetime | None = None,
+    metrics: list[str] | None = None,
 ) -> ProblemRecord:
-    a = _anomaly(service=service, severity=severity, tenant_id=tenant_id)
+    anoms = [
+        _anomaly(service=service, severity=severity, tenant_id=tenant_id, metric=m)
+        for m in (metrics or ["cpu_usage"])
+    ]
     return ProblemRecord(
         record_id=record_id,
         tenant_id=tenant_id,
@@ -52,7 +61,7 @@ def _record(
         last_seen_at=last_seen_at or NOW,
         occurrence_count=1,
         symptom={"summary": "cpu spike", "severity": severity},
-        metric_anomalies=[a],
+        metric_anomalies=anoms,
         log_anomalies=[],
         correlation=Correlation(related=False, reason=""),
         verification=Verification(passed=True, persistence_ok=True, final_severity=severity),
@@ -305,3 +314,60 @@ async def test_terminal_states_share_one_write_path() -> None:
         assert row["state"] == state
         assert row["resolve_reason"] == "r"
         assert isinstance(row["resolved_at"], datetime)
+
+
+# ---- 超集并入（2026-09-29 加）------------------------------------------------
+
+
+async def test_superset_group_merges_into_open_record() -> None:
+    """超集并入：已开的 {A} 单遇到 {A,B} ⇒ 并进它、不新开，且异常表补上 B。
+
+    实测背景：CPU 风险线与症状线**越线时刻差一轮**，集合因此变大，而 ``group_key``
+    是精确集合的哈希 ⇒ 同一场故障被拆成两张单，人要点两次 Analyze。
+    """
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001", metrics=["cpu_usage"]))
+    second = _record("PR-0002", metrics=["cpu_usage", "cpu_throttled_percent"])
+    await store.write_or_append("default", second)
+
+    rows = await store.list("default")
+    assert len(rows) == 1, "超集应当并入，不该新开单"
+    row = rows[0]
+    assert row["record_id"] == "PR-0001", "并入的是**先开**的那条"
+    assert {a["metric"] for a in row["metric_anomalies"]} == {"cpu_usage", "cpu_throttled_percent"}
+    assert row["occurrence_count"] == 2
+    # group_key 提升为超集键 ⇒ 下一轮同样的集合走精确键路径，不再读-改-写
+    assert row["group_key"] == second.group_key
+
+
+async def test_same_superset_again_appends_without_duplicating_anomalies() -> None:
+    """并入之后，再来一轮同样的集合：走精确键追加，异常表不重复。"""
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001", metrics=["cpu_usage"]))
+    await store.write_or_append("default", _record("PR-0002", metrics=["cpu_usage", "cpu_throttled_percent"]))
+    await store.write_or_append("default", _record("PR-0003", metrics=["cpu_usage", "cpu_throttled_percent"]))
+
+    rows = await store.list("default")
+    assert len(rows) == 1
+    assert len(rows[0]["metric_anomalies"]) == 2
+    assert rows[0]["occurrence_count"] == 3
+
+
+async def test_disjoint_anomaly_sets_still_open_separate_records() -> None:
+    """**互不包含**的集合照旧各自成单 —— 超集并入不能变成"按服务一刀切"。"""
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001", metrics=["cpu_usage"]))
+    await store.write_or_append("default", _record("PR-0002", metrics=["memory_percent"]))
+
+    rows = await store.list("default")
+    assert len(rows) == 2
+
+
+async def test_subset_does_not_merge_into_superset() -> None:
+    """方向是单向的：新的集合**更小**时不并入（那说明另一条线已经恢复，不是同一场）。"""
+    store = InMemoryRecordStore()
+    await store.write_or_append("default", _record("PR-0001", metrics=["cpu_usage", "cpu_throttled_percent"]))
+    await store.write_or_append("default", _record("PR-0002", metrics=["cpu_usage"]))
+
+    rows = await store.list("default")
+    assert len(rows) == 2

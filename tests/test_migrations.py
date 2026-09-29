@@ -123,7 +123,7 @@ def test_split_statements_handles_named_dollar_tags() -> None:
 def test_load_scripts_parses_version() -> None:
     runner = _runner(FakeConn())
     scripts = runner._load_scripts()
-    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert [s.version for s in scripts] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     assert "problem_record" in scripts[0].sql
     assert "collect_watermark" in scripts[1].sql
     assert "detection_round" in scripts[2].sql
@@ -207,6 +207,42 @@ def test_v9_seeds_testbed_log_targets() -> None:
     assert "'hits.hits'" in sql
 
 
+def test_v13_seeds_testbed_metric_targets() -> None:
+    """V13：测试床 order-service 的两条**指标**端点 + 症状线检测器，随 ``make migrate`` 就位。
+
+    断言要点（``_script`` 已剥注释 ⇒ 这里断言的都是**可执行 SQL 里真的有的东西**）：
+    - 幂等 + ``MT-NNNN`` 形态（同 V9）；
+    - Prometheus 地址走 GUC，未设时 COALESCE 兜底；
+    - **两条端点靠 ``label`` 区分**（同一服务 + 同一 signal_type，光靠那两项分不开）；
+    - 判据写在查询里：``min_over_time`` 表达"持续"、``sum by (pod)`` 保单副本、
+      ``>= bool`` 让每轮恒定有一行、``count_over_time`` 守卫稀疏、``label_replace`` 回填标签；
+    - ⚠️ **``container!="POD"`` 不许出现**：cAdvisor 的 pod 级聚合序列其 container 标签是
+      空串，``!="POD"`` 会把它留下 ⇒ 分子分母各算两遍（实测 1 核的 limit 算成 2 核）。
+    """
+    sql = _script(13)
+    assert "ON CONFLICT (tenant_id, target_id) DO NOTHING" in sql
+    assert "current_setting('aiops.testbed_prom_url', true)" in sql
+    assert "COALESCE(" in sql
+    for tid, label in (("MT-0004", "cpu_risk"), ("MT-0005", "cpu_throttle")):
+        assert f"'{tid}'" in sql
+        assert f"'{label}'" in sql
+    # 采集配置要点：instant query + 一行一信号
+    assert "'data.result'" in sql
+    assert "'value[1]'" in sql and "'value[0]'" in sql
+    # labels 要映射（Prometheus 把标签放在 metric 对象里，不映射就全丢 ⇒ per-pod 身份没了）
+    assert "'labels', 'metric'" in sql
+    # 判据与选择器
+    for marker in ("min_over_time", "sum by (pod)", ">= bool", "count_over_time", "label_replace"):
+        assert marker in sql, f"V13 的查询里缺少 {marker}"
+    # ⚠️ 选择器**两个条件都要**：`container!=""` 排掉 cAdvisor 的 pod 级聚合序列
+    # （它的 container 标签是**空串**，只写 !="POD" 会把它留下 ⇒ 分子分母各算两遍，
+    # 实测 1 核的 limit 算成 2 核）；`container!="POD"` 排掉 sandbox 容器。
+    assert 'container!="",container!="POD"' in sql
+    # 症状线检测器：名字必须与 cpu_usage 不同，否则两条线 anomaly_key 相撞
+    assert "cpu_throttled_percent" in sql
+    assert "jsonb_array_elements" in sql  # 追加检测器前的 NOT EXISTS 守卫
+
+
 def test_v10_widens_problem_record_service() -> None:
     """V10：service 加宽到 255 —— M9 跨服务合并后它是拼接的服务名列表。
 
@@ -282,7 +318,7 @@ def test_scripts_do_not_hardcode_schema() -> None:
     只有换一个 db_schema 才会暴露。MySQL 版能写死 ``USE aiops_apm_runtime`` 是因为库名恒等于
     schema 名；PG 的 schema 是可配置的。
     """
-    for version in range(1, 13):
+    for version in range(1, 14):
         sql = _script(version)
         assert "CREATE SCHEMA" not in sql, f"V{version} 不应自己建 schema"
         assert "SET search_path" not in sql, f"V{version} 不应自己设 search_path"
@@ -292,7 +328,7 @@ async def test_migrate_applies_new_scripts_in_order() -> None:
     conn = FakeConn(current_version=0)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 12
+    assert applied == 13
     assert conn.schema_versions_created
     assert any(s.startswith("CREATE SCHEMA IF NOT EXISTS aiops_apm_runtime") for s in conn.statements)
     assert any(s.strip().startswith("CREATE TABLE IF NOT EXISTS problem_record") for s in conn.statements)
@@ -311,7 +347,7 @@ async def test_migrate_idempotent_skips_applied_versions() -> None:
     conn = FakeConn(current_version=1)
     runner = _runner(conn)
     applied = await runner.migrate()
-    assert applied == 11  # V1 已应用，仅补 V2..V12
+    assert applied == 12  # V1 已应用，仅补 V2..V13
     # 已应用版本不重复执行其建表语句
     assert not any("CREATE TABLE IF NOT EXISTS problem_record" in s for s in conn.statements)
     assert any("CREATE TABLE IF NOT EXISTS collect_watermark" in s for s in conn.statements)
